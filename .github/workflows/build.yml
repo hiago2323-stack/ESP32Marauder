@@ -1,0 +1,36 @@
+name: Compilacao ESP32
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Baixar codigo
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar PlatformIO
+        run: pip install platformio
+
+      - name: Verificar configuracao
+        run: pio project config
+
+      - name: Compilar
+        run: pio run
+
+      - name: Publicar artefatos
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-esp32
+          if-no-files-found: warn
+          path: |
+            .pio/build/**/firmware.bin
+            .pio/build/**/bootloader.bin
+            .pio/build/**/partitions.bin
