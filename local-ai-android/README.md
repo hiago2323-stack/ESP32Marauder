@@ -12,6 +12,7 @@ Redmi A3 (app)  ⇄  Wi-Fi / Tailscale  ⇄  PC Linux Mint XFCE
 ## Etapas
 
 - [x] 1. Servidor do PC (`server/`)
+- [x] 1b. Telemetria, GPU e IA local no PC (scripts `install_*.sh`)
 - [ ] 2. App Android (chat + conexão com o PC)
 - [ ] 3. Pesquisa web (SearXNG no Positivo)
 - [ ] 4. IA pequena local no celular
@@ -40,3 +41,15 @@ O `/build` precisa do Android SDK instalado (também no próximo guia).
 
 - Nunca abra a porta 8080 no roteador. Acesse de fora só pelo **Tailscale**.
 - O token fica em `server/.env`, que não vai para o Git.
+
+## Etapa 1b — Ordem de instalação no PC (dentro de `server/`)
+
+```
+bash install_monitoring.sh     # telemetria e controle da GPU (reinicie depois)
+bash setup.sh                  # servidor (token)
+bash install_llm.sh            # llama.cpp com CUDA + modelo
+bash install_android_sdk.sh    # para o /build compilar apps
+```
+
+Para usar: em um terminal `bash start_llm.sh`, em outro `bash run.sh`.
+Ajuste `NGL` (camadas na GPU) com `NGL=10 bash start_llm.sh` olhando o `nvidia-smi`.
