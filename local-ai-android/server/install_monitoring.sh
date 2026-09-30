@@ -17,5 +17,12 @@ pipx install 'glances[web,gpu]' || true
 pipx ensurepath
 
 echo "==> Liberando overclock e controle de ventoinha da NVIDIA (Coolbits 28)"
-sudo nvidia-xconfig --cool-bits=28
+sudo mkdir -p /etc/X11/xorg.conf.d
+sudo tee /etc/X11/xorg.conf.d/20-nvidia-coolbits.conf >/dev/null <<'XCONF'
+Section "Device"
+    Identifier "NVIDIA GPU"
+    Driver "nvidia"
+    Option "Coolbits" "28"
+EndSection
+XCONF
 echo "==> Reinicie o PC para o Coolbits valer."

@@ -42,14 +42,18 @@ O `/build` precisa do Android SDK instalado (também no próximo guia).
 - Nunca abra a porta 8080 no roteador. Acesse de fora só pelo **Tailscale**.
 - O token fica em `server/.env`, que não vai para o Git.
 
-## Etapa 1b — Ordem de instalação no PC (dentro de `server/`)
+## Etapa 1b — Instalação completa no PC (um comando)
+
+Dentro de `server/`, **sem sudo**:
 
 ```
-bash install_monitoring.sh     # telemetria e controle da GPU (reinicie depois)
-bash setup.sh                  # servidor (token)
-bash install_llm.sh            # llama.cpp com CUDA + modelo
-bash install_android_sdk.sh    # para o /build compilar apps
+bash install_all.sh
 ```
 
-Para usar: em um terminal `bash start_llm.sh`, em outro `bash run.sh`.
-Ajuste `NGL` (camadas na GPU) com `NGL=10 bash start_llm.sh` olhando o `nvidia-smi`.
+Instala driver NVIDIA 580 (a GTX 960 não é suportada pelo 590+), CUDA 12.6,
+telemetria/controle da GPU, servidor, llama.cpp + modelo, Android SDK, Tailscale e
+serviços que sobem sozinhos no boot. Log em `~/localai-install.log`.
+
+Depois: reinicie, `nvidia-smi`, `sudo tailscale up`, `curl http://localhost:8080/health`.
+Ajuste as camadas na GPU editando `Environment=NGL=8` em
+`/etc/systemd/system/localai-llm.service`.
