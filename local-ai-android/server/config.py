@@ -34,3 +34,6 @@ SYSTEM_PROMPT = os.environ.get(
     "de forma clara e direta. Quando houver resultados de pesquisa na web no contexto, use-os e cite as "
     "fontes (endereços). Se não souber algo, diga que não sabe em vez de inventar.",
 )
+
+# Banco da memória de longo prazo (o que o usuário ensina e o que a IA aprende)
+MEMORY_DB = Path(os.environ.get("MEMORY_DB", str(HOME / "localai" / "memory.db")))

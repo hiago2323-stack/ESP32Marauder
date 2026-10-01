@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # =====================================================================
 #  INSTALA TUDO - Linux Mint XFCE (base Ubuntu 24.04) - GTX 960 + Ryzen
-#  Driver NVIDIA 580, CUDA 12.6, telemetria/GPU, IA local (llama.cpp),
-#  servidor com tela de conversa por TEXTO e VOZ (100% local), pesquisa web,
+#  Driver NVIDIA 580, CUDA 12.6, telemetria/GPU, IA local (llama.cpp, modelo 3B),
+#  servidor com conversa por TEXTO e VOZ (100% local), pesquisa web, MEMÓRIA que
+#  cresce com o tempo,
 #  compilação Android, serviços no boot. (Tailscale/celular: fica pra depois.)
 #  Uso (SEM sudo):  bash instalar_tudo.sh
-#  Pode rodar de novo se algo falhar. Log: ~/localai-install.log
+#  Pode rodar de novo (também por cima de uma instalação anterior: ele aproveita
+#  o que já existe, mantém o token e as memórias). Log: ~/localai-install.log
 # =====================================================================
 set -uo pipefail
 LOG="$HOME/localai-install.log"
@@ -14,7 +16,7 @@ exec > >(tee -a "$LOG") 2>&1
 BASE="$HOME/localai"
 SRV="$BASE/server"
 CUDA_DIR="/usr/local/cuda-12.6"
-MODEL="$HOME/models/Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf"
+MODEL="$HOME/models/Qwen2.5-3B-Instruct-Q4_K_M.gguf"
 FAILED=()
 
 [ "$(id -u)" -ne 0 ] || { echo "Rode SEM sudo: bash instalar_tudo.sh"; exit 1; }
@@ -123,6 +125,9 @@ SYSTEM_PROMPT = os.environ.get(
     "de forma clara e direta. Quando houver resultados de pesquisa na web no contexto, use-os e cite as "
     "fontes (endereços). Se não souber algo, diga que não sabe em vez de inventar.",
 )
+
+# Banco da memória de longo prazo (o que o usuário ensina e o que a IA aprende)
+MEMORY_DB = Path(os.environ.get("MEMORY_DB", str(HOME / "localai" / "memory.db")))
 EOF
   cat > main.py <<'EOF'
 """Servidor do PC: conversa com o modelo, pesquisa na web e compila projetos Android.
@@ -133,6 +138,7 @@ Rotas:
   POST /chat     -> repassa a conversa ao llama-server (streaming), com pesquisa web opcional
   POST /stt      -> voz -> texto (faster-whisper, local)
   POST /tts      -> texto -> voz (Piper, local), devolve WAV
+  GET/POST /memory, DELETE /memory/{id} -> memória de longo prazo (o que a IA aprendeu)
   POST /search   -> pesquisa na web (SearXNG ou DuckDuckGo)
   POST /fetch    -> baixa uma página e devolve o texto
   POST /build    -> recebe um .zip de projeto Gradle e devolve o APK debug
@@ -147,6 +153,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 import uuid
 import wave
 import zipfile
@@ -159,6 +166,7 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 import config
+import memory
 
 app = FastAPI(title="Local AI Server")
 config.WORK_DIR.mkdir(parents=True, exist_ok=True)
@@ -196,7 +204,17 @@ def _web_search_sync(query: str, limit: int) -> list[dict]:
         items = r.json().get("results", [])[:limit]
         return [{"title": x.get("title"), "url": x.get("url"), "snippet": x.get("content")} for x in items]
     from ddgs import DDGS
-    items = DDGS().text(query, max_results=limit)
+    items = []
+    for attempt in range(3):  # o DuckDuckGo às vezes devolve lista vazia; tenta de novo
+        try:
+            items = DDGS().text(query, max_results=limit)
+        except Exception:
+            if attempt == 2:
+                raise
+            items = []
+        if items:
+            break
+        time.sleep(0.7)
     return [{"title": x.get("title"), "url": x.get("href"), "snippet": x.get("body")} for x in items]
 
 
@@ -207,11 +225,19 @@ class ChatRequest(BaseModel):
     web: bool = False
 
 
-async def _build_messages(req: ChatRequest) -> list[dict]:
+async def _build_messages(req: ChatRequest) -> tuple[list[dict], int]:
     system = f"{config.SYSTEM_PROMPT}\nData de hoje: {date.today().isoformat()}."
     msgs = [{"role": "system", "content": system}]
+    last = next((m["content"] for m in reversed(req.messages) if m.get("role") == "user"), "")
+    mems = await asyncio.to_thread(memory.search, last, 4)
+    if mems:
+        notes = "\n".join(f"- {m['text'][:600]}" for m in mems)
+        msgs[0]["content"] += (
+            "\n\nCoisas que você já aprendeu ou que o usuário te ensinou (podem estar desatualizadas; "
+            "use quando forem relevantes):\n" + notes
+        )
+    n_web = 0
     if req.web:
-        last = next((m["content"] for m in reversed(req.messages) if m.get("role") == "user"), "")
         try:
             results = await asyncio.to_thread(_web_search_sync, last, 5)
         except Exception as e:  # sem internet, bloqueio etc.: segue sem a pesquisa
@@ -220,12 +246,13 @@ async def _build_messages(req: ChatRequest) -> list[dict]:
         if results:
             ctx = "\n".join(f"[{i+1}] {r['title']} - {r['url']}\n{r['snippet']}" for i, r in enumerate(results))
             msgs[0]["content"] += "\n\nResultados da pesquisa na web:\n" + ctx
-    return msgs + req.messages
+            n_web = len(results)
+    return msgs + req.messages, n_web
 
 
 @app.post("/chat", dependencies=[Depends(require_token)])
 async def chat(req: ChatRequest):
-    messages = await _build_messages(req)
+    messages, n_web = await _build_messages(req)
     payload = {"messages": messages, "max_tokens": req.max_tokens,
                "temperature": req.temperature, "stream": True}
 
@@ -243,7 +270,33 @@ async def chat(req: ChatRequest):
             except httpx.ConnectError:
                 yield b'data: {"error": "O modelo (llama-server) esta desligado"}\n\n'
 
-    return StreamingResponse(stream(), media_type="text/event-stream")
+    # X-Web-Results: quantos resultados da web foram usados (0 = a pesquisa falhou ou não foi pedida)
+    return StreamingResponse(stream(), media_type="text/event-stream", headers={"X-Web-Results": str(n_web)})
+
+
+# ------------------------------------------------------------------- memória
+class MemoryIn(BaseModel):
+    text: str
+    source: str = "usuario"
+
+
+@app.get("/memory", dependencies=[Depends(require_token)])
+async def memory_list():
+    return await asyncio.to_thread(memory.list_all)
+
+
+@app.post("/memory", dependencies=[Depends(require_token)])
+async def memory_add(item: MemoryIn):
+    try:
+        return await asyncio.to_thread(memory.add, item.text, item.source[:20])
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.delete("/memory/{mem_id}", dependencies=[Depends(require_token)])
+async def memory_delete(mem_id: int):
+    await asyncio.to_thread(memory.delete, mem_id)
+    return {"ok": True}
 
 
 # ------------------------------------------------------------------ voz (local)
@@ -391,6 +444,103 @@ async def build(project: UploadFile = File(...)):
         raise HTTPException(500, "Compilou, mas nenhum APK debug foi encontrado")
     return FileResponse(apks[0], media_type="application/vnd.android.package-archive", filename=apks[0].name)
 EOF
+  cat > memory.py <<'EOF'
+"""Memória de longo prazo: guarda o que o usuário ensina e o que a IA aprende na web.
+
+Usa SQLite com busca de texto (FTS5), sem modelos extras: leve para CPU e RAM.
+O modelo em si não muda; ele recebe as memórias relevantes junto com cada pergunta.
+"""
+import re
+import sqlite3
+import threading
+import time
+
+import config
+
+_lock = threading.Lock()
+_db: sqlite3.Connection | None = None
+
+STOP = set("""
+a o as os um uma uns umas de do da dos das em no na nos nas por para com sem sob sobre e ou mas que se
+como qual quais quem onde quando porque pra pro ao aos isso isto esse essa esses essas este esta estes
+estas ele ela eles elas eu voce você nos nós meu minha meus minhas seu sua seus suas foi ser sao são
+tem ter era tinha vai vou ja já mais muito muita tambem também so só me te lhe nao não sim favor
+""".split())
+
+
+def _conn() -> sqlite3.Connection:
+    global _db
+    if _db is None:
+        config.MEMORY_DB.parent.mkdir(parents=True, exist_ok=True)
+        _db = sqlite3.connect(config.MEMORY_DB, check_same_thread=False)
+        _db.row_factory = sqlite3.Row
+        _db.execute(
+            "CREATE TABLE IF NOT EXISTS memories("
+            "id INTEGER PRIMARY KEY, text TEXT NOT NULL UNIQUE, source TEXT NOT NULL, created REAL NOT NULL)"
+        )
+        _db.execute(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5("
+            "text, tokenize='unicode61 remove_diacritics 2')"
+        )
+        _db.commit()
+    return _db
+
+
+def add(text: str, source: str = "usuario") -> dict:
+    text = text.strip()[:1500]
+    if not text:
+        raise ValueError("texto vazio")
+    with _lock:
+        db = _conn()
+        row = db.execute("SELECT id FROM memories WHERE text = ?", (text,)).fetchone()
+        if row:
+            return {"id": row["id"], "duplicate": True}
+        cur = db.execute(
+            "INSERT INTO memories(text, source, created) VALUES (?, ?, ?)", (text, source, time.time())
+        )
+        db.execute("INSERT INTO memories_fts(rowid, text) VALUES (?, ?)", (cur.lastrowid, text))
+        db.commit()
+        return {"id": cur.lastrowid, "duplicate": False}
+
+
+def delete(mem_id: int) -> None:
+    with _lock:
+        db = _conn()
+        db.execute("DELETE FROM memories WHERE id = ?", (mem_id,))
+        db.execute("DELETE FROM memories_fts WHERE rowid = ?", (mem_id,))
+        db.commit()
+
+
+def list_all(limit: int = 300) -> list[dict]:
+    with _lock:
+        rows = _conn().execute(
+            "SELECT id, text, source, created FROM memories ORDER BY created DESC LIMIT ?", (limit,)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _fts_query(text: str) -> str:
+    words = [w for w in re.findall(r"\w{3,}", text.lower()) if w not in STOP]
+    terms = []
+    for w in dict.fromkeys(words):  # sem repetir, mantendo a ordem
+        # corta palavras longas e usa prefixo: "cachorros" encontra "cachorro"
+        stem = w[:5] if len(w) > 6 else w
+        terms.append(f'"{stem}"*' if len(w) > 6 else f'"{stem}"')
+    return " OR ".join(terms[:10])
+
+
+def search(text: str, limit: int = 4) -> list[dict]:
+    q = _fts_query(text)
+    if not q:
+        return []
+    with _lock:
+        rows = _conn().execute(
+            "SELECT m.id, m.text, m.source FROM memories_fts f JOIN memories m ON m.id = f.rowid "
+            "WHERE memories_fts MATCH ? ORDER BY bm25(memories_fts) LIMIT ?",
+            (q, limit),
+        ).fetchall()
+    return [dict(r) for r in rows]
+EOF
   mkdir -p static
   cat > static/index.html <<'EOF'
 <!doctype html>
@@ -425,6 +575,16 @@ EOF
   textarea { flex:1; resize:none; font:inherit; color:var(--txt); background:var(--bg); border:1px solid var(--line);
              border-radius:10px; padding:10px 12px; height:48px; max-height:160px; }
   #mic.rec { background:#c0392b; border-color:#c0392b; color:#fff; }
+  .msg .tools { margin-top:6px; }
+  .msg .tools button { font-size:12px; padding:2px 8px; color:var(--mut); }
+  dialog { background:var(--panel); color:var(--txt); border:1px solid var(--line); border-radius:12px;
+           width:min(720px,94vw); max-height:84vh; padding:16px; }
+  dialog::backdrop { background:rgba(0,0,0,.5); }
+  #memlist { max-height:50vh; overflow-y:auto; margin:10px 0; display:flex; flex-direction:column; gap:8px; }
+  .mem { border:1px solid var(--line); border-radius:8px; padding:8px 10px; display:flex; gap:8px;
+         align-items:flex-start; font-size:14px; white-space:pre-wrap; }
+  .mem span { flex:1; word-break:break-word; }
+  .mem small { color:var(--mut); display:block; }
   #status { color:var(--mut); font-size:13px; padding:0 16px 8px; min-height:22px; background:var(--panel); }
 </style>
 </head>
@@ -432,9 +592,20 @@ EOF
 <header>
   <h1>IA Local</h1>
   <label><input type="checkbox" id="web"> Pesquisar na web</label>
+  <label title="Guarda na memória o que descobrir pesquisando"><input type="checkbox" id="learn" checked> Aprender com pesquisas</label>
   <label><input type="checkbox" id="speak"> Falar as respostas</label>
+  <button id="memBtn">🧠 Memória</button>
   <button id="new">Nova conversa</button>
 </header>
+<dialog id="memDlg">
+  <strong>Memória de longo prazo</strong>
+  <div style="color:var(--mut);font-size:14px">Tudo que a IA sabe sobre você e o que aprendeu. Apague o que estiver errado.</div>
+  <div id="memlist"></div>
+  <div style="display:flex;gap:8px">
+    <input id="memNew" placeholder="Ensinar algo novo…" style="flex:1;font:inherit;padding:8px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--txt)">
+    <button id="memAdd">Ensinar</button><button id="memClose">Fechar</button>
+  </div>
+</dialog>
 <div id="log"></div>
 <div id="status"></div>
 <div id="bar">
@@ -471,6 +642,24 @@ function addMsg(role, text) {
   return d;
 }
 
+async function saveMemory(text, source) {
+  const r = await fetch('/memory', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                    body: JSON.stringify({text, source})});
+  if (!r.ok) throw new Error('Servidor respondeu ' + r.status);
+  return r.json();
+}
+function addRememberButton(el, question, answer) {
+  const t = document.createElement('div'); t.className = 'tools';
+  const b = document.createElement('button'); b.textContent = '📌 Lembrar disso';
+  b.onclick = async () => {
+    try { await saveMemory(`Pergunta: ${question}\nResposta: ${answer}`, 'usuario'); b.textContent = '✔ Guardado'; b.disabled = true; }
+    catch (e) { b.textContent = 'Erro ao guardar'; }
+  };
+  t.appendChild(b); el.appendChild(t);
+}
+// "lembre que ..." / "guarde que ..." / "aprenda que ..." ensina direto, sem precisar do botão
+const TEACH = /^\s*(lembre-se|lembre|guarde|aprenda|anote)(\s+disso|\s+que)?[:,]?\s+(.{4,})/is;
+
 async function send(text) {
   text = text.trim();
   if (!text || busy) return;
@@ -478,6 +667,10 @@ async function send(text) {
   txt.value = '';
   history.push({role: 'user', content: text});
   addMsg('user', text);
+  const teach = text.match(TEACH);
+  if (teach) { try { await saveMemory(teach[3].trim(), 'usuario'); } catch (e) {} }
+  const wantWeb = $('web').checked;
+  let webResults = 0;
   const out = addMsg('assistant', '…');
   setStatus($('web').checked ? 'Pesquisando na web e pensando…' : 'Pensando…');
   let answer = '';
@@ -487,6 +680,7 @@ async function send(text) {
       body: JSON.stringify({messages: history.slice(-12), web: $('web').checked})
     });
     if (!r.ok) throw new Error('Servidor respondeu ' + r.status);
+    webResults = parseInt(r.headers.get('X-Web-Results') || '0', 10);
     const reader = r.body.getReader(), dec = new TextDecoder();
     let buf = '';
     for (;;) {
@@ -507,6 +701,13 @@ async function send(text) {
     }
     history.push({role: 'assistant', content: answer});
     setStatus('');
+    if (answer) addRememberButton(out, text, answer);
+    if (wantWeb && webResults === 0 && answer) {
+      setStatus('Não consegui pesquisar na web agora (sem internet?). Respondi só com o que eu sei.');
+    }
+    if (webResults > 0 && $('learn').checked && answer && !teach) {
+      try { await saveMemory(`Pergunta: ${text}\nResposta (pesquisa na web em ${new Date().toLocaleDateString('pt-BR')}): ${answer}`, 'web'); } catch (e) {}
+    }
     if ($('speak').checked && answer) await speak(answer);
   } catch (e) {
     out.classList.add('err'); render(out, 'Erro: ' + e.message);
@@ -562,6 +763,27 @@ $('mic').onclick = async () => {
   } catch (e) { setStatus('Sem acesso ao microfone: ' + e.message); }
 };
 
+async function loadMem() {
+  const box = $('memlist'); box.textContent = 'Carregando…';
+  const r = await fetch('/memory'); const items = await r.json();
+  box.textContent = items.length ? '' : 'Ainda não há nada guardado.';
+  for (const m of items) {
+    const row = document.createElement('div'); row.className = 'mem';
+    const sp = document.createElement('span'); sp.textContent = m.text;
+    const sm = document.createElement('small');
+    sm.textContent = (m.source === 'web' ? 'aprendido na web' : 'você ensinou') + ' · ' + new Date(m.created * 1000).toLocaleDateString('pt-BR');
+    sp.appendChild(sm);
+    const del = document.createElement('button'); del.textContent = 'Apagar';
+    del.onclick = async () => { await fetch('/memory/' + m.id, {method: 'DELETE'}); loadMem(); };
+    row.append(sp, del); box.appendChild(row);
+  }
+}
+$('memBtn').onclick = () => { $('memDlg').showModal(); loadMem(); };
+$('memClose').onclick = () => $('memDlg').close();
+$('memAdd').onclick = async () => {
+  const v = $('memNew').value.trim(); if (!v) return;
+  await saveMemory(v, 'usuario'); $('memNew').value = ''; loadMem();
+};
 $('send').onclick = () => send(txt.value);
 txt.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(txt.value); } });
 $('new').onclick = () => { history = []; log.textContent = ''; setStatus(''); };
@@ -578,10 +800,11 @@ exec .venv/bin/uvicorn main:app --host 127.0.0.1 --port 8080
 EOF
   cat > "$BASE/start_llm.sh" <<'EOF'
 #!/usr/bin/env bash
-# NGL = camadas na GPU. Com 2 GB de VRAM comece em 8 e suba de 2 em 2
-# olhando o nvidia-smi até ficar perto de 1800 MiB.
-NGL="${NGL:-8}"
-MODEL="${MODEL:-$HOME/models/Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf}"
+# NGL = camadas na GPU (o modelo 3B tem 36). Com 2 GB de VRAM comece em 16 e
+# ajuste de 2 em 2 olhando o nvidia-smi: perto de 1800 MiB é o limite.
+# Para trocar de modelo, mude MODEL (qualquer arquivo .gguf em ~/models).
+NGL="${NGL:-16}"
+MODEL="${MODEL:-$HOME/models/Qwen2.5-3B-Instruct-Q4_K_M.gguf}"
 exec "$HOME/llama.cpp/build/bin/llama-server" -m "$MODEL" -ngl "$NGL" -c 4096 -t 6 \
   --host 127.0.0.1 --port 8081
 EOF
@@ -598,6 +821,11 @@ EOF
 # ----------------------------------------------------------- 6. Android SDK
 instalar_android_sdk() {
   local SDK="$HOME/Android/Sdk" JH=/usr/lib/jvm/java-17-openjdk-amd64
+  if [ -x "$SDK/build-tools/34.0.0/aapt2" ]; then
+    echo "Android SDK já instalado, pulando"
+    grep -q '^ANDROID_HOME=' "$SRV/.env" || printf 'ANDROID_HOME=%s\nJAVA_HOME=%s\n' "$SDK" "$JH" >> "$SRV/.env"
+    return 0
+  fi
   mkdir -p "$SDK/cmdline-tools"
   curl -L --fail -o /tmp/cmdtools.zip \
     https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip || return 1
@@ -623,9 +851,9 @@ instalar_llama() {
   cmake --build build --config Release -j 4 --target llama-server || return 1
   mkdir -p "$HOME/models"
   if [ ! -f "$MODEL" ]; then
-    echo "==> Baixando o modelo (~4,7 GB; retoma se cair)"
+    echo "==> Baixando o modelo (~1,9 GB; retoma se cair)"
     curl -L --fail -C - -o "$MODEL" \
-      https://huggingface.co/bartowski/Qwen2.5-Coder-7B-Instruct-GGUF/resolve/main/Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf
+      https://huggingface.co/bartowski/Qwen2.5-3B-Instruct-GGUF/resolve/main/Qwen2.5-3B-Instruct-Q4_K_M.gguf
   fi
 }
 
@@ -663,7 +891,7 @@ After=network.target
 
 [Service]
 User=$USER
-Environment=NGL=8
+Environment=NGL=16
 ExecStart=/usr/bin/env bash $BASE/start_llm.sh
 Restart=on-failure
 RestartSec=10
@@ -687,6 +915,7 @@ WantedBy=multi-user.target
 UNIT
   sudo systemctl daemon-reload
   sudo systemctl enable localai-llm.service localai-server.service  # sobem no próximo boot
+  sudo systemctl try-restart localai-llm.service localai-server.service || true  # só se já estiverem ativos
 }
 
 step "1/9 Pacotes"                  instalar_pacotes
@@ -711,6 +940,7 @@ echo
 echo " Agora: 1) REINICIE o PC"
 echo "        2) nvidia-smi             (deve listar a GTX 960)"
 echo "        3) espere ~1 minuto e abra o atalho 'IA Local' na área de trabalho"
+echo "        (Se sobrou o modelo antigo de 7B em ~/models, pode apagar para liberar 4,7 GB)"
 echo "           (ou o navegador em http://localhost:8080)"
 echo "        Se não abrir:  systemctl status localai-llm localai-server"
 echo "=============================================================="

@@ -30,6 +30,16 @@
   textarea { flex:1; resize:none; font:inherit; color:var(--txt); background:var(--bg); border:1px solid var(--line);
              border-radius:10px; padding:10px 12px; height:48px; max-height:160px; }
   #mic.rec { background:#c0392b; border-color:#c0392b; color:#fff; }
+  .msg .tools { margin-top:6px; }
+  .msg .tools button { font-size:12px; padding:2px 8px; color:var(--mut); }
+  dialog { background:var(--panel); color:var(--txt); border:1px solid var(--line); border-radius:12px;
+           width:min(720px,94vw); max-height:84vh; padding:16px; }
+  dialog::backdrop { background:rgba(0,0,0,.5); }
+  #memlist { max-height:50vh; overflow-y:auto; margin:10px 0; display:flex; flex-direction:column; gap:8px; }
+  .mem { border:1px solid var(--line); border-radius:8px; padding:8px 10px; display:flex; gap:8px;
+         align-items:flex-start; font-size:14px; white-space:pre-wrap; }
+  .mem span { flex:1; word-break:break-word; }
+  .mem small { color:var(--mut); display:block; }
   #status { color:var(--mut); font-size:13px; padding:0 16px 8px; min-height:22px; background:var(--panel); }
 </style>
 </head>
@@ -37,9 +47,20 @@
 <header>
   <h1>IA Local</h1>
   <label><input type="checkbox" id="web"> Pesquisar na web</label>
+  <label title="Guarda na memória o que descobrir pesquisando"><input type="checkbox" id="learn" checked> Aprender com pesquisas</label>
   <label><input type="checkbox" id="speak"> Falar as respostas</label>
+  <button id="memBtn">🧠 Memória</button>
   <button id="new">Nova conversa</button>
 </header>
+<dialog id="memDlg">
+  <strong>Memória de longo prazo</strong>
+  <div style="color:var(--mut);font-size:14px">Tudo que a IA sabe sobre você e o que aprendeu. Apague o que estiver errado.</div>
+  <div id="memlist"></div>
+  <div style="display:flex;gap:8px">
+    <input id="memNew" placeholder="Ensinar algo novo…" style="flex:1;font:inherit;padding:8px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--txt)">
+    <button id="memAdd">Ensinar</button><button id="memClose">Fechar</button>
+  </div>
+</dialog>
 <div id="log"></div>
 <div id="status"></div>
 <div id="bar">
@@ -76,6 +97,24 @@ function addMsg(role, text) {
   return d;
 }
 
+async function saveMemory(text, source) {
+  const r = await fetch('/memory', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                    body: JSON.stringify({text, source})});
+  if (!r.ok) throw new Error('Servidor respondeu ' + r.status);
+  return r.json();
+}
+function addRememberButton(el, question, answer) {
+  const t = document.createElement('div'); t.className = 'tools';
+  const b = document.createElement('button'); b.textContent = '📌 Lembrar disso';
+  b.onclick = async () => {
+    try { await saveMemory(`Pergunta: ${question}\nResposta: ${answer}`, 'usuario'); b.textContent = '✔ Guardado'; b.disabled = true; }
+    catch (e) { b.textContent = 'Erro ao guardar'; }
+  };
+  t.appendChild(b); el.appendChild(t);
+}
+// "lembre que ..." / "guarde que ..." / "aprenda que ..." ensina direto, sem precisar do botão
+const TEACH = /^\s*(lembre-se|lembre|guarde|aprenda|anote)(\s+disso|\s+que)?[:,]?\s+(.{4,})/is;
+
 async function send(text) {
   text = text.trim();
   if (!text || busy) return;
@@ -83,6 +122,10 @@ async function send(text) {
   txt.value = '';
   history.push({role: 'user', content: text});
   addMsg('user', text);
+  const teach = text.match(TEACH);
+  if (teach) { try { await saveMemory(teach[3].trim(), 'usuario'); } catch (e) {} }
+  const wantWeb = $('web').checked;
+  let webResults = 0;
   const out = addMsg('assistant', '…');
   setStatus($('web').checked ? 'Pesquisando na web e pensando…' : 'Pensando…');
   let answer = '';
@@ -92,6 +135,7 @@ async function send(text) {
       body: JSON.stringify({messages: history.slice(-12), web: $('web').checked})
     });
     if (!r.ok) throw new Error('Servidor respondeu ' + r.status);
+    webResults = parseInt(r.headers.get('X-Web-Results') || '0', 10);
     const reader = r.body.getReader(), dec = new TextDecoder();
     let buf = '';
     for (;;) {
@@ -112,6 +156,13 @@ async function send(text) {
     }
     history.push({role: 'assistant', content: answer});
     setStatus('');
+    if (answer) addRememberButton(out, text, answer);
+    if (wantWeb && webResults === 0 && answer) {
+      setStatus('Não consegui pesquisar na web agora (sem internet?). Respondi só com o que eu sei.');
+    }
+    if (webResults > 0 && $('learn').checked && answer && !teach) {
+      try { await saveMemory(`Pergunta: ${text}\nResposta (pesquisa na web em ${new Date().toLocaleDateString('pt-BR')}): ${answer}`, 'web'); } catch (e) {}
+    }
     if ($('speak').checked && answer) await speak(answer);
   } catch (e) {
     out.classList.add('err'); render(out, 'Erro: ' + e.message);
@@ -167,6 +218,27 @@ $('mic').onclick = async () => {
   } catch (e) { setStatus('Sem acesso ao microfone: ' + e.message); }
 };
 
+async function loadMem() {
+  const box = $('memlist'); box.textContent = 'Carregando…';
+  const r = await fetch('/memory'); const items = await r.json();
+  box.textContent = items.length ? '' : 'Ainda não há nada guardado.';
+  for (const m of items) {
+    const row = document.createElement('div'); row.className = 'mem';
+    const sp = document.createElement('span'); sp.textContent = m.text;
+    const sm = document.createElement('small');
+    sm.textContent = (m.source === 'web' ? 'aprendido na web' : 'você ensinou') + ' · ' + new Date(m.created * 1000).toLocaleDateString('pt-BR');
+    sp.appendChild(sm);
+    const del = document.createElement('button'); del.textContent = 'Apagar';
+    del.onclick = async () => { await fetch('/memory/' + m.id, {method: 'DELETE'}); loadMem(); };
+    row.append(sp, del); box.appendChild(row);
+  }
+}
+$('memBtn').onclick = () => { $('memDlg').showModal(); loadMem(); };
+$('memClose').onclick = () => $('memDlg').close();
+$('memAdd').onclick = async () => {
+  const v = $('memNew').value.trim(); if (!v) return;
+  await saveMemory(v, 'usuario'); $('memNew').value = ''; loadMem();
+};
 $('send').onclick = () => send(txt.value);
 txt.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(txt.value); } });
 $('new').onclick = () => { history = []; log.textContent = ''; setStatus(''); };

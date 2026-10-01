@@ -6,6 +6,7 @@ Rotas:
   POST /chat     -> repassa a conversa ao llama-server (streaming), com pesquisa web opcional
   POST /stt      -> voz -> texto (faster-whisper, local)
   POST /tts      -> texto -> voz (Piper, local), devolve WAV
+  GET/POST /memory, DELETE /memory/{id} -> memória de longo prazo (o que a IA aprendeu)
   POST /search   -> pesquisa na web (SearXNG ou DuckDuckGo)
   POST /fetch    -> baixa uma página e devolve o texto
   POST /build    -> recebe um .zip de projeto Gradle e devolve o APK debug
@@ -20,6 +21,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 import uuid
 import wave
 import zipfile
@@ -32,6 +34,7 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 import config
+import memory
 
 app = FastAPI(title="Local AI Server")
 config.WORK_DIR.mkdir(parents=True, exist_ok=True)
@@ -69,7 +72,17 @@ def _web_search_sync(query: str, limit: int) -> list[dict]:
         items = r.json().get("results", [])[:limit]
         return [{"title": x.get("title"), "url": x.get("url"), "snippet": x.get("content")} for x in items]
     from ddgs import DDGS
-    items = DDGS().text(query, max_results=limit)
+    items = []
+    for attempt in range(3):  # o DuckDuckGo às vezes devolve lista vazia; tenta de novo
+        try:
+            items = DDGS().text(query, max_results=limit)
+        except Exception:
+            if attempt == 2:
+                raise
+            items = []
+        if items:
+            break
+        time.sleep(0.7)
     return [{"title": x.get("title"), "url": x.get("href"), "snippet": x.get("body")} for x in items]
 
 
@@ -80,11 +93,19 @@ class ChatRequest(BaseModel):
     web: bool = False
 
 
-async def _build_messages(req: ChatRequest) -> list[dict]:
+async def _build_messages(req: ChatRequest) -> tuple[list[dict], int]:
     system = f"{config.SYSTEM_PROMPT}\nData de hoje: {date.today().isoformat()}."
     msgs = [{"role": "system", "content": system}]
+    last = next((m["content"] for m in reversed(req.messages) if m.get("role") == "user"), "")
+    mems = await asyncio.to_thread(memory.search, last, 4)
+    if mems:
+        notes = "\n".join(f"- {m['text'][:600]}" for m in mems)
+        msgs[0]["content"] += (
+            "\n\nCoisas que você já aprendeu ou que o usuário te ensinou (podem estar desatualizadas; "
+            "use quando forem relevantes):\n" + notes
+        )
+    n_web = 0
     if req.web:
-        last = next((m["content"] for m in reversed(req.messages) if m.get("role") == "user"), "")
         try:
             results = await asyncio.to_thread(_web_search_sync, last, 5)
         except Exception as e:  # sem internet, bloqueio etc.: segue sem a pesquisa
@@ -93,12 +114,13 @@ async def _build_messages(req: ChatRequest) -> list[dict]:
         if results:
             ctx = "\n".join(f"[{i+1}] {r['title']} - {r['url']}\n{r['snippet']}" for i, r in enumerate(results))
             msgs[0]["content"] += "\n\nResultados da pesquisa na web:\n" + ctx
-    return msgs + req.messages
+            n_web = len(results)
+    return msgs + req.messages, n_web
 
 
 @app.post("/chat", dependencies=[Depends(require_token)])
 async def chat(req: ChatRequest):
-    messages = await _build_messages(req)
+    messages, n_web = await _build_messages(req)
     payload = {"messages": messages, "max_tokens": req.max_tokens,
                "temperature": req.temperature, "stream": True}
 
@@ -116,7 +138,33 @@ async def chat(req: ChatRequest):
             except httpx.ConnectError:
                 yield b'data: {"error": "O modelo (llama-server) esta desligado"}\n\n'
 
-    return StreamingResponse(stream(), media_type="text/event-stream")
+    # X-Web-Results: quantos resultados da web foram usados (0 = a pesquisa falhou ou não foi pedida)
+    return StreamingResponse(stream(), media_type="text/event-stream", headers={"X-Web-Results": str(n_web)})
+
+
+# ------------------------------------------------------------------- memória
+class MemoryIn(BaseModel):
+    text: str
+    source: str = "usuario"
+
+
+@app.get("/memory", dependencies=[Depends(require_token)])
+async def memory_list():
+    return await asyncio.to_thread(memory.list_all)
+
+
+@app.post("/memory", dependencies=[Depends(require_token)])
+async def memory_add(item: MemoryIn):
+    try:
+        return await asyncio.to_thread(memory.add, item.text, item.source[:20])
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.delete("/memory/{mem_id}", dependencies=[Depends(require_token)])
+async def memory_delete(mem_id: int):
+    await asyncio.to_thread(memory.delete, mem_id)
+    return {"ok": True}
 
 
 # ------------------------------------------------------------------ voz (local)
