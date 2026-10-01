@@ -35,6 +35,9 @@ STT_DICA = os.environ.get(
     "Wi-Fi, Bluetooth, firmware, GPU, CPU, Python, Linux, Kotlin, Java.",
 )
 
+# Limpeza do áudio (ffmpeg: tira ruído grave e chiado, nivela o volume) antes de reconhecer a fala. STT_FILTRO=0 desliga.
+STT_FILTRO = os.environ.get("STT_FILTRO", "1") != "0"
+
 # Texto -> voz, voz FEMININA (Kokoro, pt-BR). Se os arquivos não existirem, cai no Piper (masculina).
 # Vozes pt-BR do Kokoro: pf_dora (feminina), pm_alex e pm_santa (masculinas)
 KOKORO_MODEL = Path(os.environ.get("KOKORO_MODEL", str(HOME / "models" / "kokoro-v1.0.onnx")))
@@ -54,7 +57,11 @@ SYSTEM_PROMPT = os.environ.get(
     "sem avisos desnecessários e sem rodeios: trate o usuário como um adulto capaz. "
     "Entenda os pedidos de forma sumária: capte a essência de pedidos curtos ou vagos (por exemplo, "
     "\"app de lista\" ou \"gato astronauta\"), assuma padrões sensatos e entregue em vez de devolver perguntas; "
-    "só pergunte se faltar algo sem o qual não dá para fazer. Respostas curtas e objetivas, com detalhes só se pedirem.",
+    "só pergunte se faltar algo sem o qual não dá para fazer. Respostas curtas e objetivas, com detalhes só se pedirem. "
+    "O usuário muitas vezes fala em vez de digitar, e a fala vira texto automaticamente: pode haver palavras trocadas por "
+    "outras de som parecido, termos em inglês escritos errado, números por extenso e pontuação ausente. Interprete pelo "
+    "contexto o que a pessoa quis dizer (por exemplo, \"i esse pe trinta e dois\" é ESP32) e responda ao pedido real, "
+    "sem comentar o erro de transcrição.",
 )
 
 # Banco da memória de longo prazo (o que o usuário ensina e o que a IA aprende)

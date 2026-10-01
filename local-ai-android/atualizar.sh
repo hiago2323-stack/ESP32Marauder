@@ -76,6 +76,9 @@ STT_DICA = os.environ.get(
     "Wi-Fi, Bluetooth, firmware, GPU, CPU, Python, Linux, Kotlin, Java.",
 )
 
+# Limpeza do áudio (ffmpeg: tira ruído grave e chiado, nivela o volume) antes de reconhecer a fala. STT_FILTRO=0 desliga.
+STT_FILTRO = os.environ.get("STT_FILTRO", "1") != "0"
+
 # Texto -> voz, voz FEMININA (Kokoro, pt-BR). Se os arquivos não existirem, cai no Piper (masculina).
 # Vozes pt-BR do Kokoro: pf_dora (feminina), pm_alex e pm_santa (masculinas)
 KOKORO_MODEL = Path(os.environ.get("KOKORO_MODEL", str(HOME / "models" / "kokoro-v1.0.onnx")))
@@ -95,7 +98,11 @@ SYSTEM_PROMPT = os.environ.get(
     "sem avisos desnecessários e sem rodeios: trate o usuário como um adulto capaz. "
     "Entenda os pedidos de forma sumária: capte a essência de pedidos curtos ou vagos (por exemplo, "
     "\"app de lista\" ou \"gato astronauta\"), assuma padrões sensatos e entregue em vez de devolver perguntas; "
-    "só pergunte se faltar algo sem o qual não dá para fazer. Respostas curtas e objetivas, com detalhes só se pedirem.",
+    "só pergunte se faltar algo sem o qual não dá para fazer. Respostas curtas e objetivas, com detalhes só se pedirem. "
+    "O usuário muitas vezes fala em vez de digitar, e a fala vira texto automaticamente: pode haver palavras trocadas por "
+    "outras de som parecido, termos em inglês escritos errado, números por extenso e pontuação ausente. Interprete pelo "
+    "contexto o que a pessoa quis dizer (por exemplo, \"i esse pe trinta e dois\" é ESP32) e responda ao pedido real, "
+    "sem comentar o erro de transcrição.",
 )
 
 # Banco da memória de longo prazo (o que o usuário ensina e o que a IA aprende)
@@ -409,7 +416,7 @@ async def _build_messages(req: ChatRequest) -> tuple[list[dict], int]:
 async def chat(req: ChatRequest):
     messages, n_web = await _build_messages(req)
     payload = {"messages": messages, "max_tokens": req.max_tokens, "temperature": req.temperature,
-               "top_p": 0.9, "repeat_penalty": 1.05, "cache_prompt": True, "stream": True}
+               "top_p": 0.9, "top_k": 40, "min_p": 0.05, "repeat_penalty": 1.05, "cache_prompt": True, "stream": True}
 
     async def stream():
         async with httpx.AsyncClient(timeout=None) as client:
@@ -754,18 +761,45 @@ def _carrega_whisper():
         return WhisperModel(config.WHISPER_FALLBACK, device="cpu", compute_type="int8", cpu_threads=nucleos)
 
 
+def _limpa_audio(path: str) -> str | None:
+    """Prepara a gravação para o Whisper: 16 kHz mono, tira graves de ruído (ventoinha, mesa), reduz o
+    chiado e nivela o volume (fala baixa ou longe do microfone vira legível). Devolve o .wav limpo, ou
+    None se o ffmpeg não existe ou falhou (aí o áudio original é usado, sem perda)."""
+    if not config.STT_FILTRO or not shutil.which("ffmpeg"):
+        return None
+    saida = path + ".limpo.wav"
+    filtro = "highpass=f=80,afftdn=nf=-30,loudnorm=I=-16:TP=-1.5:LRA=11"
+    try:
+        r = subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", path, "-af", filtro,
+                            "-ar", "16000", "-ac", "1", saida], capture_output=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0 or not os.path.exists(saida) or os.path.getsize(saida) < 1000:
+        Path(saida).unlink(missing_ok=True)
+        return None
+    return saida
+
+
 def _stt_sync(path: str) -> str:
     global _whisper
-    with _voice_lock:
-        if _whisper is None:
-            _whisper = _carrega_whisper()
-            recursos.registra("whisper", _descarrega_whisper)
-        recursos.usou("whisper")
-        segments, _ = _whisper.transcribe(
-            path, language="pt", beam_size=5, vad_filter=True,
-            vad_parameters={"min_silence_duration_ms": 500},
-            initial_prompt=config.STT_DICA, condition_on_previous_text=False)
-        return " ".join(s.text.strip() for s in segments).strip()
+    limpo = _limpa_audio(path)
+    try:
+        with _voice_lock:
+            if _whisper is None:
+                _whisper = _carrega_whisper()
+                recursos.registra("whisper", _descarrega_whisper)
+            recursos.usou("whisper")
+            segments, _ = _whisper.transcribe(
+                limpo or path, language="pt", beam_size=5, best_of=5,
+                temperature=[0.0, 0.2, 0.4],           # se a primeira tentativa sair ruim, tenta de novo
+                vad_filter=True,
+                vad_parameters={"threshold": 0.45, "min_silence_duration_ms": 600, "speech_pad_ms": 300},
+                initial_prompt=config.STT_DICA, condition_on_previous_text=False,
+                no_speech_threshold=0.5, compression_ratio_threshold=2.2, log_prob_threshold=-1.0)
+            return " ".join(s.text.strip() for s in segments).strip()
+    finally:
+        if limpo:
+            Path(limpo).unlink(missing_ok=True)
 
 
 def _get_kokoro():
@@ -1979,8 +2013,12 @@ EOF
 
 GPU NVIDIA: lê a temperatura e ajusta a ventoinha por uma curva. Tenta primeiro pelo NVML
 (sem precisar de tela) e, se a placa não aceitar, pelo nvidia-settings (precisa do Coolbits).
-CPU (opcional): se a placa-mãe expõe um PWM no Linux, defina FANCTL_CPU_PWM com o caminho
-(ex.: /sys/class/hwmon/hwmon3/pwm2). Veja o diagnostico_fans.sh para descobrir.
+CPU: se a placa-mãe expõe um PWM no Linux, ele é achado sozinho (prefere a ventoinha rotulada "cpu");
+para escolher à mão, defina FANCTL_CPU_PWM com o caminho (ex.: /sys/class/hwmon/hwmon3/pwm2) e, para
+desligar o controle da CPU, FANCTL_CPU_PWM=off. Veja o diagnostico_fans.sh para descobrir.
+
+SOB DEMANDA: além da temperatura, a rotação acompanha a CARGA (uso da GPU e da CPU). Quando a IA começa a
+trabalhar, as ventoinhas já sobem antes de o calor aparecer; ao terminar, descem devagar.
 
 SEGURANÇA: ao parar (ou se perder a leitura da temperatura) devolve o controle ao automático
 da placa. A curva nunca deixa a ventoinha abaixo do mínimo.
@@ -1999,6 +2037,16 @@ CURVA_CPU = [(40, 30), (55, 45), (65, 65), (75, 85), (85, 100)]
 INTERVALO = float(os.environ.get("FANCTL_INTERVALO", "2"))
 DESCE_POR_CICLO = 2          # a rotação sobe na hora, mas desce devagar (evita "serrote")
 FALHAS_PARA_RESTAURAR = 3
+
+
+def alvo_cpu(temp, carga):
+    """Rotação desejada da CPU. Carga alta (a IA gerando resposta) sobe antes de esquentar."""
+    alvo = interpola(CURVA_CPU, temp)
+    if carga is not None and carga >= 60:
+        alvo = max(alvo, 50)
+    if carga is not None and carga >= 85:
+        alvo = max(alvo, 65)
+    return int(round(min(100, max(30, alvo))))
 
 
 def interpola(curva, t):
@@ -2127,6 +2175,43 @@ def temp_cpu():
     return None
 
 
+def carga_cpu(anterior=[None]):
+    """Uso da CPU (%) desde a última chamada, lido de /proc/stat. None na primeira chamada."""
+    try:
+        v = [int(x) for x in open("/proc/stat").readline().split()[1:]]
+    except (OSError, ValueError):
+        return None
+    total, ocioso = sum(v), v[3] + (v[4] if len(v) > 4 else 0)
+    ant, anterior[0] = anterior[0], (total, ocioso)
+    if ant is None or total <= ant[0]:
+        return None
+    return 100.0 * (1 - (ocioso - ant[1]) / (total - ant[0]))
+
+
+def acha_pwm_cpu(raiz="/sys/class/hwmon"):
+    """Procura um PWM de placa-mãe controlável. Prefere o canal cuja ventoinha se chama 'cpu'; senão,
+    o primeiro que tenha ventoinha girando. Devolve o caminho (ex.: .../hwmon3/pwm2) ou None."""
+    achados = []
+    for d in sorted(glob.glob(f"{raiz}/hwmon*")):
+        for pwm in sorted(glob.glob(f"{d}/pwm[0-9]")):
+            n = pwm[len(d) + 4:]
+            if not os.path.exists(pwm + "_enable") or not os.access(pwm, os.W_OK):
+                continue
+            try:
+                rpm = int(open(f"{d}/fan{n}_input").read())
+            except (OSError, ValueError):
+                continue
+            try:
+                rotulo = open(f"{d}/fan{n}_label").read().strip().lower()
+            except OSError:
+                rotulo = ""
+            if "cpu" in rotulo:
+                return pwm
+            if rpm > 0:
+                achados.append(pwm)
+    return achados[0] if achados else None
+
+
 class CpuPwm:
     """Ventoinha ligada a um PWM da placa-mãe (ex.: /sys/class/hwmon/hwmon3/pwm2)."""
 
@@ -2152,8 +2237,8 @@ class CpuPwm:
 
 # ----------------------------------------------------------------------------- laço principal
 class Controlador:
-    def __init__(self, gpu, cpu=None, leitura_cpu=temp_cpu):
-        self.gpu, self.cpu, self.leitura_cpu = gpu, cpu, leitura_cpu
+    def __init__(self, gpu, cpu=None, leitura_cpu=temp_cpu, leitura_carga=carga_cpu):
+        self.gpu, self.cpu, self.leitura_cpu, self.leitura_carga = gpu, cpu, leitura_cpu, leitura_carga
         self.sg, self.sc = Suavizador(), Suavizador()
         self.falhas = 0
         self.ativo = False
@@ -2176,7 +2261,7 @@ class Controlador:
         if self.cpu:
             tc = self.leitura_cpu()
             if tc is not None:
-                pc = self.sc.passo(int(round(min(100, max(30, interpola(CURVA_CPU, tc))))))
+                pc = self.sc.passo(alvo_cpu(tc, self.leitura_carga()))
                 self.cpu.definir(pc)
         return pg, pc
 
@@ -2190,7 +2275,14 @@ class Controlador:
 
 def main():
     gpu = GpuNvidia()
-    cpu = CpuPwm(os.environ["FANCTL_CPU_PWM"]) if os.environ.get("FANCTL_CPU_PWM") else None
+    pwm = os.environ.get("FANCTL_CPU_PWM", "")
+    if pwm.lower() == "off":
+        pwm = ""
+    elif not pwm:
+        pwm = acha_pwm_cpu() or ""
+        if pwm:
+            print(f"[fanctl] PWM da CPU achado sozinho: {pwm}", flush=True)
+    cpu = CpuPwm(pwm) if pwm else None
     ctl = Controlador(gpu, cpu)
 
     def sair(*_):

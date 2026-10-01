@@ -266,7 +266,7 @@ async def _build_messages(req: ChatRequest) -> tuple[list[dict], int]:
 async def chat(req: ChatRequest):
     messages, n_web = await _build_messages(req)
     payload = {"messages": messages, "max_tokens": req.max_tokens, "temperature": req.temperature,
-               "top_p": 0.9, "repeat_penalty": 1.05, "cache_prompt": True, "stream": True}
+               "top_p": 0.9, "top_k": 40, "min_p": 0.05, "repeat_penalty": 1.05, "cache_prompt": True, "stream": True}
 
     async def stream():
         async with httpx.AsyncClient(timeout=None) as client:
@@ -611,18 +611,45 @@ def _carrega_whisper():
         return WhisperModel(config.WHISPER_FALLBACK, device="cpu", compute_type="int8", cpu_threads=nucleos)
 
 
+def _limpa_audio(path: str) -> str | None:
+    """Prepara a gravação para o Whisper: 16 kHz mono, tira graves de ruído (ventoinha, mesa), reduz o
+    chiado e nivela o volume (fala baixa ou longe do microfone vira legível). Devolve o .wav limpo, ou
+    None se o ffmpeg não existe ou falhou (aí o áudio original é usado, sem perda)."""
+    if not config.STT_FILTRO or not shutil.which("ffmpeg"):
+        return None
+    saida = path + ".limpo.wav"
+    filtro = "highpass=f=80,afftdn=nf=-30,loudnorm=I=-16:TP=-1.5:LRA=11"
+    try:
+        r = subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", path, "-af", filtro,
+                            "-ar", "16000", "-ac", "1", saida], capture_output=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0 or not os.path.exists(saida) or os.path.getsize(saida) < 1000:
+        Path(saida).unlink(missing_ok=True)
+        return None
+    return saida
+
+
 def _stt_sync(path: str) -> str:
     global _whisper
-    with _voice_lock:
-        if _whisper is None:
-            _whisper = _carrega_whisper()
-            recursos.registra("whisper", _descarrega_whisper)
-        recursos.usou("whisper")
-        segments, _ = _whisper.transcribe(
-            path, language="pt", beam_size=5, vad_filter=True,
-            vad_parameters={"min_silence_duration_ms": 500},
-            initial_prompt=config.STT_DICA, condition_on_previous_text=False)
-        return " ".join(s.text.strip() for s in segments).strip()
+    limpo = _limpa_audio(path)
+    try:
+        with _voice_lock:
+            if _whisper is None:
+                _whisper = _carrega_whisper()
+                recursos.registra("whisper", _descarrega_whisper)
+            recursos.usou("whisper")
+            segments, _ = _whisper.transcribe(
+                limpo or path, language="pt", beam_size=5, best_of=5,
+                temperature=[0.0, 0.2, 0.4],           # se a primeira tentativa sair ruim, tenta de novo
+                vad_filter=True,
+                vad_parameters={"threshold": 0.45, "min_silence_duration_ms": 600, "speech_pad_ms": 300},
+                initial_prompt=config.STT_DICA, condition_on_previous_text=False,
+                no_speech_threshold=0.5, compression_ratio_threshold=2.2, log_prob_threshold=-1.0)
+            return " ".join(s.text.strip() for s in segments).strip()
+    finally:
+        if limpo:
+            Path(limpo).unlink(missing_ok=True)
 
 
 def _get_kokoro():

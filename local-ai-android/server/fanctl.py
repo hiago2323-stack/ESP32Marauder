@@ -3,8 +3,12 @@
 
 GPU NVIDIA: lê a temperatura e ajusta a ventoinha por uma curva. Tenta primeiro pelo NVML
 (sem precisar de tela) e, se a placa não aceitar, pelo nvidia-settings (precisa do Coolbits).
-CPU (opcional): se a placa-mãe expõe um PWM no Linux, defina FANCTL_CPU_PWM com o caminho
-(ex.: /sys/class/hwmon/hwmon3/pwm2). Veja o diagnostico_fans.sh para descobrir.
+CPU: se a placa-mãe expõe um PWM no Linux, ele é achado sozinho (prefere a ventoinha rotulada "cpu");
+para escolher à mão, defina FANCTL_CPU_PWM com o caminho (ex.: /sys/class/hwmon/hwmon3/pwm2) e, para
+desligar o controle da CPU, FANCTL_CPU_PWM=off. Veja o diagnostico_fans.sh para descobrir.
+
+SOB DEMANDA: além da temperatura, a rotação acompanha a CARGA (uso da GPU e da CPU). Quando a IA começa a
+trabalhar, as ventoinhas já sobem antes de o calor aparecer; ao terminar, descem devagar.
 
 SEGURANÇA: ao parar (ou se perder a leitura da temperatura) devolve o controle ao automático
 da placa. A curva nunca deixa a ventoinha abaixo do mínimo.
@@ -23,6 +27,16 @@ CURVA_CPU = [(40, 30), (55, 45), (65, 65), (75, 85), (85, 100)]
 INTERVALO = float(os.environ.get("FANCTL_INTERVALO", "2"))
 DESCE_POR_CICLO = 2          # a rotação sobe na hora, mas desce devagar (evita "serrote")
 FALHAS_PARA_RESTAURAR = 3
+
+
+def alvo_cpu(temp, carga):
+    """Rotação desejada da CPU. Carga alta (a IA gerando resposta) sobe antes de esquentar."""
+    alvo = interpola(CURVA_CPU, temp)
+    if carga is not None and carga >= 60:
+        alvo = max(alvo, 50)
+    if carga is not None and carga >= 85:
+        alvo = max(alvo, 65)
+    return int(round(min(100, max(30, alvo))))
 
 
 def interpola(curva, t):
@@ -151,6 +165,43 @@ def temp_cpu():
     return None
 
 
+def carga_cpu(anterior=[None]):
+    """Uso da CPU (%) desde a última chamada, lido de /proc/stat. None na primeira chamada."""
+    try:
+        v = [int(x) for x in open("/proc/stat").readline().split()[1:]]
+    except (OSError, ValueError):
+        return None
+    total, ocioso = sum(v), v[3] + (v[4] if len(v) > 4 else 0)
+    ant, anterior[0] = anterior[0], (total, ocioso)
+    if ant is None or total <= ant[0]:
+        return None
+    return 100.0 * (1 - (ocioso - ant[1]) / (total - ant[0]))
+
+
+def acha_pwm_cpu(raiz="/sys/class/hwmon"):
+    """Procura um PWM de placa-mãe controlável. Prefere o canal cuja ventoinha se chama 'cpu'; senão,
+    o primeiro que tenha ventoinha girando. Devolve o caminho (ex.: .../hwmon3/pwm2) ou None."""
+    achados = []
+    for d in sorted(glob.glob(f"{raiz}/hwmon*")):
+        for pwm in sorted(glob.glob(f"{d}/pwm[0-9]")):
+            n = pwm[len(d) + 4:]
+            if not os.path.exists(pwm + "_enable") or not os.access(pwm, os.W_OK):
+                continue
+            try:
+                rpm = int(open(f"{d}/fan{n}_input").read())
+            except (OSError, ValueError):
+                continue
+            try:
+                rotulo = open(f"{d}/fan{n}_label").read().strip().lower()
+            except OSError:
+                rotulo = ""
+            if "cpu" in rotulo:
+                return pwm
+            if rpm > 0:
+                achados.append(pwm)
+    return achados[0] if achados else None
+
+
 class CpuPwm:
     """Ventoinha ligada a um PWM da placa-mãe (ex.: /sys/class/hwmon/hwmon3/pwm2)."""
 
@@ -176,8 +227,8 @@ class CpuPwm:
 
 # ----------------------------------------------------------------------------- laço principal
 class Controlador:
-    def __init__(self, gpu, cpu=None, leitura_cpu=temp_cpu):
-        self.gpu, self.cpu, self.leitura_cpu = gpu, cpu, leitura_cpu
+    def __init__(self, gpu, cpu=None, leitura_cpu=temp_cpu, leitura_carga=carga_cpu):
+        self.gpu, self.cpu, self.leitura_cpu, self.leitura_carga = gpu, cpu, leitura_cpu, leitura_carga
         self.sg, self.sc = Suavizador(), Suavizador()
         self.falhas = 0
         self.ativo = False
@@ -200,7 +251,7 @@ class Controlador:
         if self.cpu:
             tc = self.leitura_cpu()
             if tc is not None:
-                pc = self.sc.passo(int(round(min(100, max(30, interpola(CURVA_CPU, tc))))))
+                pc = self.sc.passo(alvo_cpu(tc, self.leitura_carga()))
                 self.cpu.definir(pc)
         return pg, pc
 
@@ -214,7 +265,14 @@ class Controlador:
 
 def main():
     gpu = GpuNvidia()
-    cpu = CpuPwm(os.environ["FANCTL_CPU_PWM"]) if os.environ.get("FANCTL_CPU_PWM") else None
+    pwm = os.environ.get("FANCTL_CPU_PWM", "")
+    if pwm.lower() == "off":
+        pwm = ""
+    elif not pwm:
+        pwm = acha_pwm_cpu() or ""
+        if pwm:
+            print(f"[fanctl] PWM da CPU achado sozinho: {pwm}", flush=True)
+    cpu = CpuPwm(pwm) if pwm else None
     ctl = Controlador(gpu, cpu)
 
     def sair(*_):
