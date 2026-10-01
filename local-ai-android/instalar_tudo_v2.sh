@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =====================================================================
-#  INSTALA TUDO - Linux Mint XFCE (base Ubuntu 24.04) - GTX 960 + Ryzen
+#  INSTALA TUDO - Linux Mint XFCE (base Ubuntu 22.04 ou 24.04) - GTX 960 + Ryzen
 #  Driver NVIDIA 580, CUDA 12.6, telemetria/GPU, IA local (llama.cpp, modelo 3B),
 #  servidor com conversa por TEXTO e VOZ (100% local), pesquisa web, MEMÓRIA que
 #  cresce com o tempo,
@@ -47,8 +47,20 @@ instalar_pacotes() {
     openjdk-17-jdk pipx flatpak lm-sensors psensor xfce4-sensors-plugin libcurl4-openssl-dev
 }
 
+# O repositório CUDA da NVIDIA também tem pacotes de DRIVER (com versões diferentes das do
+# Ubuntu). Se o apt misturar os dois, o driver quebra. Esta regra bloqueia os pacotes de
+# driver desse repositório: o driver vem SÓ do Ubuntu; do repositório CUDA vem só o toolkit.
+bloquear_driver_do_repo_cuda() {
+  sudo tee /etc/apt/preferences.d/cuda-sem-driver >/dev/null <<'PIN'
+Package: nvidia-* libnvidia-* xserver-xorg-video-nvidia-* libxnvctrl*
+Pin: origin developer.download.nvidia.com
+Pin-Priority: -1
+PIN
+}
+
 # ------------------------------------------------------------- 2. Driver
 instalar_driver() {
+  bloquear_driver_do_repo_cuda
   # 580 é o ÚLTIMO driver com suporte à GTX 960 (Maxwell). 590+ não reconhece a placa.
   if dpkg -l | grep -qE '^ii\s+nvidia-driver-(59|6)[0-9]'; then
     echo "Removendo driver 590+ (não suporta a GTX 960)"
@@ -60,12 +72,20 @@ instalar_driver() {
 
 # --------------------------------------------------------------- 3. CUDA
 instalar_cuda() {
+  bloquear_driver_do_repo_cuda
   if [ ! -x "$CUDA_DIR/bin/nvcc" ]; then
+    local base repo
+    base=$(. /etc/os-release; echo "${UBUNTU_CODENAME:-}")
+    case "$base" in
+      jammy) repo=ubuntu2204 ;;
+      noble) repo=ubuntu2404 ;;
+      *) echo "Base Ubuntu '$base' não suportada por este instalador."; return 1 ;;
+    esac
     curl -L --fail -o /tmp/cuda-keyring.deb \
-      https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb &&
+      "https://developer.download.nvidia.com/compute/cuda/repos/$repo/x86_64/cuda-keyring_1.1-1_all.deb" &&
     sudo dpkg -i /tmp/cuda-keyring.deb &&
     sudo apt update &&
-    sudo apt install -y cuda-toolkit-12-6   # não traz driver, então não briga com o 580
+    sudo apt install -y cuda-toolkit-12-6   # só o toolkit; o driver fica por conta do Ubuntu
   fi
 }
 
