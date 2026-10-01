@@ -10,6 +10,7 @@ import android.text.style.ForegroundColorSpan;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 
@@ -26,7 +27,7 @@ public class PainelTele extends LinearLayout {
     static final int FUNDO = 0xFF05090D, CARTAO = 0xFF0C161E, LINHA = 0xFF16313A;
     static final int VERDE = 0xFF00E58F, CIANO = 0xFF22D3EE, AMBAR = 0xFFFFB020, VERMELHO = 0xFFFF4D5E, MUDO = 0xFF6F9A8C;
 
-    private final TextView selos, metricas, detalhes;
+    private final TextView selos, metricas, detalhes, video, seta;
     private final LinearLayout painel;
     private final Grafico gGpu, gVram, gTemp, gCpu, gCpuT, gRam;
     private int falhas = 0;
@@ -38,13 +39,29 @@ public class PainelTele extends LinearLayout {
         setBackgroundColor(FUNDO);
 
         LinearLayout faixa = new LinearLayout(c);
-        faixa.setOrientation(VERTICAL);
+        faixa.setOrientation(HORIZONTAL);
+        faixa.setGravity(Gravity.CENTER_VERTICAL);
         faixa.setPadding(dp(12), dp(6), dp(12), dp(6));
 
+        ImageView logo = new ImageView(c);
+        logo.setImageResource(R.drawable.ic_marca);
+        faixa.addView(logo, new LayoutParams(dp(30), dp(34)));
+
+        LinearLayout textos = new LinearLayout(c);
+        textos.setOrientation(VERTICAL);
+        textos.setPadding(dp(10), 0, dp(6), 0);
         selos = texto(c, 11, VERDE, true);
         metricas = texto(c, 12, CIANO, false);
-        faixa.addView(selos);
-        faixa.addView(metricas);
+        video = texto(c, 11, AMBAR, false);
+        video.setVisibility(GONE);
+        textos.addView(selos);
+        textos.addView(metricas);
+        textos.addView(video);
+        faixa.addView(textos, new LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f));
+
+        seta = texto(c, 16, MUDO, true);
+        seta.setText("▾");
+        faixa.addView(seta);
         faixa.setOnClickListener(v -> alterna());
         addView(faixa);
 
@@ -74,7 +91,20 @@ public class PainelTele extends LinearLayout {
     }
 
     private void alterna() {
-        painel.setVisibility(painel.getVisibility() == GONE ? VISIBLE : GONE);
+        boolean abrir = painel.getVisibility() == GONE;
+        painel.setVisibility(abrir ? VISIBLE : GONE);
+        seta.setText(abrir ? "▴" : "▾");
+    }
+
+    /** Mostra (ou esconde) o vídeo que está sendo gerado no PC, vindo de /video/estado. */
+    public void atualizaVideo(JSONObject j) {
+        if (j == null || !j.optBoolean("rodando", false)) {
+            video.setVisibility(GONE);
+            return;
+        }
+        String m = j.optString("msg", "");
+        video.setText("🎬 " + (m.isEmpty() ? "gerando vídeo…" : m));
+        video.setVisibility(VISIBLE);
     }
 
     private Grafico grafico(Context c, String nome, int cor) {
@@ -188,7 +218,17 @@ public class PainelTele extends LinearLayout {
             }
             d.append('\n');
         }
-        d.append("controle automático: ").append("active".equals(j.optString("controle_ventoinha")) ? "ligado" : "desligado");
+        JSONObject vc = j.optJSONObject("ventoinha_ctl");
+        if (vc != null && vc.optBoolean("ativo", false)) {
+            JSONObject g = vc.optJSONObject("gpu");
+            org.json.JSONArray pm = vc.optJSONArray("placa_mae");
+            d.append("controle das ventoinhas: GPU ");
+            d.append(g != null && !g.optString("metodo", "").isEmpty() ? g.optInt("pct", 0) + "% (" + g.optString("metodo") + ")" : "sem controle");
+            d.append(" · placa-mãe ");
+            d.append(pm != null && pm.length() > 0 ? pm.length() + " ventoinha(s)" : "sem controle");
+        } else {
+            d.append("controle das ventoinhas: desligado (rode bash atualizar.sh no PC)");
+        }
         detalhes.setText(d.toString());
     }
 }

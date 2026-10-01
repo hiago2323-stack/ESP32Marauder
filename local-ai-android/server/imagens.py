@@ -17,6 +17,7 @@ import httpx
 
 import androidgen
 import config
+import modelos
 import entregas
 import recursos
 import uploads
@@ -26,8 +27,19 @@ _download: dict[str, asyncio.Task] = {}
 
 
 # ------------------------------------------------------------------ modelo de imagem (download)
+def _todos() -> dict:
+    """Modelos de imagem: os dois que vêm prontos + os que você adicionou pela busca por nome."""
+    return {**config.IMG_MODELOS, **modelos.extras_imagem()}
+
+
 def _m(mid: str) -> dict:
-    return config.IMG_MODELOS.get(mid) or config.IMG_MODELOS["rapido"]
+    t = _todos()
+    return t.get(mid) or t["rapido"]
+
+
+def lista_modelos() -> list[dict]:
+    return [{"id": k, "nome": m["nome"], "passos": m["passos"], "max_passos": m.get("max_passos", 8),
+             "presente": presente(k)} for k, m in _todos().items()]
 
 
 def presente(mid: str = "rapido") -> bool:
@@ -76,9 +88,13 @@ def baixar(mid: str = "rapido") -> None:
     _download[mid] = asyncio.get_running_loop().create_task(_baixa(mid))
 
 
-async def melhora_prompt(texto: str, realista: bool = False) -> str:
+async def melhora_prompt(texto: str, realista: bool = False, video: bool = False) -> str:
     """Pede à IA de texto para traduzir e detalhar o pedido. Se ela não responder, usa o texto original."""
-    estilo = ("a realistic photograph: RAW photo, camera and lens (e.g. 85mm f/1.8), natural lighting, skin and "
+    if video:
+        estilo = ("a short video clip: describe the subject, the motion/action, camera movement (e.g. slow pan, "
+                  "dolly in), setting, lighting and visual style")
+    else:
+        estilo = ("a realistic photograph: RAW photo, camera and lens (e.g. 85mm f/1.8), natural lighting, skin and "
               "material texture, depth of field, film grain, 8k uhd" if realista else
               "style, lighting, camera/composition, quality keywords")
     msgs = [{"role": "system", "content": (
@@ -137,9 +153,9 @@ async def gera_imagem(descricao: str, init_id: str | None, tamanho: str, passos:
     if not motor_instalado():
         await emit({"type": "error", "msg": "O gerador de imagens não está instalado. Rode: bash atualizar.sh"})
         return
-    if modelo not in config.IMG_MODELOS:
+    if modelo not in _todos():
         modelo = "rapido"
-    cfgm = config.IMG_MODELOS[modelo]
+    cfgm = _m(modelo)
     if not presente(modelo):
         await emit({"type": "error", "msg": "Falta baixar o modelo de imagens (2 GB). Use o botão de baixar abaixo.",
                     "precisa_modelo": True})
@@ -148,7 +164,7 @@ async def gera_imagem(descricao: str, init_id: str | None, tamanho: str, passos:
         await emit({"type": "error", "msg": "Ainda estou criando outra coisa. Espere terminar ou clique em Parar."})
         return
     largura, altura = TAMANHOS.get(tamanho, (512, 512))
-    passos = max(1, min(int(passos), 8))
+    passos = max(1, min(int(passos), cfgm.get("max_passos", 8)))
     async with androidgen._trava:
         try:
             recursos.garante_ram(3500, "gerar a imagem")
@@ -171,17 +187,23 @@ async def gera_imagem(descricao: str, init_id: str | None, tamanho: str, passos:
         pasta.mkdir(parents=True, exist_ok=True)
         saida = pasta / "imagem.png"
         seed = random.randint(1, 2**31 - 1)
-        modo = recursos.modo_imagem()
+        vram = recursos.vram_livre_mb()
+        modo = recursos.modo_imagem(vram)
+        if modo != "cpu" and not recursos.gpu_liberada("imagem"):
+            modo = "cpu"   # a placa falhou nas últimas tentativas; não perde tempo de novo (tenta outra vez amanhã)
         # threads = todos os núcleos/threads do processador
         base = {"modelo": str(cfgm["arquivo"]), "threads": os.cpu_count() or recursos.nucleos_fisicos(), "prompt": prompt,
                 "largura": largura, "altura": altura, "passos": passos, "seed": seed, "saida": str(saida),
-                "cfg": cfgm["cfg"], "negativo": cfgm["negativo"], "init": str(init) if init else None, "forca": forca}
+                "orcamento": recursos.orcamento_vram_gib(vram or 0), "cfg": cfgm["cfg"], "negativo": cfgm["negativo"], "init": str(init) if init else None, "forca": forca}
         try:
-            rotulo = {"gpu": "na placa de vídeo", "hibrido": "na placa de vídeo e na CPU", "cpu": "na CPU"}[modo]
-            vram = recursos.vram_livre_mb()
-            motivo = (f" (a IA de texto está ocupando a placa: só {vram} MB livres)" if modo == "cpu" and vram is not None else "")
+            rotulo = {"gpu": "na placa de vídeo",
+                      "segmentado": f"na placa de vídeo (em partes, até {base['orcamento']} GiB) com todos os núcleos da CPU ajudando",
+                      "cpu": "na CPU"}[modo]
+            motivo = (f" (a placa está ocupada: só {vram} MB livres)" if modo == "cpu" and vram is not None and vram < 600 else "")
             await emit({"type": "status", "msg": f"Gerando a imagem {rotulo}{motivo}…{' (leva cerca de 1 minuto)' if modo == 'cpu' else ''}"})
             ok, erro = await _roda_worker({**base, "modo": modo}, emit)
+            if modo != "cpu":
+                recursos.anota_gpu("imagem", ok)
             if not ok and modo != "cpu":
                 await emit({"type": "status", "msg": "A placa de vídeo não deu conta; tentando só pela CPU…"})
                 ok, erro = await _roda_worker({**base, "modo": "cpu"}, emit)

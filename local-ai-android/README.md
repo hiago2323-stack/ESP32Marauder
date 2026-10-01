@@ -40,7 +40,35 @@ O instalador é gerado a partir de `server/`; mantenha os dois iguais.
 
 ## Imagens
 
-Dois modelos: **Rápido** (SD-Turbo, arte/ilustração) e **Realista** (Realistic Vision V6.0, fotos de pessoas, lugares e objetos; Apache-2.0). Escolha na tela de criar imagem. O atualizador baixa os dois em segundo plano. Usa todos os núcleos da CPU e a parte da placa que a IA de texto deixa livre.
+Dois modelos: **Rápido** (SD-Turbo, arte/ilustração) e **Realista** (Realistic Vision V6.0, fotos de pessoas, lugares e objetos; Apache-2.0). Escolha na tela de criar imagem. O atualizador baixa os dois em segundo plano.
+
+**Placa de vídeo**: o modelo de imagem precisa de ~1,8 GB na placa (1,4 GB de pesos + 0,4 GB de cálculo), mais do que sobra
+numa GTX 960 de 2 GB com a IA de texto carregada. Por isso ele roda na placa **em partes** (`max_vram` do stable-diffusion.cpp):
+os pesos ficam na RAM e vão para a placa conforme o uso, dentro do limite de memória que sobra; todos os núcleos da CPU ajudam.
+Se a placa falhar 2 vezes seguidas, ele usa só a CPU por 24 h (não perde tempo tentando de novo). A IA de texto deixa
+~1,1 GB livres quando o modelo de imagens existe (`RESERVA_VRAM=NNNN` muda isso).
+
+## Vídeo curto
+
+Modo 🎬 **Vídeo curto**: texto para vídeo com o Wan 2.1 (1,3 bilhão de parâmetros, oficial, Apache-2.0) pelo mesmo motor.
+Clipes de 0,5 a 2 s (16 quadros por segundo) em 320×192 ou 480×272, salvos em `.mp4`. Na CPU de 4 núcleos um clipe de ~1 s
+leva de 15 a 25 minutos e a qualidade é simples (borrada em tamanhos pequenos); com a placa (em partes) deve ser mais rápido.
+O trabalho roda em segundo plano no PC: pode fechar o app; ele continua e o app volta a acompanhar sozinho. Modelos (~5 GB)
+baixados em segundo plano pelo atualizador.
+
+## Adicionar outras IAs (busca pelo nome)
+
+⚙ Configurações › **Modelo de IA** › *Adicionar outra IA*: digite só o nome (ex.: "llama 3.2 3b") ou o endereço do
+Hugging Face. A busca é online e neutra (não há lista fechada nem bloqueio); mostra os arquivos `.gguf`, marca o recomendado
+para o seu PC (avisos de tamanho são só informação), baixa com progresso e passa a usar (o número de camadas é lido do
+próprio arquivo). Modelos de imagem completos (Stable Diffusion em um arquivo) também entram na lista de modelos de imagem.
+Registro em `~/localai/modelos_extra.json`.
+
+## Inicia com o Linux
+
+Os serviços `localai-llm` (modelo), `localai-server` (servidor) e `localai-fan` (ventoinhas) sobem em todo boot, mesmo sem
+login. No boot o modelo espera o driver da placa e os discos (SSD) ficarem prontos antes de decidir quantas camadas vão para
+a GPU (antes, se o driver demorasse, a IA podia ficar só na CPU a sessão inteira). O atualizador refaz os serviços.
 
 ## SSD como parte rápida
 
@@ -52,7 +80,9 @@ O `atualizar.sh` escolhe sozinho o disco grande (>= 100 GB, que não seja o do s
 
 ## App do celular (acesso de qualquer lugar)
 
-O app **Betina & IA** (`dist/Betina-IA.apk`, código em `android-client/`) é a "cara" do PC no celular.
+O app **Betina & IA** (`dist/Betina-IA.apk`, v1.3, código em `android-client/`) é a "cara" do PC no celular: tela de abertura
+com a marca, faixa de telemetria com logo (e o vídeo em andamento), navegação inferior (Conversa, Criar, Arquivos, Biblioteca,
+Mais) e uma bandeja com todas as ferramentas (apps, firmware, web, Python, imagem e vídeo).
 Ele tem uma **faixa de telemetria em tempo real** no topo (atualiza a cada ~1,5 s): uso e temperatura da
 GPU e da CPU, VRAM, RAM e estado da IA. Tocando na faixa abre o painel com gráficos estilo osciloscópio.
 O visual segue o app "Decker Cyber Segurança" (terminal escuro, verde neon e ciano), e o ícone é um
@@ -110,10 +140,12 @@ e `NGL=auto` no `start_llm.sh` (camadas do modelo na placa calculadas pela VRAM 
 
 ## Ventoinhas
 
-`fanctl.py` (serviço `localai-fan`) ajusta a ventoinha da GPU pela temperatura (curva de 30% a 100%) e a devolve
-ao automático ao parar. Pela tela: ⚙ Configurações › Sistema e ventoinhas. Para a CPU, a placa-mãe costuma controlar
-sozinha pela BIOS; `bash ~/localai/diagnostico_fans.sh` mostra se o Linux consegue controlá-la (então se define
-`FANCTL_CPU_PWM` em `server/fan.env`).
+`fanctl.py` (serviço `localai-fan`) sobe a rotação **pelo uso e pela temperatura**: com a GPU ou a CPU ocupada ela já
+acelera antes de esquentar (ex.: GPU a 85% de uso → ventoinha a 85%), e desce devagar. **GPU**: por NVML ou nvidia-settings.
+**Processador e caixa**: na primeira vez o serviço testa sozinho quais saídas PWM da placa-mãe mexem numa ventoinha (elas
+aceleram e desaceleram por alguns segundos) e passa a controlar todas; o resultado fica guardado. O atualizador instala o
+`lm-sensors` e roda o `sensors-detect` se o Linux ainda não enxergar o chip da placa-mãe. Tudo volta ao automático ao parar.
+O estado aparece em ⚙ › Sistema e ventoinhas e no painel do app. Ajustes em `server/fan.env` (`FANCTL_CPU_PWM`, `FANCTL_AUTO_PWM=0`).
 
 ## Tailscale
 

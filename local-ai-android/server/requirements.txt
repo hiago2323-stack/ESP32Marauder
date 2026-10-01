@@ -8,3 +8,4 @@ kokoro-onnx==0.6.*
 ddgs==9.*
 nvidia-ml-py==13.*
 pillow>=10
+imageio-ffmpeg

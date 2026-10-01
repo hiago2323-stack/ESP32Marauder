@@ -12,7 +12,7 @@ import config
 
 ID_RE = re.compile(r"[0-9a-f]{10}")
 TIPOS = {".apk": "application/vnd.android.package-archive", ".bin": "application/octet-stream",
-         ".png": "image/png", ".html": "text/html", ".py": "text/x-python", ".zip": "application/zip"}
+         ".png": "image/png", ".mp4": "video/mp4", ".html": "text/html", ".py": "text/x-python", ".zip": "application/zip"}
 
 
 def salva(id_: str, nome: str, descricao: str, tipo: str, arquivos: list, extra: dict | None = None) -> dict:

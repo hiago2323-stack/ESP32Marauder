@@ -28,7 +28,12 @@ import android.webkit.WebResourceRequest;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
+import android.view.Gravity;
+import android.view.View;
 import android.widget.EditText;
+import android.widget.FrameLayout;
+import android.widget.ImageView;
+import android.widget.ProgressBar;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -60,6 +65,8 @@ public class MainActivity extends Activity {
     private PainelTele tele;                        // faixa de telemetria em tempo real
     private volatile boolean visivel = false;
     private Thread leitor;
+    private LinearLayout abertura;                  // tela de abertura (logo) enquanto a página carrega
+    private int tick = 0;
 
     // ------------------------------------------------------------------ ciclo de vida
     @Override
@@ -73,7 +80,10 @@ public class MainActivity extends Activity {
         raiz.setBackgroundColor(PainelTele.FUNDO);
         raiz.addView(tele, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT));
-        raiz.addView(web, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+        FrameLayout corpo = new FrameLayout(this);
+        corpo.addView(web, new FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+        corpo.addView(criaAbertura(), new FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+        raiz.addView(corpo, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
         setContentView(raiz);
         if (Build.VERSION.SDK_INT >= 21) {
             getWindow().setStatusBarColor(PainelTele.FUNDO);
@@ -93,6 +103,61 @@ public class MainActivity extends Activity {
         } else {
             carrega();
         }
+    }
+
+    /** Tela de abertura: a marca do app enquanto a página do PC carrega. */
+    private LinearLayout criaAbertura() {
+        abertura = new LinearLayout(this);
+        abertura.setOrientation(LinearLayout.VERTICAL);
+        abertura.setGravity(Gravity.CENTER);
+        abertura.setBackgroundColor(PainelTele.FUNDO);
+        ImageView logo = new ImageView(this);
+        logo.setImageResource(R.drawable.ic_splash);
+        abertura.addView(logo, new LinearLayout.LayoutParams(dp(96), dp(108)));
+        TextView nome = new TextView(this);
+        nome.setText("BETINA & IA");
+        nome.setTextColor(PainelTele.VERDE);
+        nome.setTextSize(22);
+        nome.setTypeface(android.graphics.Typeface.MONOSPACE, android.graphics.Typeface.BOLD);
+        nome.setPadding(0, dp(14), 0, dp(4));
+        abertura.addView(nome);
+        TextView sub = new TextView(this);
+        sub.setText("conectando ao seu PC…");
+        sub.setTextColor(PainelTele.MUDO);
+        sub.setTextSize(13);
+        sub.setTypeface(android.graphics.Typeface.MONOSPACE);
+        abertura.addView(sub);
+        ProgressBar barra = new ProgressBar(this, null, android.R.attr.progressBarStyleSmall);
+        barra.setIndeterminate(true);
+        abertura.addView(barra, new LinearLayout.LayoutParams(dp(26), dp(26)));
+        ((LinearLayout.LayoutParams) barra.getLayoutParams()).topMargin = dp(18);
+        return abertura;
+    }
+
+    private void escondeAbertura() {
+        if (abertura != null) {
+            abertura.setVisibility(View.GONE);
+        }
+    }
+
+    private JSONObject lerJson(String caminho) throws Exception {
+        HttpURLConnection c = (HttpURLConnection) new URL(servidor() + caminho).openConnection();
+        c.setConnectTimeout(3000);
+        c.setReadTimeout(4000);
+        c.setRequestProperty("Authorization", "Bearer " + token());
+        int codigo = c.getResponseCode();
+        if (codigo != 200) {
+            throw new java.io.IOException("HTTP " + codigo);
+        }
+        ByteArrayOutputStream corpo = new ByteArrayOutputStream();
+        try (InputStream in = c.getInputStream()) {
+            byte[] buf = new byte[4096];
+            int n;
+            while ((n = in.read(buf)) > 0) {
+                corpo.write(buf, 0, n);
+            }
+        }
+        return new JSONObject(corpo.toString("UTF-8"));
     }
 
     // ------------------------------------------------------------------ telemetria em tempo real
@@ -121,24 +186,16 @@ public class MainActivity extends Activity {
                 runOnUiThread(() -> tele.falhou("sem servidor configurado"));
             } else {
                 try {
-                    HttpURLConnection c = (HttpURLConnection) new URL(base + "/telemetry").openConnection();
-                    c.setConnectTimeout(3000);
-                    c.setReadTimeout(4000);
-                    c.setRequestProperty("Authorization", "Bearer " + token());
-                    int codigo = c.getResponseCode();
-                    if (codigo != 200) {
-                        throw new java.io.IOException("HTTP " + codigo);
-                    }
-                    ByteArrayOutputStream corpo = new ByteArrayOutputStream();
-                    try (InputStream in = c.getInputStream()) {
-                        byte[] buf = new byte[4096];
-                        int n;
-                        while ((n = in.read(buf)) > 0) {
-                            corpo.write(buf, 0, n);
+                    final JSONObject j = lerJson("/telemetry");
+                    runOnUiThread(() -> tele.atualiza(j));
+                    if (tick++ % 3 == 0) {   // a cada ~5 s: vídeo em geração no PC (se houver)
+                        try {
+                            final JSONObject v = lerJson("/video/estado");
+                            runOnUiThread(() -> tele.atualizaVideo(v));
+                        } catch (Exception ignorado) {
+                            runOnUiThread(() -> tele.atualizaVideo(null));
                         }
                     }
-                    final JSONObject j = new JSONObject(corpo.toString("UTF-8"));
-                    runOnUiThread(() -> tele.atualiza(j));
                 } catch (Exception e) {
                     final String m = e.getClass().getSimpleName();
                     runOnUiThread(() -> tele.falhou(m));
@@ -253,14 +310,16 @@ public class MainActivity extends Activity {
 
     private void mostraErro(WebView v, String motivo) {
         String seguro = motivo == null ? "" : motivo.replace("<", "&lt;");
-        String estilo = "style='font-size:18px;padding:12px 18px;margin:6px 6px 0 0;border-radius:8px;border:1px solid #888'";
+        String botao = "style='font:600 15px monospace;padding:13px 16px;margin:8px 8px 0 0;border-radius:12px;border:1px solid #16313A;background:#0C161E;color:#D7F5E6'";
         String html = "<html><head><meta name='viewport' content='width=device-width,initial-scale=1'></head>"
-                + "<body style='font-family:sans-serif;padding:24px;background:#14161a;color:#e8eaed'>"
-                + "<h2>Não consegui falar com o seu PC</h2><p>" + seguro + "</p>"
-                + "<p>Confira se o PC está ligado e se o Tailscale (a VPN) está <b>conectado</b> no celular.</p>"
-                + "<button " + estilo + " onclick='AndroidBridge.openTailscale()'>Abrir o Tailscale</button>"
-                + "<button " + estilo + " onclick='AndroidBridge.retry()'>Tentar de novo</button>"
-                + "<button " + estilo + " onclick='AndroidBridge.openSettings()'>Configurar servidor</button>"
+                + "<body style='font-family:sans-serif;padding:26px;background:#05090D;color:#D7F5E6'>"
+                + "<div style='font:700 13px monospace;color:#22D3EE'>// SEM LINK</div>"
+                + "<h2 style='font:700 22px monospace;color:#00E58F;margin:6px 0 10px'>N&atilde;o consegui falar com o seu PC</h2>"
+                + "<p style='color:#6F9A8C'>" + seguro + "</p>"
+                + "<p>Confira se o PC est&aacute; ligado e se o <b>Tailscale</b> (a VPN) est&aacute; <b>conectado</b> no celular.</p>"
+                + "<button " + botao + " onclick='AndroidBridge.openTailscale()'>Abrir o Tailscale</button>"
+                + "<button " + botao.replace("#0C161E", "#00E58F").replace("#D7F5E6'", "#03140D'") + " onclick='AndroidBridge.retry()'>Tentar de novo</button>"
+                + "<button " + botao + " onclick='AndroidBridge.openSettings()'>Configurar servidor</button>"
                 + "</body></html>";
         v.loadDataWithBaseURL(null, html, "text/html", "utf-8", null);
     }
@@ -307,8 +366,14 @@ public class MainActivity extends Activity {
             }
 
             @Override
+            public void onPageFinished(WebView v, String url) {
+                escondeAbertura();
+            }
+
+            @Override
             public void onReceivedError(WebView v, WebResourceRequest r, WebResourceError e) {
                 if (r.isForMainFrame()) {
+                    escondeAbertura();
                     mostraErro(v, e.getDescription().toString());
                 }
             }

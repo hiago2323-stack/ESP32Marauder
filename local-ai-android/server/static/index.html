@@ -65,7 +65,8 @@
 
   #log { flex:1; overflow-y:auto; scroll-behavior:smooth; }
   .coluna { max-width:760px; margin:0 auto; padding:8px 20px 24px; display:flex; flex-direction:column; gap:22px; min-height:100%; }
-  .vazio { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; text-align:center; padding:24px 0 60px; gap:22px; }
+  .vazio { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:flex-start; text-align:center; padding:24px 0 40px; gap:22px; }
+  .vazio > :first-child { margin-top:auto; } .vazio > :last-child { margin-bottom:auto; }   /* centraliza sem cortar o topo quando é alto */
   .vazio h1 { font:700 clamp(26px,5vw,36px)/1.2 var(--serif); margin:0; }
   .vazio h1 i { font-style:normal; color:var(--acc); margin-right:8px; }
   .sugestoes { display:flex; flex-wrap:wrap; gap:8px; justify-content:center; max-width:640px; }
@@ -108,7 +109,7 @@
   #status { min-height:20px; padding:0 20px 6px; text-align:center; font-size:13px; color:var(--mut); }
   .compor { padding:0 16px calc(14px + env(safe-area-inset-bottom)); }
   .caixa { max-width:760px; margin:0 auto; background:var(--card); border:1px solid var(--line); border-radius:24px; box-shadow:var(--sombra); padding:10px 12px 8px; position:relative; transition:border-color .15s, box-shadow .15s; }
-  .caixa:focus-within { border-color:var(--acc); box-shadow:0 2px 18px rgba(198,97,63,.18); }
+  .caixa:focus-within { border-color:var(--acc); box-shadow:0 2px 18px rgba(0,229,143,.18); }
   #modoChips { display:flex; gap:6px; flex-wrap:wrap; padding:0 4px 6px; } #modoChips:empty { display:none; }
   #modoChips span { font-size:12.5px; background:var(--acc-soft); color:var(--acc); padding:3px 10px; border-radius:999px; }
   #txt { width:100%; border:0; outline:0; resize:none; background:none; color:var(--txt); font:16px/1.5 var(--sans); padding:6px 6px 4px; max-height:200px; min-height:28px; }
@@ -168,6 +169,10 @@
   #imgOpts { padding:2px 10px 6px; } #imgOpts label { padding:5px 0; } #imgOpts .linha-opt { display:flex; align-items:center; gap:8px; font-size:13px; color:var(--mut); }
   #imgOpts input[type=range] { flex:1; }
   .barra-img { height:6px; background:var(--line); border-radius:99px; overflow:hidden; margin-top:8px; } .barra-img i { display:block; height:100%; background:var(--acc); width:0; transition:width .5s; }
+  .sub { font:700 13px var(--mono); color:var(--ciano); margin:16px 0 4px; letter-spacing:.3px; }
+  .linha-bm { display:flex; gap:8px; margin-top:8px; } .linha-bm input { flex:1; min-width:0; } .linha-bm select { max-width:44%; }
+  .arq-l { display:flex; align-items:center; gap:8px; padding:7px 0; border-top:1px solid var(--line); font-size:13px; } .arq-l .t { flex:1; word-break:break-all; }
+  .rec { color:var(--acc); font-weight:700; } .aviso { color:var(--warn); }
   .sec-btn { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:6px 10px; font-size:13px; color:var(--mut); }
   /* ---------- celular ---------- */
   @media (max-width: 860px) {
@@ -180,6 +185,43 @@
     .msg.user .corpo { max-width:92%; }
     .compor { padding:0 10px calc(10px + env(safe-area-inset-bottom)); }
     .rodape { display:none; }
+  }
+  /* ---------- visual v1.3: brilho, bandeja de ferramentas e navegação do celular ---------- */
+  body { background:radial-gradient(1100px 480px at 50% -12%, rgba(0,229,143,.08), transparent 62%), radial-gradient(800px 380px at 100% 0%, rgba(34,211,238,.06), transparent 58%), var(--bg); background-attachment:fixed; }
+  :root[data-tema="claro"] body { background:var(--bg); }
+  .caixa:focus-within { border-color:var(--acc); box-shadow:0 0 0 1px var(--acc), 0 6px 28px rgba(0,229,143,.16); }
+  .vazio h1 { background:linear-gradient(90deg,var(--acc),var(--ciano)); -webkit-background-clip:text; background-clip:text; color:transparent; }
+  .vazio h1 i { -webkit-text-fill-color:var(--acc); }
+  .msg.user .corpo { border:1px solid var(--line); background:linear-gradient(180deg,var(--user),var(--card)); }
+  .cartao { border-left:3px solid var(--acc); }
+  ::-webkit-scrollbar { width:8px; height:8px; } ::-webkit-scrollbar-thumb { background:var(--line); border-radius:8px; }
+  .ferr-grid { display:grid; grid-template-columns:repeat(4,1fr); gap:10px; width:min(640px,100%); }
+  .ferr-grid button, .tiles button { display:flex; flex-direction:column; align-items:flex-start; gap:2px; text-align:left; padding:12px 12px 11px; border:1px solid var(--line); background:var(--card); border-radius:16px; box-shadow:var(--sombra); transition:border-color .15s, transform .1s; }
+  .ferr-grid button:hover, .tiles button:hover, .ferr-grid button:active, .tiles button:active { border-color:var(--acc); transform:translateY(-1px); }
+  .ferr-grid b, .tiles b { font:700 13.5px var(--sans); } .ferr-grid small, .tiles small { font-size:11.5px; color:var(--mut); line-height:1.3; }
+  .ferr-grid .e, .tiles .e { font-size:24px; line-height:1.2; }
+  #folha { position:fixed; inset:0; z-index:90; display:flex; align-items:flex-end; justify-content:center; }
+  #folhaFundo { position:absolute; inset:0; background:rgba(0,0,0,.55); }
+  .folha-cx { position:relative; width:min(560px,100%); max-height:82dvh; overflow-y:auto; background:var(--side); border:1px solid var(--line); border-bottom:0; border-radius:22px 22px 0 0; padding:10px 16px calc(18px + env(safe-area-inset-bottom)); box-shadow:0 -10px 40px rgba(0,0,0,.45); animation:sobe .2s ease-out; }
+  @keyframes sobe { from { transform:translateY(30px); opacity:.4; } }
+  .folha-barra { width:44px; height:4px; border-radius:4px; background:var(--line); margin:4px auto 12px; }
+  #folhaTit { font:700 15px var(--mono); color:var(--acc); margin:0 2px 12px; } #folhaTit::before { content:"// "; color:var(--ciano); }
+  .tiles { display:grid; grid-template-columns:repeat(2,1fr); gap:10px; }
+  .linhas { display:flex; flex-direction:column; gap:4px; }
+  .linhas button { display:flex; align-items:center; gap:14px; padding:13px 12px; border:0; background:none; border-radius:14px; text-align:left; font-size:15px; }
+  .linhas button:hover, .linhas button:active { background:var(--user); } .linhas .e { font-size:22px; width:30px; text-align:center; }
+  #nav { display:none; }
+  @media (max-width: 860px) {
+    .ferr-grid { grid-template-columns:repeat(4,1fr); gap:8px; } .ferr-grid small { display:none; } .ferr-grid button { align-items:center; text-align:center; padding:10px 3px 9px; border-radius:14px; } .ferr-grid b { font-size:11.5px; line-height:1.2; } .ferr-grid .e { font-size:22px; }
+    .vazio { gap:16px; padding:12px 0 24px; } .vazio h1 { font-size:26px; }
+    .sugestoes { flex-wrap:nowrap; overflow-x:auto; justify-content:flex-start; width:100%; padding:0 2px 6px; } .sugestoes button { white-space:nowrap; flex:none; }
+    #side { z-index:60; } body.lateral #fundo { z-index:55; }   /* a gaveta fica por cima da navegação inferior */
+    #nav { display:flex; position:relative; z-index:40; background:var(--side); border-top:1px solid var(--line); padding:5px 6px calc(5px + env(safe-area-inset-bottom)); gap:2px; }
+    #nav button { flex:1; display:flex; flex-direction:column; align-items:center; gap:2px; border:0; background:none; color:var(--mut); font:600 10.5px var(--sans); padding:6px 2px 5px; border-radius:12px; }
+    #nav button svg { width:22px; height:22px; stroke:currentColor; fill:none; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }
+    #nav button.ativo { color:var(--acc); background:var(--acc-soft); }
+    .compor { padding-bottom:8px; }
+    dialog { width:100vw; max-width:100vw; max-height:92dvh; margin:auto 0 0; border-radius:22px 22px 0 0; border-bottom:0; }
   }
 </style>
 </head>
@@ -228,6 +270,7 @@
             <option value="web">🌐 Página web</option>
             <option value="python">🐍 Programa Python</option>
             <option value="img">🎨 Criar ou modificar imagem</option>
+            <option value="video">🎬 Criar vídeo curto (lento)</option>
           </select>
           <select id="placa" hidden></select>
           <div id="imgOpts" hidden>
@@ -238,6 +281,15 @@
             <label title="A IA traduz o pedido para inglês e o detalha; os modelos de imagem entendem muito melhor"><input type="checkbox" id="imgMelhorar" checked> ✨ Melhorar o pedido com a IA</label>
             <div class="sec-btn"><span id="imgModeloTxt">Modelo de imagens: verificando…</span><button class="bt-mini" id="imgBaixar" hidden>Baixar (2 GB)</button></div>
             <div class="barra-img" id="imgBaixarBarra" hidden><i></i></div>
+          </div>
+          <div id="vidOpts" hidden>
+            <select id="vidTam" title="Tamanho do vídeo. Quanto maior, mais demora."><option value="320x192">Horizontal pequeno 320×192 (recomendado)</option><option value="192x320">Vertical pequeno 192×320</option><option value="480x272">Horizontal maior 480×272 (bem mais lento)</option></select>
+            <select id="vidQuadros" title="Duração do clipe (16 quadros por segundo)."><option value="9">Curtinho ≈ 0,5 s</option><option value="17" selected>Curto ≈ 1 s</option><option value="33">Mais longo ≈ 2 s (demora o dobro)</option></select>
+            <div class="linha-opt">Qualidade (passos) <input type="range" id="vidPassos" min="6" max="25" value="12"> <span id="vidPassosV">12</span></div>
+            <label title="A IA traduz o pedido para inglês e descreve movimento e câmera; o modelo de vídeo entende muito melhor"><input type="checkbox" id="vidMelhorar" checked> ✨ Melhorar o pedido com a IA</label>
+            <div class="dica">Roda na CPU: um clipe de ~1 s leva de 15 a 25 minutos. Pode fechar o app; ele continua no PC e o vídeo aparece em 📁 Arquivos criados.</div>
+            <div class="sec-btn"><span id="vidModeloTxt">Modelo de vídeo: verificando…</span><button class="bt-mini" id="vidBaixar" hidden>Baixar (5 GB)</button></div>
+            <div class="barra-img" id="vidBaixarBarra" hidden><i></i></div>
           </div>
           <div class="sec">Opções</div>
           <label><input type="checkbox" id="web"> 🌐 Pesquisar na web</label>
@@ -257,7 +309,14 @@
           <button id="send" title="Enviar (Enter)" aria-label="Enviar" disabled>↑</button>
         </div>
       </div>
-      <div class="rodape">A IA roda no seu PC. Confira informações importantes.</div>
+      <nav id="nav" aria-label="Navegação">
+      <button data-aba="chat" class="ativo"><svg viewBox="0 0 24 24"><path d="M21 12a8 8 0 0 1-11.5 7.2L4 20l1-4.4A8 8 0 1 1 21 12z"/></svg>Conversa</button>
+      <button data-aba="criar"><svg viewBox="0 0 24 24"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z"/><path d="M19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8z"/></svg>Criar</button>
+      <button data-aba="arquivos"><svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>Arquivos</button>
+      <button data-aba="biblioteca"><svg viewBox="0 0 24 24"><path d="M4 5a2 2 0 0 1 2-2h12v16H6a2 2 0 0 0-2 2z"/><path d="M4 19V5M8 7h6"/></svg>Biblioteca</button>
+      <button data-aba="mais"><svg viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg>Mais</button>
+    </nav>
+    <div class="rodape">A IA roda no seu PC. Confira informações importantes.</div>
     </div>
   </main>
 </div>
@@ -276,6 +335,12 @@
   <div class="dica">Troque conforme a tarefa. Mais preciso = mais lento. Ao trocar, o modelo recarrega (alguns minutos).</div>
   <div class="lista" id="llmLista"></div>
   <div class="dica" id="llmMsg"></div>
+  <h3 class="sub">➕ Adicionar outra IA</h3>
+  <div class="dica">Digite só o <b>nome</b> (ex.: “llama 3.2 3b”, “mistral 7b”, “gemma”, “stable diffusion”) ou o endereço do Hugging Face. A busca é online e <b>nada é filtrado</b>: aparece o que o Hugging Face tiver com esse nome. Os avisos de tamanho são só informação.</div>
+  <div class="linha-bm"><select id="mdTipo"><option value="texto">💬 Conversa</option><option value="imagem">🎨 Imagem</option></select><input type="text" class="campo" id="mdQ" placeholder="Nome da IA…" autocomplete="off"><button class="bt pri" id="mdBusca">Buscar</button></div>
+  <div class="lista" id="mdRes"></div>
+  <h3 class="sub">Suas IAs adicionadas</h3>
+  <div class="lista" id="mdMeus"></div>
   <button class="bt" id="llmClose">Fechar</button>
 </dialog>
 
@@ -293,12 +358,17 @@
   <button class="bt" id="filesClose">Fechar</button>
 </dialog>
 
+<div id="folha" hidden>
+  <div id="folhaFundo"></div>
+  <div class="folha-cx"><div class="folha-barra"></div><div id="folhaTit"></div><div id="folhaCorpo"></div></div>
+</div>
+
 <dialog id="libDlg">
   <h2>Biblioteca</h2>
   <div class="dica">Documentação e exemplos guardados no disco grande. A IA consulta isto sozinha ao responder e ao criar apps e firmware. Coloque seus próprios arquivos na pasta <b>meus</b>.</div>
   <table class="sis" id="libTab"></table>
   <div class="dica" id="libNota"></div>
-  <div style="display:flex;gap:8px;margin-top:10px"><input id="libQ" placeholder="Buscar na biblioteca…" style="flex:1"><button class="bt" id="libBusca">Buscar</button></div>
+  <div style="display:flex;gap:8px;margin-top:10px"><input type="text" class="campo" id="libQ" placeholder="Buscar na biblioteca…" style="flex:1" autocomplete="off"><button class="bt" id="libBusca">Buscar</button></div>
   <div class="lista" id="libRes" style="max-height:34vh;overflow:auto"></div>
   <div style="margin-top:14px;display:flex;gap:8px"><button class="bt" id="libIdx">Atualizar índice</button><button class="bt" id="libClose">Fechar</button></div>
 </dialog>
@@ -423,6 +493,26 @@ function apaga(id) {
 $('new').onclick = nova;
 
 /* ======================= Desenho das mensagens ======================= */
+const FERRAMENTAS = [
+  ['chat', '💬', 'Conversa', 'pergunte, pesquise na web'], ['app', '📱', 'App rápido', '1 arquivo, gera o .apk'],
+  ['appx', '📲', 'App avançado', 'várias telas e arquivos'], ['esp32', '🔌', 'Firmware ESP32', 'gera o .ino e o .bin'],
+  ['web', '🌐', 'Página web', 'site ou sistema'], ['python', '🐍', 'Programa Python', 'scripts e ferramentas'],
+  ['img', '🎨', 'Imagem', 'arte, fotos e edição'], ['video', '🎬', 'Vídeo curto', 'lento: roda na CPU'],
+];
+function escolheFerramenta(id) {
+  $('modo').value = id; $('modo').onchange(); fechaFolha();
+  if (['img', 'video', 'esp32'].includes(id)) { $('gearMenu').hidden = true; $('plusMenu').hidden = false; }
+  txt.focus();
+}
+function tilesFerramentas(classe) {
+  const g = document.createElement('div'); g.className = classe;
+  for (const [id, e, nome, sub] of FERRAMENTAS) {
+    const b = document.createElement('button'); b.innerHTML = '<span class="e"></span><b></b><small></small>';
+    b.querySelector('.e').textContent = e; b.querySelector('b').textContent = nome; b.querySelector('small').textContent = sub;
+    b.onclick = e2 => { e2.stopPropagation(); escolheFerramenta(id); }; g.appendChild(b);
+  }
+  return g;
+}
 const SUGESTOES = [
   ['📱 Criar um app Android de lista de compras', 'app', 'um app de lista de compras com campo para adicionar itens e marcar como comprado'],
   ['🔌 Firmware ESP32 que pisca um LED', 'esp32', 'piscar o LED da placa a cada meio segundo e escrever na serial'],
@@ -434,6 +524,7 @@ const SUGESTOES = [
 function boasVindas() {
   const d = document.createElement('div'); d.className = 'vazio'; d.id = 'vazio';
   d.innerHTML = '<h1><i>✦</i>Olá! Como posso ajudar hoje?</h1>';
+  d.appendChild(tilesFerramentas('ferr-grid'));
   const s = document.createElement('div'); s.className = 'sugestoes';
   for (const [rot, modo, texto, web] of SUGESTOES) {
     const b = document.createElement('button'); b.textContent = rot;
@@ -503,7 +594,7 @@ const TEACH = /^\s*(lembre-se|lembre|guarde|aprenda|anote)(\s+disso|\s+que)?[:,]
 /* ======================= Anexos e modificação ======================= */
 let anexos = [];      // arquivos enviados e ainda não usados: {id, name, tipo, size, url, analise, entrega}
 let baseMod = null;   // item que a IA já criou e que será modificado: {id, nome, kind}
-const ICONES = {apk: '📱', bin: '🔌', ino: '🔌', imagem: '🖼️', texto: '📄', img: '🎨', web: '🌐', python: '🐍'};
+const ICONES = {apk: '📱', bin: '🔌', ino: '🔌', imagem: '🖼️', texto: '📄', img: '🎨', video: '🎬', web: '🌐', python: '🐍'};
 function renderAnexos() {
   const box = $('anexos'); box.textContent = '';
   if (baseMod) {
@@ -703,7 +794,9 @@ $('mic').onclick = async () => {
 };
 
 /* ======================= Parar (resposta, voz, gravação, criação) ======================= */
+let criandoVideo = false;
 function parar() {
+  if (criandoVideo) fetch('/video/cancelar', {method: 'POST'}).catch(() => {});   // vídeo continua no PC se só a conexão cair; Parar cancela de verdade
   if (ctrl) ctrl.abort();
   pararVoz();
   if (rec) { descartar = true; rec.stop(); }
@@ -728,6 +821,30 @@ txt.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey && !
 $('send').onclick = () => send(txt.value);
 
 /* ======================= Menus ======================= */
+// --- bandeja (folha) e navegação inferior
+function abreFolha(titulo, corpo) { $('folhaTit').textContent = titulo; const c = $('folhaCorpo'); c.textContent = ''; c.appendChild(corpo); $('folha').hidden = false; }
+function fechaFolha() { $('folha').hidden = true; }
+$('folhaFundo').onclick = fechaFolha;
+function folhaMais() {
+  const l = document.createElement('div'); l.className = 'linhas';
+  for (const [e, nome, id] of [['🤖', 'Modelos de IA e adicionar outras', 'llmBtn'], ['🔊', 'Voz', 'voiceBtn'], ['🧠', 'Memória', 'memBtn'], ['🖥', 'Sistema e ventoinhas', 'sisBtn'], ['📲', 'Conectar celular', 'pairBtn'], ['⚙', 'Servidor do app', 'cfgBtn'], ['🌓', 'Tema', 'temaBtn'], ['＋', 'Nova conversa', 'new']]) {
+    if ($(id).hidden) continue;
+    const b = document.createElement('button'); b.innerHTML = '<span class="e"></span><span></span>'; b.querySelector('.e').textContent = e; b.lastChild.textContent = nome;
+    b.onclick = () => { fechaFolha(); $(id).click(); }; l.appendChild(b);
+  }
+  abreFolha('Mais', l);
+}
+function marcaAba(aba) { for (const b of document.querySelectorAll('#nav button')) b.classList.toggle('ativo', b.dataset.aba === aba); }
+for (const b of document.querySelectorAll('#nav button')) b.onclick = () => {
+  const a = b.dataset.aba; fechaMenus(); fechaFolha();
+  if (a === 'chat') { $('modo').value = 'chat'; $('modo').onchange(); txt.focus(); }
+  else if (a === 'criar') { const t = tilesFerramentas('tiles'); abreFolha('Criar', t); }
+  else if (a === 'arquivos') $('filesBtn').click();
+  else if (a === 'biblioteca') $('libBtn').click();
+  else if (a === 'mais') folhaMais();
+  marcaAba(a);
+};
+document.addEventListener('keydown', e => { if (e.key === 'Escape') fechaFolha(); });
 function fechaMenus() { $('plusMenu').hidden = true; $('gearMenu').hidden = true; }
 $('plus').onclick = e => { e.stopPropagation(); const v = $('plusMenu').hidden; fechaMenus(); $('plusMenu').hidden = !v; };
 $('gearBtn').onclick = e => { e.stopPropagation(); const v = $('gearMenu').hidden; fechaMenus(); $('gearMenu').hidden = !v; };
@@ -736,11 +853,12 @@ $('menuBtn').onclick = () => document.body.classList.add('lateral');
 $('fundo').onclick = () => document.body.classList.remove('lateral');
 
 const PLACEHOLDERS = {
+  video: 'Descreva o vídeo curto (ex.: um balão vermelho flutuando sobre um campo, câmera lenta)…',
   chat: 'Escreva sua mensagem…', app: 'Descreva o app (ex.: lista de compras)… ou anexe um app para modificar',
   appx: 'Descreva o app com várias telas (ex.: agenda com lista e detalhes)…', esp32: 'Descreva o firmware… ou anexe um .ino para modificar/compilar',
   web: 'Descreva a página ou o sistema web (ex.: calculadora de gorjeta)…', python: 'Descreva o programa Python (ex.: renomear arquivos em lote)…',
   img: 'Descreva a imagem… ou anexe uma imagem para modificar'};
-const ROTULOS_MODO = {app: '📱 App Android rápido', appx: '📱 App Android avançado', esp32: '🔌 Firmware ESP32', web: '🌐 Página web', python: '🐍 Python', img: '🎨 Imagem'};
+const ROTULOS_MODO = {app: '📱 App Android rápido', appx: '📱 App Android avançado', esp32: '🔌 Firmware ESP32', web: '🌐 Página web', python: '🐍 Python', img: '🎨 Imagem', video: '🎬 Vídeo'};
 function atualizaChips() {
   const box = $('modoChips'); box.textContent = '';
   const m = $('modo').value;
@@ -764,10 +882,36 @@ async function checaModeloImagem() {
   } catch (e) {}
 }
 $('imgBaixar').onclick = async () => { await fetch('/imagem/modelo?m=' + $('imgModelo').value, {method: 'POST'}); checaModeloImagem(); };
-$('imgModelo').onchange = () => { const p = $('imgModelo').value === 'realista' ? 6 : 4; $('imgPassos').value = p; $('imgPassosV').textContent = p; checaModeloImagem(); };
+let imgModelos = [];
+async function carregaModelosImagem() {
+  try {
+    imgModelos = await (await fetch('/imagem/modelos')).json(); const sel = $('imgModelo'), atual = sel.value;
+    sel.textContent = '';
+    for (const m of imgModelos) { const o = document.createElement('option'); o.value = m.id; o.textContent = (m.id === 'rapido' ? '⚡ ' : m.id === 'realista' ? '📷 ' : '🎨 ') + m.nome + (m.id === 'rapido' ? ' (arte e ilustração)' : m.id === 'realista' ? ' (fotos)' : ''); sel.appendChild(o); }
+    if (imgModelos.some(m => m.id === atual)) sel.value = atual;
+  } catch (e) {}
+}
+$('imgModelo').onchange = () => {
+  const m = imgModelos.find(x => x.id === $('imgModelo').value) || {passos: 4, max_passos: 8};
+  $('imgPassos').max = m.max_passos || 8; $('imgPassos').value = m.passos; $('imgPassosV').textContent = m.passos; checaModeloImagem();
+};
+let vidTimer = null;
+async function checaModeloVideo() {
+  try {
+    const e = await (await fetch('/video/modelo')).json();
+    $('vidModeloTxt').textContent = !e.motor ? 'Motor de imagens/vídeo não instalado (rode: bash atualizar.sh)' : !e.ffmpeg ? 'Falta o conversor de vídeo (rode: bash atualizar.sh)' : e.presente ? 'Modelo de vídeo pronto ✓' : e.baixando ? 'Baixando o modelo de vídeo… ' + Math.round(e.progresso * 100) + '%' : 'Falta o modelo de vídeo (5 GB)';
+    $('vidBaixar').hidden = !(e.motor && !e.presente && !e.baixando); $('vidBaixarBarra').hidden = !e.baixando;
+    if (e.baixando) $('vidBaixarBarra').firstChild.style.width = Math.round(e.progresso * 100) + '%';
+    if (e.baixando && !vidTimer) vidTimer = setInterval(checaModeloVideo, 3000); if (!e.baixando && vidTimer) { clearInterval(vidTimer); vidTimer = null; }
+  } catch (e) {}
+}
+$('vidBaixar').onclick = async () => { const r = await fetch('/video/modelo', {method: 'POST'}); if (!r.ok) $('vidModeloTxt').textContent = (await r.json()).detail; else checaModeloVideo(); };
+$('vidPassos').oninput = () => $('vidPassosV').textContent = $('vidPassos').value;
 $('modo').onchange = async () => {
-  const m = $('modo').value; $('placa').hidden = m !== 'esp32'; $('imgOpts').hidden = m !== 'img'; atualizaChips(); atualizaForca();
-  if (m === 'img') checaModeloImagem();
+  const m = $('modo').value; $('placa').hidden = m !== 'esp32'; $('imgOpts').hidden = m !== 'img'; $('vidOpts').hidden = m !== 'video'; atualizaChips(); atualizaForca();
+  if (m === 'img') { await carregaModelosImagem(); checaModeloImagem(); }
+  if (m === 'video') checaModeloVideo();
+  marcaAba(m === 'chat' ? 'chat' : 'criar');
   if (m === 'esp32' && !$('placa').options.length) {
     try { for (const b of await (await fetch('/boards')).json()) { const o = document.createElement('option'); o.value = b.id; o.textContent = b.label; $('placa').appendChild(o); } } catch (e) {}
   }
@@ -789,10 +933,11 @@ function cartaoCriacao(m) {
   const k = m.criacao, d = document.createElement('div'); d.className = 'cartao' + (k.erro ? ' erro' : '');
   const st = document.createElement('div'); st.className = 'st'; st.textContent = k.status; d.appendChild(st);
   if (k.codigo) { const det = document.createElement('details'), sm = document.createElement('summary'), pre = document.createElement('pre'); sm.textContent = 'Ver o código que a IA escreveu'; pre.textContent = k.codigo; det.append(sm, pre); d.appendChild(det); }
-  if (k.preview) { const im = document.createElement('img'); im.className = 'miniatura'; im.src = k.preview; im.alt = 'Imagem criada'; d.appendChild(im); }
+  if (k.preview && k.kind === 'video') { const v = document.createElement('video'); v.className = 'miniatura'; v.src = k.preview; v.controls = true; v.loop = true; v.muted = true; v.playsInline = true; v.preload = 'metadata'; d.appendChild(v); }
+  else if (k.preview) { const im = document.createElement('img'); im.className = 'miniatura'; im.src = k.preview; im.alt = 'Imagem criada'; d.appendChild(im); }
   for (const f of k.files || []) d.appendChild(linkArquivo(f));
   if (k.passo) { const b = document.createElement('div'); b.className = 'barra-img'; b.innerHTML = '<i></i>'; b.firstChild.style.width = Math.round(100 * k.passo[0] / k.passo[1]) + '%'; d.appendChild(b); }
-  if (k.id && !k.erro && (k.files || []).length) {
+  if (k.id && !k.erro && (k.files || []).length && k.kind !== 'video') {
     const ac = document.createElement('div'); ac.className = 'acoes-cartao';
     const mb = document.createElement('button'); mb.textContent = '✏ Modificar'; mb.onclick = () => modificar({id: k.id, name: k.nome, kind: k.kind, modo: k.modo}); ac.appendChild(mb);
     if (k.kind === 'img' && k.descricao) { const ob = document.createElement('button'); ob.textContent = '↻ Outra versão'; ob.onclick = () => { $('modo').value = 'img'; $('modo').onchange(); txt.value = k.descricao; autoAltura(); send(txt.value); }; ac.appendChild(ob); }
@@ -802,8 +947,8 @@ function cartaoCriacao(m) {
   if (k.log) { const det = document.createElement('details'), sm = document.createElement('summary'), pre = document.createElement('pre'); sm.textContent = 'Ver os erros'; pre.textContent = k.log; det.append(sm, pre); d.appendChild(det); }
   return d;
 }
-async function criarArquivo(tipo, desc, c, usados, base) {
-  usados = usados || []; const rotulo = {app: 'app', appx: 'app', esp32: 'firmware', web: 'página web', python: 'programa', img: 'imagem'}[tipo];
+async function criarArquivo(tipo, desc, c, usados, base, retomar) {
+  usados = usados || []; const rotulo = {app: 'app', appx: 'app', esp32: 'firmware', web: 'página web', python: 'programa', img: 'imagem', video: 'vídeo'}[tipo];
   const m = {role: 'assistant', kind: 'criacao', ignorar: true, criacao: {status: '⏳ Enviando o pedido…', descricao: desc}}; c.msgs.push(m);
   let atual = criaMsg(m); coluna.appendChild(atual); desceFim(true);
   const k = m.criacao, att = () => { const n = criaMsg(m); atual.replaceWith(n); atual = n; desceFim(false); };
@@ -819,12 +964,12 @@ async function criarArquivo(tipo, desc, c, usados, base) {
   else if (tipo === 'esp32') rota = '/esp32/generate';
   else if (tipo === 'web' || tipo === 'python') { rota = '/codigo/generate'; body.alvo = tipo; }
   else if (tipo === 'img') { rota = '/imagem/generate'; body.tamanho = $('imgTam').value; body.passos = parseInt($('imgPassos').value, 10); body.forca = parseFloat($('imgForca').value); body.melhorar = $('imgMelhorar').checked; body.modelo = $('imgModelo').value; }
+  else if (tipo === 'video') { rota = '/video/generate'; body.tamanho = $('vidTam').value; body.quadros = parseInt($('vidQuadros').value, 10); body.passos = parseInt($('vidPassos').value, 10); body.melhorar = $('vidMelhorar').checked; }
   setStatus(`Criando: ${rotulo}… (■ cancela)`); let terminou = false;
-  try {
-    ctrl = new AbortController();
-    const r = await fetch(rota, {method: 'POST', headers: {'Content-Type': 'application/json'}, signal: ctrl.signal, body: JSON.stringify(body)});
-    if (!r.ok) throw new Error(r.status === 400 || r.status === 404 ? (await r.json()).detail : 'Servidor respondeu ' + r.status);
-    const reader = r.body.getReader(), dec = new TextDecoder(); let buf = '';
+  const ehVideo = tipo === 'video'; if (ehVideo) criandoVideo = true;
+  // lê o fluxo de eventos do servidor (SSE) e atualiza o cartão
+  const consome = async resp => {
+    const reader = resp.body.getReader(), dec = new TextDecoder(); let buf = '';
     for (;;) {
       const {value, done} = await reader.read(); if (done) break;
       buf += dec.decode(value, {stream: true});
@@ -833,22 +978,44 @@ async function criarArquivo(tipo, desc, c, usados, base) {
         if (!ln.startsWith('data:')) continue;
         const ev = JSON.parse(ln.slice(5).trim());
         if (ev.type === 'status') { k.status = '⏳ ' + ev.msg; att(); }
-        else if (ev.type === 'passo') { k.passo = [ev.passo, ev.total]; k.status = `⏳ Gerando a imagem… passo ${ev.passo} de ${ev.total}`; att(); }
+        else if (ev.type === 'passo') { k.passo = [ev.passo, ev.total]; k.status = ev.msg ? '⏳ ' + ev.msg : `⏳ Gerando a imagem… passo ${ev.passo} de ${ev.total}`; att(); }
         else if (ev.type === 'progress') setStatus(`A IA já escreveu ${ev.tokens} pedaços de código… (■ cancela)`);
         else if (ev.type === 'code') { k.codigo = ev.text; att(); }
         else if (ev.type === 'done') { terminou = true; k.passo = null; k.status = `✅ "${ev.name}" pronto!`; k.files = ev.files; k.nota = ev.note; k.preview = ev.preview; k.id = ev.id; k.nome = ev.name; k.kind = ev.kind; k.modo = tipo === 'appx' ? 'avancado' : undefined; att(); }
         else if (ev.type === 'error') {
           terminou = true; k.passo = null; k.erro = true; k.status = '⚠ ' + ev.msg; k.log = ev.log; att();
           if (ev.precisa_modelo) { $('plusMenu').hidden = false; checaModeloImagem(); }
+          if (ev.precisa_modelo_video) { $('plusMenu').hidden = false; checaModeloVideo(); }
         }
       }
+    }
+  };
+  try {
+    ctrl = new AbortController();
+    const r = await fetch(retomar ? '/video/seguir' : rota, retomar ? {signal: ctrl.signal} : {method: 'POST', headers: {'Content-Type': 'application/json'}, signal: ctrl.signal, body: JSON.stringify(body)});
+    if (!r.ok) throw new Error(r.status === 400 || r.status === 404 ? (await r.json()).detail : 'Servidor respondeu ' + r.status);
+    await consome(r);
+    // vídeo demora vários minutos: se a conexão cair (tela apagada, sinal), o PC continua e o app volta a acompanhar
+    for (let t = 0; ehVideo && !terminou && t < 400; t++) {
+      k.status = '⏳ Conexão interrompida; o vídeo continua sendo gerado no PC. Reconectando…'; att();
+      await new Promise(ok => setTimeout(ok, 5000));
+      try { const r2 = await fetch('/video/seguir', {signal: ctrl.signal}); if (r2.ok) await consome(r2); } catch (e) { if (e.name === 'AbortError') throw e; }
     }
     if (!terminou) { k.erro = true; k.status = `⚠ A conexão terminou antes de ficar pronto.`; att(); }
   } catch (e) {
     if (e.name === 'AbortError') k.status = `⏹ Criação cancelada por você.`;
     else { k.erro = true; k.status = '⚠ ' + mensagemAmigavel(e); }
     att();
-  } finally { setStatus(''); }
+  } finally { criandoVideo = false; setStatus(''); }
+}
+// ao abrir o app: se um vídeo ainda está sendo gerado no PC, volta a acompanhar
+async function retomaVideo() {
+  try {
+    const e = await (await fetch('/video/estado')).json(); if (!e.rodando || busy) return;
+    let c = conv(); if (!c) { c = novaConv(); convs.push(c); atualId = c.id; }
+    busy = true; atualizaBotoes();
+    try { await criarArquivo('video', e.descricao || 'vídeo', c, [], null, true); } finally { busy = false; atualizaBotoes(); }
+  } catch (e) {}
 }
 
 /* ======================= Janelas ======================= */
@@ -943,7 +1110,87 @@ async function trocaModelo(id) {
   const r = await fetch('/llm/select', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({id})});
   if (!r.ok) $('llmMsg').textContent = '⚠ ' + (await r.json()).detail; carregaLlm();
 }
-$('llmBtn').onclick = () => { abreDlg('llmDlg'); carregaLlm(); clearInterval(llmTimer); llmTimer = setInterval(() => { if ($('llmDlg').open) carregaLlm(); else clearInterval(llmTimer); }, 2500); };
+$('llmBtn').onclick = () => { abreDlg('llmDlg'); carregaLlm(); lerMeus(); clearInterval(llmTimer); llmTimer = setInterval(() => { if ($('llmDlg').open) carregaLlm(); else clearInterval(llmTimer); }, 2500); };
+// --- adicionar outras IAs (busca pelo nome, online)
+let mdTimer = null, modeloAtual = '';
+const fmtN = n => n >= 1e6 ? (n / 1e6).toFixed(1) + ' mi' : n >= 1e3 ? Math.round(n / 1e3) + ' mil' : String(n || 0);
+const fmtGB = n => n >= 1e9 ? (n / 1e9).toFixed(2) + ' GB' : Math.round(n / 1e6) + ' MB';
+async function buscaModelos() {
+  const q = $('mdQ').value.trim(); if (!q) return; const tipo = $('mdTipo').value, box = $('mdRes');
+  box.textContent = 'Buscando no Hugging Face…';
+  try {
+    const r = await fetch('/modelos/buscar?q=' + encodeURIComponent(q) + '&tipo=' + tipo);
+    if (!r.ok) throw new Error((await r.json()).detail);
+    const itens = await r.json(); box.textContent = itens.length ? '' : 'Nada encontrado com esse nome.';
+    for (const it of itens) {
+      const row = document.createElement('div'); row.className = 'item-l'; row.style.flexDirection = 'column';
+      const topo = document.createElement('div'); topo.style.cssText = 'display:flex;gap:10px;align-items:center;width:100%';
+      const t = document.createElement('div'); t.className = 't'; t.innerHTML = '<b></b><small></small>';
+      t.querySelector('b').textContent = it.repo; t.querySelector('small').textContent = '↓ ' + fmtN(it.downloads) + ' · ♥ ' + fmtN(it.likes) + (it.tags && it.tags.length ? ' · ' + it.tags.join(', ') : '');
+      const b = document.createElement('button'); b.className = 'bt'; b.textContent = 'Ver arquivos';
+      b.onclick = () => mostraArquivos(it.repo, tipo, row, b);
+      topo.append(t, b); row.appendChild(topo); box.appendChild(row);
+    }
+  } catch (e) { box.textContent = '⚠ ' + e.message; }
+}
+async function mostraArquivos(repo, tipo, row, btn) {
+  btn.disabled = true; btn.textContent = '…';
+  try {
+    const r = await fetch('/modelos/arquivos?repo=' + encodeURIComponent(repo) + '&tipo=' + tipo);
+    if (!r.ok) throw new Error((await r.json()).detail);
+    const gs = await r.json(); btn.remove();
+    if (!gs.length) { const d = document.createElement('div'); d.className = 'dica'; d.textContent = 'Esse repositório não tem arquivo .gguf utilizável.'; row.appendChild(d); }
+    for (const g of gs) {
+      const l = document.createElement('div'); l.className = 'arq-l'; l.style.width = '100%';
+      const t = document.createElement('div'); t.className = 't';
+      t.innerHTML = '<span></span> <small></small><div class="aviso"></div>';
+      t.querySelector('span').textContent = g.nome; t.querySelector('small').textContent = (g.quant ? g.quant + ' · ' : '') + fmtGB(g.tam) + (g.arquivos.length > 1 ? ' · ' + g.arquivos.length + ' partes' : '');
+      if (g.recomendado) { const rc = document.createElement('span'); rc.className = 'rec'; rc.textContent = ' ★ recomendado para o seu PC'; t.querySelector('small').after(rc); }
+      t.querySelector('.aviso').textContent = g.aviso || '';
+      const bb = document.createElement('button'); bb.className = 'bt' + (g.recomendado ? ' pri' : ''); bb.textContent = 'Baixar';
+      bb.onclick = async () => {
+        bb.disabled = true; const rr = await fetch('/modelos/baixar', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({repo, arquivos: g.arquivos, tipo, tam: g.tam})});
+        if (!rr.ok) { $('llmMsg').textContent = '⚠ ' + (await rr.json()).detail; bb.disabled = false; } else { bb.textContent = 'Baixando…'; lerMeus(); }
+      };
+      l.append(t, bb); row.appendChild(l);
+    }
+  } catch (e) { btn.disabled = false; btn.textContent = 'Ver arquivos'; $('llmMsg').textContent = '⚠ ' + e.message; }
+}
+async function lerMeus() {
+  try {
+    const [e, j] = await Promise.all([fetch('/modelos/estado').then(r => r.json()), fetch('/llm').then(r => r.json())]);
+    modeloAtual = j.modelo_atual || ''; const box = $('mdMeus'); box.textContent = '';
+    for (const d of e.baixando) {
+      const row = document.createElement('div'); row.className = 'item-l'; row.style.flexDirection = 'column';
+      const topo = document.createElement('div'); topo.style.cssText = 'display:flex;gap:10px;align-items:center;width:100%';
+      const t = document.createElement('div'); t.className = 't'; t.innerHTML = '<b></b><small></small>';
+      t.querySelector('b').textContent = d.repo; t.querySelector('small').textContent = d.erro ? '⚠ ' + d.erro : 'Baixando… ' + Math.round(d.progresso * 100) + '% (' + fmtGB(d.feito) + ' de ' + fmtGB(d.tam) + ')';
+      const b = document.createElement('button'); b.className = 'bt'; b.textContent = d.fim ? 'Ok' : 'Cancelar';
+      b.onclick = async () => { await fetch('/modelos/cancelar', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({id: d.id})}); lerMeus(); };
+      topo.append(t, b); row.appendChild(topo);
+      if (!d.fim) { const bar = document.createElement('div'); bar.className = 'barra'; bar.innerHTML = '<i></i>'; bar.firstChild.style.width = Math.round(d.progresso * 100) + '%'; row.appendChild(bar); }
+      box.appendChild(row);
+    }
+    for (const m of e.modelos) {
+      const emUso = m.tipo === 'texto' && modeloAtual === m.arquivo;
+      const row = document.createElement('div'); row.className = 'item-l';
+      const t = document.createElement('div'); t.className = 't'; t.innerHTML = '<b></b><small></small>';
+      t.querySelector('b').textContent = (m.tipo === 'imagem' ? '🎨 ' : '💬 ') + m.nome + (emUso ? ' · em uso' : '');
+      t.querySelector('small').textContent = (m.quant ? m.quant + ' · ' : '') + fmtGB(m.tam) + ' · ' + m.repo;
+      const b = document.createElement('button'); b.className = 'bt' + (emUso ? '' : ' pri');
+      if (emUso) { b.textContent = 'Em uso'; b.disabled = true; }
+      else if (m.tipo === 'texto') { b.textContent = 'Usar'; b.onclick = async () => { $('llmMsg').textContent = 'Trocando o modelo… ele recarrega em alguns minutos.'; const r = await fetch('/modelos/usar', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({id: m.id})}); if (!r.ok) $('llmMsg').textContent = '⚠ ' + (await r.json()).detail; carregaLlm(); lerMeus(); }; }
+      else { b.textContent = 'Usar nas imagens'; b.onclick = () => { $('llmDlg').close(); $('modo').value = 'img'; $('modo').onchange(); setTimeout(() => { $('imgModelo').value = 'x' + m.id; $('imgModelo').onchange(); }, 400); }; }
+      const ap = document.createElement('button'); ap.className = 'bt'; ap.textContent = 'Apagar';
+      ap.onclick = async () => { if (!confirm('Apagar ' + m.nome + ' do disco?')) return; await fetch('/modelos/apagar', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({id: m.id})}); lerMeus(); };
+      row.append(t, b, ap); box.appendChild(row);
+    }
+    if (!e.baixando.length && !e.modelos.length) box.textContent = 'Nenhuma ainda. Busque pelo nome acima.';
+    if (e.baixando.some(d => !d.fim) && !mdTimer) mdTimer = setInterval(() => { if ($('llmDlg').open) lerMeus(); else { clearInterval(mdTimer); mdTimer = null; } }, 3000);
+    if (!e.baixando.some(d => !d.fim) && mdTimer) { clearInterval(mdTimer); mdTimer = null; }
+  } catch (e) {}
+}
+$('mdBusca').onclick = buscaModelos; $('mdQ').onkeydown = e => { if (e.key === 'Enter') buscaModelos(); };
 function atualizaEstadoLlm(estado) {
   $('bolinha').className = 'bolinha ' + estado;
   $('estadoTxt').textContent = {ok: 'Modelo pronto', carregando: 'Modelo carregando…', desligado: 'Modelo desligado'}[estado] || '';
@@ -963,6 +1210,12 @@ async function lerTele() {
     h += linhaSis('Temperatura da CPU', t.cpu.temp != null ? t.cpu.temp.toFixed(0) + ' °C' : 'indisponível', t.cpu.temp >= 85 ? 'err' : t.cpu.temp >= 75 ? 'warn' : '') + linhaSis('Uso da CPU', t.cpu.uso != null ? t.cpu.uso + ' %' : 'indisponível', t.cpu.uso >= 90 ? 'warn' : '') + linhaSis('Carga da CPU (1 min)', t.cpu.carga + ' (de ' + t.cpu.nucleos + ' threads)');
     for (const [k, v] of Object.entries(t.ventoinhas)) h += linhaSis('Ventoinha ' + k, v + ' RPM');
     h += linhaSis('Memória RAM', t.ram.usada + ' / ' + t.ram.total + ' MB');
+    const vc = t.ventoinha_ctl || {};
+    if (vc.ativo) {
+      h += linhaSis('Controle da ventoinha da GPU', vc.gpu && vc.gpu.metodo ? 'ligado (' + vc.gpu.metodo + ') · ' + (vc.gpu.pct != null ? vc.gpu.pct + ' %' : '—') : 'sem controle: ' + ((vc.gpu && vc.gpu.erro) || 'a placa não aceitou'), vc.gpu && vc.gpu.metodo ? '' : 'warn');
+      const pm = vc.placa_mae || [];
+      h += linhaSis('Ventoinhas da placa-mãe (CPU/caixa)', pm.length ? pm.length + ' controlada(s) · ' + (pm[0].pct != null ? pm[0].pct + ' %' : '—') : 'a placa-mãe não expõe controle ao Linux (rode: bash atualizar.sh)', pm.length ? '' : 'warn');
+    }
     $('sisTab').innerHTML = h;
     $('sisNota').textContent = t.controle_ventoinha === 'active' ? '✔ Controle automático da ventoinha da GPU ligado.' : 'O controle automático da ventoinha da GPU não está ligado (rode: bash atualizar.sh).';
     montaChips(t);
@@ -1034,7 +1287,7 @@ aplicaTema(le('iaTema', 'automático'));
 /* ======================= Início ======================= */
 atualId = le('iaAtual', '');
 if (!conv()) { const n = novaConv(); convs.push(n); atualId = n.id; }
-desenha(); atualizaChips(); autoAltura(); checaLlm(); setInterval(checaLlm, 5000); chipsLoop(); setInterval(chipsLoop, 3000);
+desenha(); atualizaChips(); autoAltura(); checaLlm(); setInterval(checaLlm, 5000); chipsLoop(); setInterval(chipsLoop, 3000); setTimeout(retomaVideo, 1500);
 txt.focus();
 </script>
 </body>

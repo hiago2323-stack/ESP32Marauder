@@ -48,10 +48,12 @@ import entregas
 import esp32gen
 import imagens
 import memory
+import modelos
 import perfis
 import recursos
 import telemetria
 import uploads
+import video
 
 @asynccontextmanager
 async def ciclo_de_vida(_app):
@@ -301,7 +303,8 @@ class PerfilReq(BaseModel):
 
 @app.get("/llm", dependencies=[Depends(require_token)])
 async def llm_info():
-    return {"atual": perfis.atual(), "estado": await perfis.estado_llm(), "perfis": perfis.lista()}
+    return {"atual": perfis.atual(), "estado": await perfis.estado_llm(), "perfis": perfis.lista(),
+            "modelo_atual": Path(perfis._le_env().get("MODEL", "")).name}
 
 
 @app.post("/llm/select", dependencies=[Depends(require_token)])
@@ -322,6 +325,75 @@ async def llm_download(req: PerfilReq):
     except ValueError as e:
         raise HTTPException(400, str(e))
     return {"ok": True}
+
+
+# ----------------------------------------------------------------------------- adicionar outras IAs (busca pelo nome)
+class BaixarModeloReq(BaseModel):
+    repo: str
+    arquivos: list[str]
+    tipo: str = "texto"
+    tam: int = 0
+
+
+@app.get("/modelos/buscar", dependencies=[Depends(require_token)])
+async def modelos_buscar(q: str, tipo: str = "texto"):
+    try:
+        return await modelos.buscar(q, tipo)
+    except (httpx.HTTPError, ValueError):
+        raise HTTPException(502, "Não consegui falar com o Hugging Face (o PC está sem internet?).")
+
+
+@app.get("/modelos/arquivos", dependencies=[Depends(require_token)])
+async def modelos_arquivos(repo: str, tipo: str = "texto"):
+    try:
+        return await modelos.arquivos(repo, tipo)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except httpx.HTTPError:
+        raise HTTPException(502, "Não consegui falar com o Hugging Face (o PC está sem internet?).")
+
+
+@app.post("/modelos/baixar", dependencies=[Depends(require_token)])
+async def modelos_baixar(req: BaixarModeloReq):
+    try:
+        return {"id": modelos.baixar(req.repo, req.arquivos, req.tipo, req.tam)}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.get("/modelos/estado", dependencies=[Depends(require_token)])
+async def modelos_estado():
+    return await asyncio.to_thread(modelos.estado)
+
+
+@app.post("/modelos/cancelar", dependencies=[Depends(require_token)])
+async def modelos_cancelar(req: PerfilReq):
+    return {"ok": modelos.cancelar(req.id)}
+
+
+@app.post("/modelos/usar", dependencies=[Depends(require_token)])
+async def modelos_usar(req: PerfilReq):
+    try:
+        await asyncio.to_thread(modelos.usar, req.id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+    return {"ok": True}
+
+
+@app.post("/modelos/apagar", dependencies=[Depends(require_token)])
+async def modelos_apagar(req: PerfilReq):
+    try:
+        await asyncio.to_thread(modelos.apagar, req.id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True}
+
+
+@app.get("/imagem/modelos", dependencies=[Depends(require_token)])
+async def imagem_modelos():
+    return imagens.lista_modelos()
 
 
 @app.get("/telemetry", dependencies=[Depends(require_token)])
@@ -376,6 +448,7 @@ class AppRequest(BaseModel):
     forca: float = 0.6
     melhorar: bool = True
     modelo: str = "rapido"            # /imagem/generate: rapido | realista
+    quadros: int = 17                 # /video/generate: 9, 17 ou 33 quadros (a 16 por segundo)
 
 
 def _base_de(req: AppRequest) -> dict:
@@ -490,6 +563,49 @@ async def imagem_modelo_baixar(m: str = "rapido"):
     except ValueError as e:
         raise HTTPException(400, str(e))
     return {"ok": True}
+
+
+# ----------------------------------------------------------------------------- vídeo
+@app.get("/video/modelo", dependencies=[Depends(require_token)])
+async def video_modelo():
+    return video.estado()
+
+
+@app.post("/video/modelo", dependencies=[Depends(require_token)])
+async def video_modelo_baixar():
+    try:
+        video.baixar()
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True}
+
+
+@app.post("/video/generate", dependencies=[Depends(require_token)])
+async def video_generate(req: AppRequest):
+    desc = req.description.strip()[:800]
+    if not desc:
+        raise HTTPException(400, "Descreva o vídeo que você quer.")
+    try:
+        video.inicia(desc, req.tamanho, req.quadros, req.passos, req.melhorar)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return StreamingResponse(video.segue(), media_type="text/event-stream")
+
+
+@app.get("/video/seguir", dependencies=[Depends(require_token)])
+async def video_seguir():
+    """Reconecta ao vídeo em andamento (ou mostra o último) depois de uma queda de conexão."""
+    return StreamingResponse(video.segue(), media_type="text/event-stream")
+
+
+@app.get("/video/estado", dependencies=[Depends(require_token)])
+async def video_estado():
+    return video.situacao()
+
+
+@app.post("/video/cancelar", dependencies=[Depends(require_token)])
+async def video_cancelar():
+    return {"ok": video.cancela()}
 
 
 # ----------------------------------------------------------------------------- anexos
