@@ -183,7 +183,10 @@ SYSTEM_PROMPT = os.environ.get(
     "de forma clara, direta e correta. Quando a mensagem trouxer um bloco [CONTEXTO], use-o: ele tem "
     "memórias do usuário e resultados de pesquisa na web; cite os endereços das fontes usadas. "
     "Se não tiver certeza ou não souber, diga isso em vez de inventar. Responda direto ao ponto, sem sermões, "
-    "sem avisos desnecessários e sem rodeios: trate o usuário como um adulto capaz.",
+    "sem avisos desnecessários e sem rodeios: trate o usuário como um adulto capaz. "
+    "Entenda os pedidos de forma sumária: capte a essência de pedidos curtos ou vagos (por exemplo, "
+    "\"app de lista\" ou \"gato astronauta\"), assuma padrões sensatos e entregue em vez de devolver perguntas; "
+    "só pergunte se faltar algo sem o qual não dá para fazer. Respostas curtas e objetivas, com detalhes só se pedirem.",
 )
 
 # Banco da memória de longo prazo (o que o usuário ensina e o que a IA aprende)
@@ -615,12 +618,16 @@ def _base_de(req: AppRequest) -> dict:
     return base
 
 
+_NOTA_SUMARIA = ("\n\n(Pedido curto: capte a essência, assuma padrões sensatos para o que não foi dito e entregue o "
+                 "programa completo e funcionando, sem fazer perguntas.)")
+
+
 async def _com_referencias(desc: str) -> str:
     """Junta ao pedido alguns exemplos/documentação da biblioteca local (se houver e se casarem com o pedido)."""
     if not desc:
         return desc
     try:
-        return desc + await asyncio.to_thread(biblioteca.referencias, desc)
+        return desc + await asyncio.to_thread(biblioteca.referencias, desc) + _NOTA_SUMARIA
     except Exception:
         return desc
 
@@ -2851,14 +2858,15 @@ async def gera_imagem(descricao: str, init_id: str | None, tamanho: str, passos:
         saida = pasta / "imagem.png"
         seed = random.randint(1, 2**31 - 1)
         modo = recursos.modo_imagem()
-        base = {"modelo": str(config.IMG_MODEL), "threads": (os.cpu_count() or recursos.nucleos_fisicos()) if modo == "cpu" else recursos.nucleos_fisicos(), "prompt": prompt,
+        # threads = todos os núcleos/threads do processador
+        base = {"modelo": str(config.IMG_MODEL), "threads": os.cpu_count() or recursos.nucleos_fisicos(), "prompt": prompt,
                 "largura": largura, "altura": altura, "passos": passos, "seed": seed, "saida": str(saida),
                 "cfg": 1.0, "init": str(init) if init else None, "forca": forca}
         try:
             rotulo = {"gpu": "na placa de vídeo", "hibrido": "na placa de vídeo e na CPU", "cpu": "na CPU"}[modo]
             vram = recursos.vram_livre_mb()
             motivo = (f" (a IA de texto está ocupando a placa: só {vram} MB livres)" if modo == "cpu" and vram is not None else "")
-            await emit({"type": "status", "msg": f"Gerando a imagem {rotulo}{motivo}… (leva cerca de 1 minuto na CPU)"})
+            await emit({"type": "status", "msg": f"Gerando a imagem {rotulo}{motivo}…{' (leva cerca de 1 minuto)' if modo == 'cpu' else ''}"})
             ok, erro = await _roda_worker({**base, "modo": modo}, emit)
             if not ok and modo != "cpu":
                 await emit({"type": "status", "msg": "A placa de vídeo não deu conta; tentando só pela CPU…"})
@@ -4794,7 +4802,10 @@ if [ "$NGL" = "auto" ]; then
   case "$MODEL" in *14B*|*14b*) CAMADAS=48 ;; *3B*|*3b*) CAMADAS=36 ;; *7B*|*7b*|*1.5B*) CAMADAS=28 ;; *) CAMADAS=32 ;; esac
   if [ -n "$LIVRE" ] && [ "$LIVRE" -gt 0 ] && [ "$TAM" -gt 0 ]; then
     POR_CAMADA=$(( TAM / CAMADAS + 1 ))
-    NGL=$(( (LIVRE - ${RESERVA_VRAM:-1000}) / POR_CAMADA ))
+    # Deixa parte da placa livre para o gerador de imagens (junto com o texto, sem pausar nada): o modelo de
+    # imagens, se existir, pede ~1,4 GB; sem ele, só a folga normal. Mude com RESERVA_VRAM=NNNN (MiB).
+    if [ -s "$HOME/models/imagens/sd_turbo-f16-q8_0.gguf" ]; then RESERVA_PADRAO=1400; else RESERVA_PADRAO=1000; fi
+    NGL=$(( (LIVRE - ${RESERVA_VRAM:-$RESERVA_PADRAO}) / POR_CAMADA ))
     [ "$NGL" -lt 0 ] && NGL=0
     [ "$NGL" -gt "$CAMADAS" ] && NGL=$CAMADAS
   else

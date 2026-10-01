@@ -395,12 +395,16 @@ def _base_de(req: AppRequest) -> dict:
     return base
 
 
+_NOTA_SUMARIA = ("\n\n(Pedido curto: capte a essência, assuma padrões sensatos para o que não foi dito e entregue o "
+                 "programa completo e funcionando, sem fazer perguntas.)")
+
+
 async def _com_referencias(desc: str) -> str:
     """Junta ao pedido alguns exemplos/documentação da biblioteca local (se houver e se casarem com o pedido)."""
     if not desc:
         return desc
     try:
-        return desc + await asyncio.to_thread(biblioteca.referencias, desc)
+        return desc + await asyncio.to_thread(biblioteca.referencias, desc) + _NOTA_SUMARIA
     except Exception:
         return desc
 

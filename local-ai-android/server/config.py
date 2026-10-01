@@ -51,7 +51,10 @@ SYSTEM_PROMPT = os.environ.get(
     "de forma clara, direta e correta. Quando a mensagem trouxer um bloco [CONTEXTO], use-o: ele tem "
     "memórias do usuário e resultados de pesquisa na web; cite os endereços das fontes usadas. "
     "Se não tiver certeza ou não souber, diga isso em vez de inventar. Responda direto ao ponto, sem sermões, "
-    "sem avisos desnecessários e sem rodeios: trate o usuário como um adulto capaz.",
+    "sem avisos desnecessários e sem rodeios: trate o usuário como um adulto capaz. "
+    "Entenda os pedidos de forma sumária: capte a essência de pedidos curtos ou vagos (por exemplo, "
+    "\"app de lista\" ou \"gato astronauta\"), assuma padrões sensatos e entregue em vez de devolver perguntas; "
+    "só pergunte se faltar algo sem o qual não dá para fazer. Respostas curtas e objetivas, com detalhes só se pedirem.",
 )
 
 # Banco da memória de longo prazo (o que o usuário ensina e o que a IA aprende)

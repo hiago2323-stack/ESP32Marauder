@@ -158,14 +158,15 @@ async def gera_imagem(descricao: str, init_id: str | None, tamanho: str, passos:
         saida = pasta / "imagem.png"
         seed = random.randint(1, 2**31 - 1)
         modo = recursos.modo_imagem()
-        base = {"modelo": str(config.IMG_MODEL), "threads": (os.cpu_count() or recursos.nucleos_fisicos()) if modo == "cpu" else recursos.nucleos_fisicos(), "prompt": prompt,
+        # threads = todos os núcleos/threads do processador
+        base = {"modelo": str(config.IMG_MODEL), "threads": os.cpu_count() or recursos.nucleos_fisicos(), "prompt": prompt,
                 "largura": largura, "altura": altura, "passos": passos, "seed": seed, "saida": str(saida),
                 "cfg": 1.0, "init": str(init) if init else None, "forca": forca}
         try:
             rotulo = {"gpu": "na placa de vídeo", "hibrido": "na placa de vídeo e na CPU", "cpu": "na CPU"}[modo]
             vram = recursos.vram_livre_mb()
             motivo = (f" (a IA de texto está ocupando a placa: só {vram} MB livres)" if modo == "cpu" and vram is not None else "")
-            await emit({"type": "status", "msg": f"Gerando a imagem {rotulo}{motivo}… (leva cerca de 1 minuto na CPU)"})
+            await emit({"type": "status", "msg": f"Gerando a imagem {rotulo}{motivo}…{' (leva cerca de 1 minuto)' if modo == 'cpu' else ''}"})
             ok, erro = await _roda_worker({**base, "modo": modo}, emit)
             if not ok and modo != "cpu":
                 await emit({"type": "status", "msg": "A placa de vídeo não deu conta; tentando só pela CPU…"})
