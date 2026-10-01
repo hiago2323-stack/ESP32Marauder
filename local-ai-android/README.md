@@ -64,6 +64,28 @@ Todos os arquivos ficam também em **📁 Arquivos**.
 O botão **⏹ Parar** (ou Esc) cancela a escrita e a compilação. A primeira compilação baixa as
 ferramentas do Android (algumas centenas de MB) e demora mais.
 
+## Desempenho e precisão
+
+- **Perfis de modelo** (⚙ Configurações › Modelo de IA): *Rápido* (3B), *Preciso* (7B) e *Código* (Coder 7B).
+  Dá para baixar e trocar pela tela. O 3B é bem mais rápido; o 7B é mais correto; o Código é o melhor para apps/firmware.
+- **Velocidade**: o prompt é mantido estável e o contexto (memórias, web) vai na última mensagem, então o
+  `llama-server` reaproveita o cache entre perguntas; threads de geração = núcleos físicos; `--mlock`, `-np 1`,
+  `--cache-reuse` (só entram se a versão do llama.cpp conhecer a opção); contexto de 8192.
+- **Precisão**: temperatura 0.4, pesquisa web com poucos resultados, e voz com modelo maior (large-v3-turbo) e
+  dica de vocabulário técnico (ESP32, Tailscale, Gradle...).
+
+## Ventoinhas
+
+`fanctl.py` (serviço `localai-fan`) ajusta a ventoinha da GPU pela temperatura (curva de 30% a 100%) e a devolve
+ao automático ao parar. Pela tela: ⚙ Configurações › Sistema e ventoinhas. Para a CPU, a placa-mãe costuma controlar
+sozinha pela BIOS; `bash ~/localai/diagnostico_fans.sh` mostra se o Linux consegue controlá-la (então se define
+`FANCTL_CPU_PWM` em `server/fan.env`).
+
+## Tailscale
+
+O `atualizar.sh` liga o `tailscaled` no boot e faz o login uma vez (`sudo tailscale up`, ou `TS_AUTHKEY=... bash atualizar.sh`
+para entrar sem navegador). Depois disso o PC reconecta sozinho a cada ligada.
+
 ## Atualizar sem reinstalar
 
 ```

@@ -19,6 +19,7 @@ import asyncio
 import hmac
 import io
 import json
+import os
 import re
 import shutil
 import socket
@@ -42,6 +43,8 @@ import config
 import entregas
 import esp32gen
 import memory
+import perfis
+import telemetria
 
 app = FastAPI(title="Local AI Server")
 config.WORK_DIR.mkdir(parents=True, exist_ok=True)
@@ -80,13 +83,27 @@ def index(request: Request, token: str = ""):
     return FileResponse(STATIC / "index.html", headers={"Cache-Control": "no-cache"})
 
 
-def _ips_do_pc() -> list[str]:
-    ips = []
-    try:  # IP do Tailscale (acesso de qualquer lugar)
-        r = subprocess.run(["tailscale", "ip", "-4"], capture_output=True, text=True, timeout=4)
-        ips += [f"http://{x.strip()}:8080" for x in r.stdout.split() if x.strip()]
+def _tailscale() -> dict:
+    """Estado do Tailscale: {'estado': 'Running'|'NeedsLogin'|'Stopped'|'ausente', 'ips': [...], 'dns': 'nome'}."""
+    try:
+        r = subprocess.run(["tailscale", "status", "--json"], capture_output=True, text=True, timeout=5)
+        if r.returncode != 0 and not r.stdout.strip():
+            return {"estado": "parado", "ips": [], "dns": ""}
+        j = json.loads(r.stdout)
+        eu = j.get("Self") or {}
+        return {"estado": j.get("BackendState", "?"), "ips": [i for i in eu.get("TailscaleIPs", []) if "." in i],
+                "dns": (eu.get("DNSName") or "").rstrip(".")}
+    except FileNotFoundError:
+        return {"estado": "ausente", "ips": [], "dns": ""}
     except Exception:
-        pass
+        return {"estado": "erro", "ips": [], "dns": ""}
+
+
+def _ips_do_pc() -> list[str]:
+    ts = _tailscale()
+    ips = [f"http://{i}:8080" for i in ts["ips"]]
+    if ts["dns"]:
+        ips.append(f"http://{ts['dns']}:8080")
     try:  # IP na rede de casa (Wi-Fi)
         sk = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sk.connect(("10.255.255.255", 1))
@@ -102,7 +119,7 @@ def pair(request: Request):
     """Dados para conectar o app do celular. SÓ responde para quem está no próprio PC."""
     if not (request.client and request.client.host in LOCAL_HOSTS):
         raise HTTPException(403, "Só disponível no próprio PC")
-    return {"urls": _ips_do_pc(), "token": config.API_TOKEN}
+    return {"urls": _ips_do_pc(), "token": config.API_TOKEN, "tailscale": _tailscale()}
 
 
 @app.get("/health")
@@ -135,7 +152,7 @@ def _web_search_sync(query: str, limit: int) -> list[dict]:
 class ChatRequest(BaseModel):
     messages: list[dict]
     max_tokens: int = 700
-    temperature: float = 0.7
+    temperature: float = 0.4   # mais baixo = respostas mais consistentes e precisas
     web: bool = False
 
 
@@ -144,35 +161,48 @@ def _sse_error(msg: str) -> bytes:
 
 
 async def _build_messages(req: ChatRequest) -> tuple[list[dict], int]:
+    """Monta a conversa para o modelo.
+
+    VELOCIDADE: a mensagem de sistema é sempre a mesma (só muda a data, 1x por dia). As memórias e a
+    pesquisa web vão dentro da ÚLTIMA mensagem do usuário. Assim o início da conversa fica idêntico
+    entre um turno e outro, e o llama-server reaproveita o que já calculou (cache do prompt), em vez
+    de reprocessar tudo a cada pergunta.
+    """
     system = f"{config.SYSTEM_PROMPT}\nData de hoje: {date.today().isoformat()}."
-    msgs = [{"role": "system", "content": system}]
-    last = next((m["content"] for m in reversed(req.messages) if m.get("role") == "user"), "")
-    mems = await asyncio.to_thread(memory.search, last, 4)
+    msgs = [{"role": "system", "content": system}] + [dict(m) for m in req.messages]
+    ultimo = next((i for i in range(len(msgs) - 1, -1, -1) if msgs[i].get("role") == "user"), None)
+    if ultimo is None:
+        return msgs, 0
+    pergunta = msgs[ultimo]["content"]
+    partes = []
+
+    mems = await asyncio.to_thread(memory.search, pergunta, 4)
     if mems:
-        notes = "\n".join(f"- {m['text'][:600]}" for m in mems)
-        msgs[0]["content"] += (
-            "\n\nCoisas que você já aprendeu ou que o usuário te ensinou (podem estar desatualizadas; "
-            "use quando forem relevantes):\n" + notes
-        )
+        partes.append("Memórias (podem estar desatualizadas):\n" + "\n".join(f"- {m['text'][:500]}" for m in mems))
+
     n_web = 0
     if req.web:
         try:
-            results = await asyncio.to_thread(_web_search_sync, last, 5)
+            # poucos resultados e trechos curtos: cada palavra a mais deixa a resposta mais lenta
+            results = await asyncio.to_thread(_web_search_sync, pergunta, 3)
         except Exception as e:  # sem internet, bloqueio etc.: segue sem a pesquisa
             results = []
-            msgs[0]["content"] += f"\n(A pesquisa na web falhou: {type(e).__name__}.)"
+            partes.append(f"(A pesquisa na web falhou: {type(e).__name__}.)")
         if results:
-            ctx = "\n".join(f"[{i+1}] {r['title']} - {r['url']}\n{r['snippet']}" for i, r in enumerate(results))
-            msgs[0]["content"] += "\n\nResultados da pesquisa na web:\n" + ctx
             n_web = len(results)
-    return msgs + req.messages, n_web
+            partes.append("Pesquisa na web:\n" + "\n".join(
+                f"[{i+1}] {r['title']} - {r['url']}\n{(r['snippet'] or '')[:260]}" for i, r in enumerate(results)))
+
+    if partes:
+        msgs[ultimo]["content"] = "[CONTEXTO]\n" + "\n\n".join(partes) + "\n[FIM DO CONTEXTO]\n\n" + pergunta
+    return msgs, n_web
 
 
 @app.post("/chat", dependencies=[Depends(require_token)])
 async def chat(req: ChatRequest):
     messages, n_web = await _build_messages(req)
-    payload = {"messages": messages, "max_tokens": req.max_tokens,
-               "temperature": req.temperature, "stream": True}
+    payload = {"messages": messages, "max_tokens": req.max_tokens, "temperature": req.temperature,
+               "top_p": 0.9, "repeat_penalty": 1.05, "cache_prompt": True, "stream": True}
 
     async def stream():
         async with httpx.AsyncClient(timeout=None) as client:
@@ -198,6 +228,41 @@ async def chat(req: ChatRequest):
 
     # X-Web-Results: quantos resultados da web foram usados (0 = a pesquisa falhou ou não foi pedida)
     return StreamingResponse(stream(), media_type="text/event-stream", headers={"X-Web-Results": str(n_web)})
+
+
+# ------------------------------------------------- modelo de linguagem e telemetria
+class PerfilReq(BaseModel):
+    id: str
+
+
+@app.get("/llm", dependencies=[Depends(require_token)])
+async def llm_info():
+    return {"atual": perfis.atual(), "estado": await perfis.estado_llm(), "perfis": perfis.lista()}
+
+
+@app.post("/llm/select", dependencies=[Depends(require_token)])
+async def llm_select(req: PerfilReq):
+    try:
+        await asyncio.to_thread(perfis.seleciona, req.id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+    return {"ok": True}
+
+
+@app.post("/llm/download", dependencies=[Depends(require_token)])
+async def llm_download(req: PerfilReq):
+    try:
+        perfis.baixar(req.id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True}
+
+
+@app.get("/telemetry", dependencies=[Depends(require_token)])
+async def telemetry():
+    return await asyncio.to_thread(telemetria.ler)
 
 
 # ------------------------------------------- criar apps / firmware / arquivos
@@ -299,13 +364,24 @@ _kokoro = None
 _voice_lock = threading.Lock()
 
 
+def _carrega_whisper():
+    from faster_whisper import WhisperModel
+    nucleos = max(2, (os.cpu_count() or 4) // 2)  # núcleos físicos: rende mais que usar todos os threads
+    try:
+        return WhisperModel(config.WHISPER_MODEL, device="cpu", compute_type="int8", cpu_threads=nucleos)
+    except Exception:  # sem o modelo grande (não baixou / pouca memória): usa o pequeno
+        return WhisperModel(config.WHISPER_FALLBACK, device="cpu", compute_type="int8", cpu_threads=nucleos)
+
+
 def _stt_sync(path: str) -> str:
     global _whisper
     with _voice_lock:
         if _whisper is None:
-            from faster_whisper import WhisperModel
-            _whisper = WhisperModel(config.WHISPER_MODEL, device="cpu", compute_type="int8")
-        segments, _ = _whisper.transcribe(path, language="pt", vad_filter=True)
+            _whisper = _carrega_whisper()
+        segments, _ = _whisper.transcribe(
+            path, language="pt", beam_size=5, vad_filter=True,
+            vad_parameters={"min_silence_duration_ms": 500},
+            initial_prompt=config.STT_DICA, condition_on_previous_text=False)
         return " ".join(s.text.strip() for s in segments).strip()
 
 

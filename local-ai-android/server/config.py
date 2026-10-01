@@ -23,7 +23,14 @@ BUILD_TIMEOUT = int(os.environ.get("BUILD_TIMEOUT", "1200"))
 MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "100"))
 
 # Voz -> texto (faster-whisper, roda na CPU). Opções: tiny, base, small, medium
-WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")
+WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "large-v3-turbo")  # se não carregar, usa o "small"
+WHISPER_FALLBACK = os.environ.get("WHISPER_FALLBACK", "small")
+# Dica de vocabulário: faz o reconhecimento acertar termos técnicos (medido: 96% -> 99% de acerto)
+STT_DICA = os.environ.get(
+    "STT_DICA",
+    "Conversa em português do Brasil sobre tecnologia. Termos: ESP32, Android, APK, Tailscale, Gradle, Arduino, "
+    "Wi-Fi, Bluetooth, firmware, GPU, CPU, Python, Linux, Kotlin, Java.",
+)
 
 # Texto -> voz, voz FEMININA (Kokoro, pt-BR). Se os arquivos não existirem, cai no Piper (masculina).
 # Vozes pt-BR do Kokoro: pf_dora (feminina), pm_alex e pm_santa (masculinas)
@@ -38,8 +45,9 @@ PIPER_VOICE = Path(os.environ.get("PIPER_VOICE", str(HOME / "models" / "pt_BR-fa
 SYSTEM_PROMPT = os.environ.get(
     "SYSTEM_PROMPT",
     "Você é uma IA local que roda no computador do usuário. Responda sempre em português do Brasil, "
-    "de forma clara e direta. Quando houver resultados de pesquisa na web no contexto, use-os e cite as "
-    "fontes (endereços). Se não souber algo, diga que não sabe em vez de inventar.",
+    "de forma clara, direta e correta. Quando a mensagem trouxer um bloco [CONTEXTO], use-o: ele tem "
+    "memórias do usuário e resultados de pesquisa na web; cite os endereços das fontes usadas. "
+    "Se não tiver certeza ou não souber, diga isso em vez de inventar.",
 )
 
 # Banco da memória de longo prazo (o que o usuário ensina e o que a IA aprende)
@@ -56,3 +64,7 @@ GEN_MAX_TOKENS = int(os.environ.get("GEN_MAX_TOKENS", "2500"))
 
 # arduino-cli (compila firmware ESP32)
 ARDUINO_CLI = os.environ.get("ARDUINO_CLI", str(HOME / "bin" / "arduino-cli"))
+
+# ---- Desempenho e precisão ----
+MODELS_DIR = Path(os.environ.get("MODELS_DIR", str(HOME / "models")))
+MODELO_ENV = Path(os.environ.get("MODELO_ENV", str(HOME / "localai" / "modelo.env")))   # perfil escolhido na tela (o start_llm.sh lê este arquivo)

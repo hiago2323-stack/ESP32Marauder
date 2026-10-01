@@ -6,3 +6,4 @@ faster-whisper==1.2.*
 piper-tts==1.8.*
 kokoro-onnx==0.6.*
 ddgs==9.*
+nvidia-ml-py==13.*

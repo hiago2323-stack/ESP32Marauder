@@ -241,7 +241,8 @@ def resumo_erros(log: str, limite: int = 1600) -> str:
 # ------------------------------------------------------------------ chamadas externas
 async def pede_codigo(messages: list[dict], emit) -> str:
     """Chama o llama-server em streaming e junta o texto, avisando o progresso."""
-    payload = {"messages": messages, "stream": True, "temperature": 0.2,
+    payload = {"messages": messages, "stream": True, "temperature": 0.2, "top_p": 0.9,
+               "cache_prompt": True,  # o exemplo e as regras são sempre iguais: reaproveita o cálculo
                "max_tokens": config.GEN_MAX_TOKENS}
     texto, n, ultimo = "", 0, time.time()
     async with httpx.AsyncClient(timeout=None) as client:
