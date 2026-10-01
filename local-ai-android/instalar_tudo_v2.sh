@@ -216,6 +216,17 @@ OCIOSO_MIN = int(os.environ.get("OCIOSO_MIN", "10"))   # minutos parado até des
 IMG_MODEL = Path(os.environ.get("IMG_MODEL", str(HOME / "models" / "imagens" / "sd_turbo-f16-q8_0.gguf")))
 IMG_URL = "https://huggingface.co/Green-Sky/SD-Turbo-GGUF/resolve/main/sd_turbo-f16-q8_0.gguf"
 IMG_TAM = 2023745376
+# Modelos de imagem disponíveis (o rápido e um de fotorrealismo). Todos rodam 100% local, sem filtro extra nosso.
+_NEG_FOTO = ("(worst quality, low quality:1.4), blurry, deformed, bad anatomy, extra fingers, extra limbs, "
+             "cartoon, illustration, painting, 3d render, watermark, text, signature")
+IMG_MODELOS = {
+    "rapido": {"nome": "Rápido (SD-Turbo)", "arquivo": IMG_MODEL, "url": IMG_URL, "tam": IMG_TAM,
+               "cfg": 1.0, "passos": 4, "negativo": ""},
+    "realista": {"nome": "Realista (fotos)", "tam": 1765950304, "cfg": 2.0, "passos": 6, "negativo": _NEG_FOTO,
+                 "arquivo": IMG_MODEL.parent / "realisticVisionV60B1_v51HyperVAE-Q8_0.gguf",
+                 "url": "https://huggingface.co/second-state/Realistic_Vision_V6.0_B1-GGUF/resolve/main/"
+                        "realisticVisionV60B1_v51HyperVAE-Q8_0.gguf"},
+}
 
 # ---- Biblioteca local (documentação e código de referência; fica no disco grande via link ~/biblioteca) ----
 BIBLIOTECA_DIR = Path(os.environ.get("BIBLIOTECA_DIR", str(HOME / "biblioteca")))
@@ -598,6 +609,7 @@ class AppRequest(BaseModel):
     passos: int = 4
     forca: float = 0.6
     melhorar: bool = True
+    modelo: str = "rapido"            # /imagem/generate: rapido | realista
 
 
 def _base_de(req: AppRequest) -> dict:
@@ -697,18 +709,18 @@ async def imagem_generate(req: AppRequest):
         if arq is None:
             raise HTTPException(404, "Não achei a imagem que você quer modificar.")
         init = uploads.salva(arq.name, shutil.copy(arq, config.WORK_DIR / f"copia-{arq.name}"))["id"]
-    return _stream_job(lambda emit: imagens.gera_imagem(desc, init, req.tamanho, req.passos, req.forca, req.melhorar, emit))
+    return _stream_job(lambda emit: imagens.gera_imagem(desc, init, req.tamanho, req.passos, req.forca, req.melhorar, emit, req.modelo))
 
 
 @app.get("/imagem/modelo", dependencies=[Depends(require_token)])
-async def imagem_modelo():
-    return imagens.estado()
+async def imagem_modelo(m: str = "rapido"):
+    return imagens.estado(m)
 
 
 @app.post("/imagem/modelo", dependencies=[Depends(require_token)])
-async def imagem_modelo_baixar():
+async def imagem_modelo_baixar(m: str = "rapido"):
     try:
-        imagens.baixar()
+        imagens.baixar(m)
     except ValueError as e:
         raise HTTPException(400, str(e))
     return {"ok": True}
@@ -2722,20 +2734,27 @@ import recursos
 import uploads
 
 TAMANHOS = {"512x512": (512, 512), "512x768": (512, 768), "768x512": (768, 512)}
-_download: asyncio.Task | None = None
+_download: dict[str, asyncio.Task] = {}
 
 
 # ------------------------------------------------------------------ modelo de imagem (download)
-def presente() -> bool:
-    return config.IMG_MODEL.exists() and config.IMG_MODEL.stat().st_size >= config.IMG_TAM * 0.999
+def _m(mid: str) -> dict:
+    return config.IMG_MODELOS.get(mid) or config.IMG_MODELOS["rapido"]
 
 
-def estado() -> dict:
-    parte = config.IMG_MODEL.with_suffix(".gguf.part")
-    baixando = _download is not None and not _download.done()
-    prog = (parte.stat().st_size / config.IMG_TAM) if baixando and parte.exists() else 0.0
-    return {"presente": presente(), "baixando": baixando, "progresso": round(min(prog, 1.0), 3),
-            "tam": config.IMG_TAM, "motor": motor_instalado()}
+def presente(mid: str = "rapido") -> bool:
+    m = _m(mid)
+    return m["arquivo"].exists() and m["arquivo"].stat().st_size >= m["tam"] * 0.999
+
+
+def estado(mid: str = "rapido") -> dict:
+    m = _m(mid)
+    parte = m["arquivo"].with_suffix(".gguf.part")
+    t = _download.get(mid)
+    baixando = t is not None and not t.done()
+    prog = (parte.stat().st_size / m["tam"]) if baixando and parte.exists() else 0.0
+    return {"presente": presente(mid), "baixando": baixando, "progresso": round(min(prog, 1.0), 3),
+            "tam": m["tam"], "motor": motor_instalado(), "nome": m["nome"]}
 
 
 def motor_instalado() -> bool:
@@ -2746,33 +2765,37 @@ def motor_instalado() -> bool:
         return False
 
 
-async def _baixa() -> None:
-    config.IMG_MODEL.parent.mkdir(parents=True, exist_ok=True)
-    parte = config.IMG_MODEL.with_suffix(".gguf.part")
+async def _baixa(mid: str) -> None:
+    m = _m(mid)
+    m["arquivo"].parent.mkdir(parents=True, exist_ok=True)
+    parte = m["arquivo"].with_suffix(".gguf.part")
     proc = await asyncio.create_subprocess_exec(
-        "curl", "-L", "--fail", "-C", "-", "-o", str(parte), config.IMG_URL,
+        "curl", "-L", "--fail", "-C", "-", "-o", str(parte), m["url"],
         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL, start_new_session=True)
     rc = await proc.wait()
-    if rc == 0 and parte.exists() and parte.stat().st_size >= config.IMG_TAM * 0.999:
-        parte.rename(config.IMG_MODEL)
+    if rc == 0 and parte.exists() and parte.stat().st_size >= m["tam"] * 0.999:
+        parte.rename(m["arquivo"])
 
 
-def baixar() -> None:
-    global _download
-    if presente() or (_download is not None and not _download.done()):
+def baixar(mid: str = "rapido") -> None:
+    m = _m(mid)
+    t = _download.get(mid)
+    if presente(mid) or (t is not None and not t.done()):
         return
-    config.IMG_MODEL.parent.mkdir(parents=True, exist_ok=True)
-    if shutil.disk_usage(config.IMG_MODEL.parent).free < config.IMG_TAM * 1.1:
+    m["arquivo"].parent.mkdir(parents=True, exist_ok=True)
+    if shutil.disk_usage(m["arquivo"].parent).free < m["tam"] * 1.1:
         raise ValueError("Falta espaço no disco: preciso de uns 3 GB livres.")
-    _download = asyncio.get_running_loop().create_task(_baixa())
+    _download[mid] = asyncio.get_running_loop().create_task(_baixa(mid))
 
 
-# ------------------------------------------------------------------ prompt em inglês
-async def melhora_prompt(texto: str) -> str:
+async def melhora_prompt(texto: str, realista: bool = False) -> str:
     """Pede à IA de texto para traduzir e detalhar o pedido. Se ela não responder, usa o texto original."""
+    estilo = ("a realistic photograph: RAW photo, camera and lens (e.g. 85mm f/1.8), natural lighting, skin and "
+              "material texture, depth of field, film grain, 8k uhd" if realista else
+              "style, lighting, camera/composition, quality keywords")
     msgs = [{"role": "system", "content": (
         "You write prompts for a text-to-image model. Translate the user's request to English and make it a "
-        "single detailed line: subject, setting, style, lighting, camera/composition, quality keywords. "
+        f"single detailed line: subject, setting, {estilo}. "
         "Keep the user's intent exactly; do not add or remove subjects; do not refuse or moralize. "
         "Output ONLY the prompt, no quotes, no explanation.")}, {"role": "user", "content": texto}]
     try:
@@ -2822,11 +2845,14 @@ async def _roda_worker(cfg: dict, emit) -> tuple[bool, str]:
 
 
 async def gera_imagem(descricao: str, init_id: str | None, tamanho: str, passos: int, forca: float,
-                      melhorar: bool, emit) -> None:
+                      melhorar: bool, emit, modelo: str = "rapido") -> None:
     if not motor_instalado():
         await emit({"type": "error", "msg": "O gerador de imagens não está instalado. Rode: bash atualizar.sh"})
         return
-    if not presente():
+    if modelo not in config.IMG_MODELOS:
+        modelo = "rapido"
+    cfgm = config.IMG_MODELOS[modelo]
+    if not presente(modelo):
         await emit({"type": "error", "msg": "Falta baixar o modelo de imagens (2 GB). Use o botão de baixar abaixo.",
                     "precisa_modelo": True})
         return
@@ -2851,7 +2877,7 @@ async def gera_imagem(descricao: str, init_id: str | None, tamanho: str, passos:
         prompt = descricao
         if melhorar:
             await emit({"type": "status", "msg": "A IA está traduzindo e detalhando o seu pedido…"})
-            prompt = await melhora_prompt(descricao)
+            prompt = await melhora_prompt(descricao, modelo == "realista")
         id_ = uuid.uuid4().hex[:10]
         pasta = config.WORK_DIR / f"img-{id_}"
         pasta.mkdir(parents=True, exist_ok=True)
@@ -2859,9 +2885,9 @@ async def gera_imagem(descricao: str, init_id: str | None, tamanho: str, passos:
         seed = random.randint(1, 2**31 - 1)
         modo = recursos.modo_imagem()
         # threads = todos os núcleos/threads do processador
-        base = {"modelo": str(config.IMG_MODEL), "threads": os.cpu_count() or recursos.nucleos_fisicos(), "prompt": prompt,
+        base = {"modelo": str(cfgm["arquivo"]), "threads": os.cpu_count() or recursos.nucleos_fisicos(), "prompt": prompt,
                 "largura": largura, "altura": altura, "passos": passos, "seed": seed, "saida": str(saida),
-                "cfg": 1.0, "init": str(init) if init else None, "forca": forca}
+                "cfg": cfgm["cfg"], "negativo": cfgm["negativo"], "init": str(init) if init else None, "forca": forca}
         try:
             rotulo = {"gpu": "na placa de vídeo", "hibrido": "na placa de vídeo e na CPU", "cpu": "na CPU"}[modo]
             vram = recursos.vram_livre_mb()
@@ -3970,6 +3996,7 @@ EOF
           </select>
           <select id="placa" hidden></select>
           <div id="imgOpts" hidden>
+            <select id="imgModelo" title="Rápido: ilustrações e arte em poucos segundos. Realista: fotos de pessoas, lugares e objetos."><option value="rapido">⚡ Rápido (arte e ilustração)</option><option value="realista">📷 Realista (fotos)</option></select>
             <select id="imgTam"><option value="512x512">Quadrada 512×512</option><option value="512x768">Em pé 512×768</option><option value="768x512">Deitada 768×512</option></select>
             <div class="linha-opt">Qualidade (passos) <input type="range" id="imgPassos" min="1" max="8" value="4"> <span id="imgPassosV">4</span></div>
             <div class="linha-opt" id="imgForcaLinha" hidden>Quanto mudar <input type="range" id="imgForca" min="0.2" max="0.95" step="0.05" value="0.6"> <span id="imgForcaV">0.60</span></div>
@@ -4494,14 +4521,15 @@ $('imgForca').oninput = () => $('imgForcaV').textContent = parseFloat($('imgForc
 let imgTimer = null;
 async function checaModeloImagem() {
   try {
-    const e = await (await fetch('/imagem/modelo')).json();
+    const e = await (await fetch('/imagem/modelo?m=' + $('imgModelo').value)).json();
     $('imgModeloTxt').textContent = !e.motor ? 'Motor de imagens não instalado (rode: bash atualizar.sh)' : e.presente ? 'Modelo de imagens pronto ✓' : e.baixando ? 'Baixando o modelo… ' + Math.round(e.progresso * 100) + '%' : 'Falta o modelo de imagens (2 GB)';
     $('imgBaixar').hidden = !(e.motor && !e.presente && !e.baixando); $('imgBaixarBarra').hidden = !e.baixando;
     if (e.baixando) $('imgBaixarBarra').firstChild.style.width = Math.round(e.progresso * 100) + '%';
     if (e.baixando && !imgTimer) imgTimer = setInterval(checaModeloImagem, 2500); if (!e.baixando && imgTimer) { clearInterval(imgTimer); imgTimer = null; }
   } catch (e) {}
 }
-$('imgBaixar').onclick = async () => { await fetch('/imagem/modelo', {method: 'POST'}); checaModeloImagem(); };
+$('imgBaixar').onclick = async () => { await fetch('/imagem/modelo?m=' + $('imgModelo').value, {method: 'POST'}); checaModeloImagem(); };
+$('imgModelo').onchange = () => { const p = $('imgModelo').value === 'realista' ? 6 : 4; $('imgPassos').value = p; $('imgPassosV').textContent = p; checaModeloImagem(); };
 $('modo').onchange = async () => {
   const m = $('modo').value; $('placa').hidden = m !== 'esp32'; $('imgOpts').hidden = m !== 'img'; atualizaChips(); atualizaForca();
   if (m === 'img') checaModeloImagem();
@@ -4555,7 +4583,7 @@ async function criarArquivo(tipo, desc, c, usados, base) {
   if (tipo === 'appx') body.avancado = true;
   else if (tipo === 'esp32') rota = '/esp32/generate';
   else if (tipo === 'web' || tipo === 'python') { rota = '/codigo/generate'; body.alvo = tipo; }
-  else if (tipo === 'img') { rota = '/imagem/generate'; body.tamanho = $('imgTam').value; body.passos = parseInt($('imgPassos').value, 10); body.forca = parseFloat($('imgForca').value); body.melhorar = $('imgMelhorar').checked; }
+  else if (tipo === 'img') { rota = '/imagem/generate'; body.tamanho = $('imgTam').value; body.passos = parseInt($('imgPassos').value, 10); body.forca = parseFloat($('imgForca').value); body.melhorar = $('imgMelhorar').checked; body.modelo = $('imgModelo').value; }
   setStatus(`Criando: ${rotulo}… (■ cancela)`); let terminou = false;
   try {
     ctrl = new AbortController();
@@ -5066,13 +5094,17 @@ BIBEOF
 # ------------------------------------------------ gerador de imagens (stable-diffusion.cpp)
 # Modelo de imagens (SD-Turbo, ~2 GB): baixa sozinho em segundo plano, para você não precisar baixar pelo app.
 baixar_modelo_imagem() {
-  local d="$HOME/models/imagens" f=sd_turbo-f16-q8_0.gguf tam=2023745376 atual=0
+  local d="$HOME/models/imagens" atual par f tam url
   mkdir -p "$d"
-  [ -f "$d/$f" ] && atual=$(stat -c %s "$d/$f")
-  [ "$atual" -ge $((tam * 999 / 1000)) ] && return 0
-  pgrep -f "sd_turbo-f16-q8_0.gguf.part" >/dev/null 2>&1 && return 0   # já está baixando
-  echo "==> Modelo de imagens (~2 GB) baixando em segundo plano (continua de onde parou se interromper)."
-  nohup nice -n 10 bash -c "curl -L --fail -C - -o '$d/$f.part' 'https://huggingface.co/Green-Sky/SD-Turbo-GGUF/resolve/main/$f' && mv '$d/$f.part' '$d/$f'" >> "$BASE/imagens-modelo.log" 2>&1 &
+  for par in "sd_turbo-f16-q8_0.gguf|2023745376|https://huggingface.co/Green-Sky/SD-Turbo-GGUF/resolve/main/sd_turbo-f16-q8_0.gguf" \
+             "realisticVisionV60B1_v51HyperVAE-Q8_0.gguf|1765950304|https://huggingface.co/second-state/Realistic_Vision_V6.0_B1-GGUF/resolve/main/realisticVisionV60B1_v51HyperVAE-Q8_0.gguf"; do
+    IFS='|' read -r f tam url <<< "$par"
+    atual=0; [ -f "$d/$f" ] && atual=$(stat -c %s "$d/$f")
+    [ "$atual" -ge $((tam * 999 / 1000)) ] && continue
+    pgrep -f "$f.part" >/dev/null 2>&1 && continue   # já está baixando
+    echo "==> Modelo de imagens $f (~$((tam / 1000000)) MB) baixando em segundo plano (continua de onde parou se interromper)."
+    nohup nice -n 10 bash -c "curl -L --fail -C - -o '$d/$f.part' '$url' && mv '$d/$f.part' '$d/$f'" >> "$BASE/imagens-modelo.log" 2>&1 &
+  done
 }
 
 instalar_imagens() {

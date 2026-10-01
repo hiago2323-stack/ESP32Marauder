@@ -38,6 +38,10 @@ O instalador é gerado a partir de `server/`; mantenha os dois iguais.
 - [ ] Compilar `.bin` de ESP32 (`arduino-cli`)
 - [ ] App Android + acesso remoto (Tailscale)
 
+## Imagens
+
+Dois modelos: **Rápido** (SD-Turbo, arte/ilustração) e **Realista** (Realistic Vision V6.0, fotos de pessoas, lugares e objetos; Apache-2.0). Escolha na tela de criar imagem. O atualizador baixa os dois em segundo plano. Usa todos os núcleos da CPU e a parte da placa que a IA de texto deixa livre.
+
 ## SSD como parte rápida
 
 Se o sistema está num HD e há um SSD à parte (partição ext4/btrfs/xfs), o `atualizar.sh` move para ele os modelos de IA, Gradle, Android SDK e núcleo ESP32 (as pastas antigas viram links). `SEM_SSD=1` pula; `SSD_DESTINO=/caminho` escolhe a pasta.

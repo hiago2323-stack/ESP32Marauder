@@ -231,6 +231,7 @@
           </select>
           <select id="placa" hidden></select>
           <div id="imgOpts" hidden>
+            <select id="imgModelo" title="Rápido: ilustrações e arte em poucos segundos. Realista: fotos de pessoas, lugares e objetos."><option value="rapido">⚡ Rápido (arte e ilustração)</option><option value="realista">📷 Realista (fotos)</option></select>
             <select id="imgTam"><option value="512x512">Quadrada 512×512</option><option value="512x768">Em pé 512×768</option><option value="768x512">Deitada 768×512</option></select>
             <div class="linha-opt">Qualidade (passos) <input type="range" id="imgPassos" min="1" max="8" value="4"> <span id="imgPassosV">4</span></div>
             <div class="linha-opt" id="imgForcaLinha" hidden>Quanto mudar <input type="range" id="imgForca" min="0.2" max="0.95" step="0.05" value="0.6"> <span id="imgForcaV">0.60</span></div>
@@ -755,14 +756,15 @@ $('imgForca').oninput = () => $('imgForcaV').textContent = parseFloat($('imgForc
 let imgTimer = null;
 async function checaModeloImagem() {
   try {
-    const e = await (await fetch('/imagem/modelo')).json();
+    const e = await (await fetch('/imagem/modelo?m=' + $('imgModelo').value)).json();
     $('imgModeloTxt').textContent = !e.motor ? 'Motor de imagens não instalado (rode: bash atualizar.sh)' : e.presente ? 'Modelo de imagens pronto ✓' : e.baixando ? 'Baixando o modelo… ' + Math.round(e.progresso * 100) + '%' : 'Falta o modelo de imagens (2 GB)';
     $('imgBaixar').hidden = !(e.motor && !e.presente && !e.baixando); $('imgBaixarBarra').hidden = !e.baixando;
     if (e.baixando) $('imgBaixarBarra').firstChild.style.width = Math.round(e.progresso * 100) + '%';
     if (e.baixando && !imgTimer) imgTimer = setInterval(checaModeloImagem, 2500); if (!e.baixando && imgTimer) { clearInterval(imgTimer); imgTimer = null; }
   } catch (e) {}
 }
-$('imgBaixar').onclick = async () => { await fetch('/imagem/modelo', {method: 'POST'}); checaModeloImagem(); };
+$('imgBaixar').onclick = async () => { await fetch('/imagem/modelo?m=' + $('imgModelo').value, {method: 'POST'}); checaModeloImagem(); };
+$('imgModelo').onchange = () => { const p = $('imgModelo').value === 'realista' ? 6 : 4; $('imgPassos').value = p; $('imgPassosV').textContent = p; checaModeloImagem(); };
 $('modo').onchange = async () => {
   const m = $('modo').value; $('placa').hidden = m !== 'esp32'; $('imgOpts').hidden = m !== 'img'; atualizaChips(); atualizaForca();
   if (m === 'img') checaModeloImagem();
@@ -816,7 +818,7 @@ async function criarArquivo(tipo, desc, c, usados, base) {
   if (tipo === 'appx') body.avancado = true;
   else if (tipo === 'esp32') rota = '/esp32/generate';
   else if (tipo === 'web' || tipo === 'python') { rota = '/codigo/generate'; body.alvo = tipo; }
-  else if (tipo === 'img') { rota = '/imagem/generate'; body.tamanho = $('imgTam').value; body.passos = parseInt($('imgPassos').value, 10); body.forca = parseFloat($('imgForca').value); body.melhorar = $('imgMelhorar').checked; }
+  else if (tipo === 'img') { rota = '/imagem/generate'; body.tamanho = $('imgTam').value; body.passos = parseInt($('imgPassos').value, 10); body.forca = parseFloat($('imgForca').value); body.melhorar = $('imgMelhorar').checked; body.modelo = $('imgModelo').value; }
   setStatus(`Criando: ${rotulo}… (■ cancela)`); let terminou = false;
   try {
     ctrl = new AbortController();

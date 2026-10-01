@@ -375,6 +375,7 @@ class AppRequest(BaseModel):
     passos: int = 4
     forca: float = 0.6
     melhorar: bool = True
+    modelo: str = "rapido"            # /imagem/generate: rapido | realista
 
 
 def _base_de(req: AppRequest) -> dict:
@@ -474,18 +475,18 @@ async def imagem_generate(req: AppRequest):
         if arq is None:
             raise HTTPException(404, "Não achei a imagem que você quer modificar.")
         init = uploads.salva(arq.name, shutil.copy(arq, config.WORK_DIR / f"copia-{arq.name}"))["id"]
-    return _stream_job(lambda emit: imagens.gera_imagem(desc, init, req.tamanho, req.passos, req.forca, req.melhorar, emit))
+    return _stream_job(lambda emit: imagens.gera_imagem(desc, init, req.tamanho, req.passos, req.forca, req.melhorar, emit, req.modelo))
 
 
 @app.get("/imagem/modelo", dependencies=[Depends(require_token)])
-async def imagem_modelo():
-    return imagens.estado()
+async def imagem_modelo(m: str = "rapido"):
+    return imagens.estado(m)
 
 
 @app.post("/imagem/modelo", dependencies=[Depends(require_token)])
-async def imagem_modelo_baixar():
+async def imagem_modelo_baixar(m: str = "rapido"):
     try:
-        imagens.baixar()
+        imagens.baixar(m)
     except ValueError as e:
         raise HTTPException(400, str(e))
     return {"ok": True}

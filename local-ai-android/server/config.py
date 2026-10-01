@@ -84,6 +84,17 @@ OCIOSO_MIN = int(os.environ.get("OCIOSO_MIN", "10"))   # minutos parado até des
 IMG_MODEL = Path(os.environ.get("IMG_MODEL", str(HOME / "models" / "imagens" / "sd_turbo-f16-q8_0.gguf")))
 IMG_URL = "https://huggingface.co/Green-Sky/SD-Turbo-GGUF/resolve/main/sd_turbo-f16-q8_0.gguf"
 IMG_TAM = 2023745376
+# Modelos de imagem disponíveis (o rápido e um de fotorrealismo). Todos rodam 100% local, sem filtro extra nosso.
+_NEG_FOTO = ("(worst quality, low quality:1.4), blurry, deformed, bad anatomy, extra fingers, extra limbs, "
+             "cartoon, illustration, painting, 3d render, watermark, text, signature")
+IMG_MODELOS = {
+    "rapido": {"nome": "Rápido (SD-Turbo)", "arquivo": IMG_MODEL, "url": IMG_URL, "tam": IMG_TAM,
+               "cfg": 1.0, "passos": 4, "negativo": ""},
+    "realista": {"nome": "Realista (fotos)", "tam": 1765950304, "cfg": 2.0, "passos": 6, "negativo": _NEG_FOTO,
+                 "arquivo": IMG_MODEL.parent / "realisticVisionV60B1_v51HyperVAE-Q8_0.gguf",
+                 "url": "https://huggingface.co/second-state/Realistic_Vision_V6.0_B1-GGUF/resolve/main/"
+                        "realisticVisionV60B1_v51HyperVAE-Q8_0.gguf"},
+}
 
 # ---- Biblioteca local (documentação e código de referência; fica no disco grande via link ~/biblioteca) ----
 BIBLIOTECA_DIR = Path(os.environ.get("BIBLIOTECA_DIR", str(HOME / "biblioteca")))

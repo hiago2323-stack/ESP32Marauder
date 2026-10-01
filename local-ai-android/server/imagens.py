@@ -22,20 +22,27 @@ import recursos
 import uploads
 
 TAMANHOS = {"512x512": (512, 512), "512x768": (512, 768), "768x512": (768, 512)}
-_download: asyncio.Task | None = None
+_download: dict[str, asyncio.Task] = {}
 
 
 # ------------------------------------------------------------------ modelo de imagem (download)
-def presente() -> bool:
-    return config.IMG_MODEL.exists() and config.IMG_MODEL.stat().st_size >= config.IMG_TAM * 0.999
+def _m(mid: str) -> dict:
+    return config.IMG_MODELOS.get(mid) or config.IMG_MODELOS["rapido"]
 
 
-def estado() -> dict:
-    parte = config.IMG_MODEL.with_suffix(".gguf.part")
-    baixando = _download is not None and not _download.done()
-    prog = (parte.stat().st_size / config.IMG_TAM) if baixando and parte.exists() else 0.0
-    return {"presente": presente(), "baixando": baixando, "progresso": round(min(prog, 1.0), 3),
-            "tam": config.IMG_TAM, "motor": motor_instalado()}
+def presente(mid: str = "rapido") -> bool:
+    m = _m(mid)
+    return m["arquivo"].exists() and m["arquivo"].stat().st_size >= m["tam"] * 0.999
+
+
+def estado(mid: str = "rapido") -> dict:
+    m = _m(mid)
+    parte = m["arquivo"].with_suffix(".gguf.part")
+    t = _download.get(mid)
+    baixando = t is not None and not t.done()
+    prog = (parte.stat().st_size / m["tam"]) if baixando and parte.exists() else 0.0
+    return {"presente": presente(mid), "baixando": baixando, "progresso": round(min(prog, 1.0), 3),
+            "tam": m["tam"], "motor": motor_instalado(), "nome": m["nome"]}
 
 
 def motor_instalado() -> bool:
@@ -46,33 +53,37 @@ def motor_instalado() -> bool:
         return False
 
 
-async def _baixa() -> None:
-    config.IMG_MODEL.parent.mkdir(parents=True, exist_ok=True)
-    parte = config.IMG_MODEL.with_suffix(".gguf.part")
+async def _baixa(mid: str) -> None:
+    m = _m(mid)
+    m["arquivo"].parent.mkdir(parents=True, exist_ok=True)
+    parte = m["arquivo"].with_suffix(".gguf.part")
     proc = await asyncio.create_subprocess_exec(
-        "curl", "-L", "--fail", "-C", "-", "-o", str(parte), config.IMG_URL,
+        "curl", "-L", "--fail", "-C", "-", "-o", str(parte), m["url"],
         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL, start_new_session=True)
     rc = await proc.wait()
-    if rc == 0 and parte.exists() and parte.stat().st_size >= config.IMG_TAM * 0.999:
-        parte.rename(config.IMG_MODEL)
+    if rc == 0 and parte.exists() and parte.stat().st_size >= m["tam"] * 0.999:
+        parte.rename(m["arquivo"])
 
 
-def baixar() -> None:
-    global _download
-    if presente() or (_download is not None and not _download.done()):
+def baixar(mid: str = "rapido") -> None:
+    m = _m(mid)
+    t = _download.get(mid)
+    if presente(mid) or (t is not None and not t.done()):
         return
-    config.IMG_MODEL.parent.mkdir(parents=True, exist_ok=True)
-    if shutil.disk_usage(config.IMG_MODEL.parent).free < config.IMG_TAM * 1.1:
+    m["arquivo"].parent.mkdir(parents=True, exist_ok=True)
+    if shutil.disk_usage(m["arquivo"].parent).free < m["tam"] * 1.1:
         raise ValueError("Falta espaço no disco: preciso de uns 3 GB livres.")
-    _download = asyncio.get_running_loop().create_task(_baixa())
+    _download[mid] = asyncio.get_running_loop().create_task(_baixa(mid))
 
 
-# ------------------------------------------------------------------ prompt em inglês
-async def melhora_prompt(texto: str) -> str:
+async def melhora_prompt(texto: str, realista: bool = False) -> str:
     """Pede à IA de texto para traduzir e detalhar o pedido. Se ela não responder, usa o texto original."""
+    estilo = ("a realistic photograph: RAW photo, camera and lens (e.g. 85mm f/1.8), natural lighting, skin and "
+              "material texture, depth of field, film grain, 8k uhd" if realista else
+              "style, lighting, camera/composition, quality keywords")
     msgs = [{"role": "system", "content": (
         "You write prompts for a text-to-image model. Translate the user's request to English and make it a "
-        "single detailed line: subject, setting, style, lighting, camera/composition, quality keywords. "
+        f"single detailed line: subject, setting, {estilo}. "
         "Keep the user's intent exactly; do not add or remove subjects; do not refuse or moralize. "
         "Output ONLY the prompt, no quotes, no explanation.")}, {"role": "user", "content": texto}]
     try:
@@ -122,11 +133,14 @@ async def _roda_worker(cfg: dict, emit) -> tuple[bool, str]:
 
 
 async def gera_imagem(descricao: str, init_id: str | None, tamanho: str, passos: int, forca: float,
-                      melhorar: bool, emit) -> None:
+                      melhorar: bool, emit, modelo: str = "rapido") -> None:
     if not motor_instalado():
         await emit({"type": "error", "msg": "O gerador de imagens não está instalado. Rode: bash atualizar.sh"})
         return
-    if not presente():
+    if modelo not in config.IMG_MODELOS:
+        modelo = "rapido"
+    cfgm = config.IMG_MODELOS[modelo]
+    if not presente(modelo):
         await emit({"type": "error", "msg": "Falta baixar o modelo de imagens (2 GB). Use o botão de baixar abaixo.",
                     "precisa_modelo": True})
         return
@@ -151,7 +165,7 @@ async def gera_imagem(descricao: str, init_id: str | None, tamanho: str, passos:
         prompt = descricao
         if melhorar:
             await emit({"type": "status", "msg": "A IA está traduzindo e detalhando o seu pedido…"})
-            prompt = await melhora_prompt(descricao)
+            prompt = await melhora_prompt(descricao, modelo == "realista")
         id_ = uuid.uuid4().hex[:10]
         pasta = config.WORK_DIR / f"img-{id_}"
         pasta.mkdir(parents=True, exist_ok=True)
@@ -159,9 +173,9 @@ async def gera_imagem(descricao: str, init_id: str | None, tamanho: str, passos:
         seed = random.randint(1, 2**31 - 1)
         modo = recursos.modo_imagem()
         # threads = todos os núcleos/threads do processador
-        base = {"modelo": str(config.IMG_MODEL), "threads": os.cpu_count() or recursos.nucleos_fisicos(), "prompt": prompt,
+        base = {"modelo": str(cfgm["arquivo"]), "threads": os.cpu_count() or recursos.nucleos_fisicos(), "prompt": prompt,
                 "largura": largura, "altura": altura, "passos": passos, "seed": seed, "saida": str(saida),
-                "cfg": 1.0, "init": str(init) if init else None, "forca": forca}
+                "cfg": cfgm["cfg"], "negativo": cfgm["negativo"], "init": str(init) if init else None, "forca": forca}
         try:
             rotulo = {"gpu": "na placa de vídeo", "hibrido": "na placa de vídeo e na CPU", "cpu": "na CPU"}[modo]
             vram = recursos.vram_livre_mb()
