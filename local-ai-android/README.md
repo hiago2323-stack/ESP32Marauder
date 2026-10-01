@@ -64,6 +64,24 @@ Todos os arquivos ficam também em **📁 Arquivos**.
 O botão **⏹ Parar** (ou Esc) cancela a escrita e a compilação. A primeira compilação baixa as
 ferramentas do Android (algumas centenas de MB) e demora mais.
 
+## Anexar, modificar e criar
+
+- **📎 Anexar** (ou arrastar/colar): imagens, `.ino`, `.bin`, `.apk` e arquivos de código. Cada um é analisado:
+  APK (pacote, permissões, assinatura), `.bin` (chip ESP32, partições, endereço de gravação), `.ino` (setup/loop/bibliotecas).
+- **Modos** (botão ＋): Conversa, App Android rápido (1 arquivo), App Android avançado (vários arquivos, layouts XML e AndroidX),
+  Firmware ESP32, Página web, Programa Python e Imagem.
+- **✏ Modificar**: em qualquer item criado (ou em **📁 Arquivos**) a IA recebe o código atual e devolve a versão nova.
+  Um `.ino` anexado também pode ser **só compilado**. APK enviado de volta é reconhecido se foi criado aqui.
+- **Imagens**: Stable Diffusion Turbo local (`stable-diffusion.cpp`), texto→imagem e imagem→imagem, sem filtro de conteúdo
+  acrescentado por este projeto. O pedido é traduzido para inglês pela IA de texto (opcional).
+- **Limite**: `.apk` de terceiros só são analisados (não reempacotados). `.bin` é analisado, não editado.
+
+## Recursos (RAM, VRAM, CPU)
+
+`recursos.py`: uma tarefa pesada por vez, modelos de voz descarregados da RAM após 10 min parados, programas pesados com
+prioridade baixa (`nice`), geração de imagem em GPU/híbrido/CPU conforme a VRAM livre (e repete na CPU se a placa falhar),
+e `NGL=auto` no `start_llm.sh` (camadas do modelo na placa calculadas pela VRAM livre).
+
 ## Desempenho e precisão
 
 - **Perfis de modelo** (⚙ Configurações › Modelo de IA): *Rápido* (3B), *Preciso* (7B) e *Código* (Coder 7B).

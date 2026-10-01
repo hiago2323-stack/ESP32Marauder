@@ -15,6 +15,7 @@ from pathlib import Path
 import androidgen
 import config
 import entregas
+import recursos
 
 # id da tela -> (nome para o usuário, FQBN do arduino-cli)
 PLACAS = {
@@ -80,7 +81,7 @@ async def compila(pasta: Path, fqbn: str) -> tuple[bool, str, Path]:
     cli = config.ARDUINO_CLI
     env = dict(os.environ)
     proc = await asyncio.create_subprocess_exec(
-        cli, "compile", "--fqbn", fqbn, "--output-dir", str(saida_dir), str(pasta / "sketch"),
+        *recursos.baixa_prioridade([cli, "compile", "--fqbn", fqbn, "--output-dir", str(saida_dir), str(pasta / "sketch")]),
         cwd=pasta, env=env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
         start_new_session=True,
     )
@@ -102,7 +103,8 @@ async def compila(pasta: Path, fqbn: str) -> tuple[bool, str, Path]:
     return proc.returncode == 0, saida.decode(errors="replace"), saida_dir
 
 
-async def gera_firmware(descricao: str, placa: str, emit) -> None:
+async def gera_firmware(descricao: str, placa: str, emit, base_codigo: str | None = None,
+                        base_nome: str | None = None) -> None:
     if placa not in PLACAS:
         await emit({"type": "error", "msg": "Placa desconhecida."})
         return
@@ -114,11 +116,20 @@ async def gera_firmware(descricao: str, placa: str, emit) -> None:
         await emit({"type": "error", "msg": "Ainda estou criando outra coisa. Espere terminar ou clique em Parar."})
         return
     async with androidgen._trava:
+        try:
+            recursos.garante_ram(1500, "compilar o firmware")
+        except RuntimeError as e:
+            await emit({"type": "error", "msg": str(e)})
+            return
+        so_compilar = bool(base_codigo) and not descricao.strip()
         mensagens = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": f"Crie: {EXEMPLO_PEDIDO}"},
             {"role": "assistant", "content": EXEMPLO_RESPOSTA},
-            {"role": "user", "content": f"Placa: {nome_placa}. Crie: {descricao}"},
+            {"role": "user", "content": (
+                f"Placa: {nome_placa}. Código ATUAL do sketch:\n```cpp\n{base_codigo[:14000]}\n```\n\n"
+                f"Modifique conforme o pedido e devolva o sketch COMPLETO no mesmo formato. Pedido: {descricao or 'corrigir os erros'}")
+             if base_codigo else f"Placa: {nome_placa}. Crie: {descricao}"},
         ]
         id_ = uuid.uuid4().hex[:10]
         pasta = config.WORK_DIR / f"esp-{id_}"
@@ -129,12 +140,17 @@ async def gera_firmware(descricao: str, placa: str, emit) -> None:
                 else:
                     await emit({"type": "status",
                                 "msg": f"Deu erro ao compilar. A IA está corrigindo (tentativa {tentativa} de {config.MAX_FIX_ATTEMPTS})…"})
-                texto = await androidgen.pede_codigo(mensagens, emit)
-                try:
-                    nome, codigo = extrai_resposta(texto)
-                except ValueError as e:
-                    await emit({"type": "error", "msg": str(e), "log": texto[-1500:]})
-                    return
+                if tentativa == 0 and so_compilar:   # sem pedido de mudança: compila o sketch como está
+                    nome, codigo = base_nome or "Firmware", base_codigo
+                    texto = f"NOME: {nome}\n```cpp\n{codigo}\n```"
+                    await emit({"type": "status", "msg": "Compilando o seu sketch como ele está…"})
+                else:
+                    texto = await androidgen.pede_codigo(mensagens, emit)
+                    try:
+                        nome, codigo = extrai_resposta(texto)
+                    except ValueError as e:
+                        await emit({"type": "error", "msg": str(e), "log": texto[-1500:]})
+                        return
                 await emit({"type": "code", "text": codigo})
 
                 if pasta.exists():

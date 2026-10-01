@@ -11,7 +11,8 @@ from pathlib import Path
 import config
 
 ID_RE = re.compile(r"[0-9a-f]{10}")
-TIPOS = {".apk": "application/vnd.android.package-archive", ".bin": "application/octet-stream"}
+TIPOS = {".apk": "application/vnd.android.package-archive", ".bin": "application/octet-stream",
+         ".png": "image/png", ".html": "text/html", ".py": "text/x-python", ".zip": "application/zip"}
 
 
 def salva(id_: str, nome: str, descricao: str, tipo: str, arquivos: list, extra: dict | None = None) -> dict:
@@ -39,8 +40,20 @@ def lista() -> list[dict]:
             m = json.loads(f.read_text())
         except Exception:
             continue
-        out.append({k: m.get(k) for k in ("id", "name", "description", "kind", "created", "files")})
+        item = {k: m.get(k) for k in ("id", "name", "description", "kind", "created", "files")}
+        item["editavel"] = bool(m.get("code") or m.get("arquivos_fonte") or m.get("kind") == "img")
+        out.append(item)
     return sorted(out, key=lambda m: m["created"] or 0, reverse=True)
+
+
+def meta(id_: str) -> dict | None:
+    """meta.json completo de uma entrega (inclui o código-fonte guardado), ou None."""
+    if not ID_RE.fullmatch(id_):
+        return None
+    try:
+        return json.loads((config.APPS_DIR / id_ / "meta.json").read_text())
+    except (OSError, ValueError):
+        return None
 
 
 def caminho(id_: str, nome: str) -> Path | None:

@@ -21,6 +21,8 @@ import android.text.InputType;
 import android.webkit.CookieManager;
 import android.webkit.JavascriptInterface;
 import android.webkit.URLUtil;
+import android.webkit.ValueCallback;
+import android.webkit.WebChromeClient;
 import android.webkit.WebResourceError;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebSettings;
@@ -48,11 +50,13 @@ import java.net.URL;
  */
 public class MainActivity extends Activity {
     private static final int PEDIDO_MICROFONE = 10;
+    private static final int PEDIDO_ARQUIVO = 11;
 
     private WebView web;
     private SharedPreferences prefs;
     private MediaRecorder gravador;
     private File arquivoVoz;
+    private ValueCallback<Uri[]> seletorArquivos;   // resposta pendente do botão 📎 da página
 
     // ------------------------------------------------------------------ ciclo de vida
     @Override
@@ -218,6 +222,25 @@ public class MainActivity extends Activity {
             }
         });
 
+        // Botão 📎 da página (anexar imagens, .ino, .bin, .apk, código): abre o seletor de arquivos do Android
+        web.setWebChromeClient(new WebChromeClient() {
+            @Override
+            public boolean onShowFileChooser(WebView v, ValueCallback<Uri[]> retorno, FileChooserParams params) {
+                if (seletorArquivos != null) {
+                    seletorArquivos.onReceiveValue(null);
+                }
+                seletorArquivos = retorno;
+                try {
+                    startActivityForResult(params.createIntent(), PEDIDO_ARQUIVO);
+                } catch (ActivityNotFoundException e) {
+                    seletorArquivos = null;
+                    Toast.makeText(MainActivity.this, "Não achei um app para escolher arquivos.", Toast.LENGTH_LONG).show();
+                    return false;
+                }
+                return true;
+            }
+        });
+
         // Downloads (.apk, .bin...) vão para a pasta Downloads, com notificação
         web.setDownloadListener((url, userAgent, contentDisposition, mimetype, tamanho) -> {
             String nome = URLUtil.guessFileName(url, contentDisposition, mimetype);
@@ -234,6 +257,15 @@ public class MainActivity extends Activity {
             ((DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE)).enqueue(rq);
             Toast.makeText(this, "Baixando " + nome + "…", Toast.LENGTH_SHORT).show();
         });
+    }
+
+    @Override
+    protected void onActivityResult(int codigo, int resultado, Intent dados) {
+        super.onActivityResult(codigo, resultado, dados);
+        if (codigo == PEDIDO_ARQUIVO && seletorArquivos != null) {
+            seletorArquivos.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(resultado, dados));
+            seletorArquivos = null;
+        }
     }
 
     // ------------------------------------------------------------------ instalar APK baixado

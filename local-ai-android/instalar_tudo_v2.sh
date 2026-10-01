@@ -23,10 +23,10 @@ MODELO="${MODELO:-7b}"
 case "$MODELO" in
   3b) MODEL_FILE=Qwen2.5-3B-Instruct-Q4_K_M.gguf
       MODEL_URL=https://huggingface.co/bartowski/Qwen2.5-3B-Instruct-GGUF/resolve/main/$MODEL_FILE
-      NGL_PADRAO=16; MODEL_TAM="~1,9 GB" ;;
+      NGL_PADRAO=auto; MODEL_TAM="~1,9 GB" ;;
   *)  MODEL_FILE=Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf
       MODEL_URL=https://huggingface.co/bartowski/Qwen2.5-Coder-7B-Instruct-GGUF/resolve/main/$MODEL_FILE
-      NGL_PADRAO=4; MODEL_TAM="~4,7 GB" ;;
+      NGL_PADRAO=auto; MODEL_TAM="~4,7 GB" ;;
 esac
 MODEL="$HOME/models/$MODEL_FILE"
 FAILED=()
@@ -127,6 +127,7 @@ piper-tts==1.8.*
 kokoro-onnx==0.6.*
 ddgs==9.*
 nvidia-ml-py==13.*
+pillow>=10
 EOF
   cat > config.py <<'EOF'
 """Configuração do servidor, lida de variáveis de ambiente (arquivo .env via instalador)."""
@@ -178,7 +179,8 @@ SYSTEM_PROMPT = os.environ.get(
     "Você é uma IA local que roda no computador do usuário. Responda sempre em português do Brasil, "
     "de forma clara, direta e correta. Quando a mensagem trouxer um bloco [CONTEXTO], use-o: ele tem "
     "memórias do usuário e resultados de pesquisa na web; cite os endereços das fontes usadas. "
-    "Se não tiver certeza ou não souber, diga isso em vez de inventar.",
+    "Se não tiver certeza ou não souber, diga isso em vez de inventar. Responda direto ao ponto, sem sermões, "
+    "sem avisos desnecessários e sem rodeios: trate o usuário como um adulto capaz.",
 )
 
 # Banco da memória de longo prazo (o que o usuário ensina e o que a IA aprende)
@@ -199,6 +201,15 @@ ARDUINO_CLI = os.environ.get("ARDUINO_CLI", str(HOME / "bin" / "arduino-cli"))
 # ---- Desempenho e precisão ----
 MODELS_DIR = Path(os.environ.get("MODELS_DIR", str(HOME / "models")))
 MODELO_ENV = Path(os.environ.get("MODELO_ENV", str(HOME / "localai" / "modelo.env")))   # perfil escolhido na tela (o start_llm.sh lê este arquivo)
+
+# ---- Anexos, imagens e recursos ----
+UPLOADS_DIR = Path(os.environ.get("UPLOADS_DIR", str(HOME / "localai" / "uploads")))
+OCIOSO_MIN = int(os.environ.get("OCIOSO_MIN", "10"))   # minutos parado até descarregar um modelo de voz da RAM
+
+# Gerador de imagens (stable-diffusion.cpp): SD-Turbo quantizado (~2 GB), 1 a 4 passos
+IMG_MODEL = Path(os.environ.get("IMG_MODEL", str(HOME / "models" / "imagens" / "sd_turbo-f16-q8_0.gguf")))
+IMG_URL = "https://huggingface.co/Green-Sky/SD-Turbo-GGUF/resolve/main/sd_turbo-f16-q8_0.gguf"
+IMG_TAM = 2023745376
 EOF
   cat > main.py <<'EOF'
 """Servidor do PC: conversa com o modelo, pesquisa na web e compila projetos Android.
@@ -219,6 +230,7 @@ Rotas:
 Conexões vindas do próprio PC (127.0.0.1) não precisam de token; as de fora precisam.
 """
 import asyncio
+from contextlib import asynccontextmanager
 import hmac
 import io
 import json
@@ -242,16 +254,30 @@ from fastapi.responses import FileResponse, RedirectResponse, Response, Streamin
 from pydantic import BaseModel
 
 import androidgen
+import codegen
 import config
 import entregas
 import esp32gen
+import imagens
 import memory
 import perfis
+import recursos
 import telemetria
+import uploads
 
-app = FastAPI(title="Local AI Server")
+@asynccontextmanager
+async def ciclo_de_vida(_app):
+    config.UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+    await asyncio.to_thread(uploads.limpa_antigos)
+    vigia = asyncio.create_task(recursos.vigia())   # descarrega da RAM os modelos de voz parados
+    yield
+    vigia.cancel()
+
+
+app = FastAPI(title="Local AI Server", lifespan=ciclo_de_vida)
 config.WORK_DIR.mkdir(parents=True, exist_ok=True)
 config.APPS_DIR.mkdir(parents=True, exist_ok=True)
+config.UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 STATIC = Path(__file__).parent / "static"
@@ -357,6 +383,7 @@ class ChatRequest(BaseModel):
     max_tokens: int = 700
     temperature: float = 0.4   # mais baixo = respostas mais consistentes e precisas
     web: bool = False
+    anexos: list[str] = []     # ids de arquivos enviados (código, .ino, análise de .apk/.bin...)
 
 
 def _sse_error(msg: str) -> bytes:
@@ -382,6 +409,11 @@ async def _build_messages(req: ChatRequest) -> tuple[list[dict], int]:
     mems = await asyncio.to_thread(memory.search, pergunta, 4)
     if mems:
         partes.append("Memórias (podem estar desatualizadas):\n" + "\n".join(f"- {m['text'][:500]}" for m in mems))
+
+    for aid in req.anexos[:4]:
+        ctx = uploads.contexto_do_anexo(aid)
+        if ctx:
+            partes.append(ctx[:9000])
 
     n_web = 0
     if req.web:
@@ -497,24 +529,134 @@ def _stream_job(rodar):
 
 
 class AppRequest(BaseModel):
-    description: str
+    description: str = ""
     board: str = "esp32"
+    base_entrega: str | None = None   # modificar algo que a IA já criou
+    base_upload: str | None = None    # modificar/compilar um arquivo anexado
+    avancado: bool = False            # app Android com vários arquivos (layouts XML, AndroidX)
+    alvo: str = "web"                 # /codigo/generate: web | python
+    tamanho: str = "512x512"          # /imagem/generate
+    passos: int = 4
+    forca: float = 0.6
+    melhorar: bool = True
+
+
+def _base_de(req: AppRequest) -> dict:
+    """Resolve o 'código base' de um pedido de modificação: {'codigo','arquivos','nome','modo'}."""
+    base = {"codigo": None, "arquivos": None, "nome": None, "modo": None}
+    if req.base_entrega:
+        m = entregas.meta(req.base_entrega)
+        if not m:
+            raise HTTPException(404, "Não achei o item que você quer modificar.")
+        base.update(codigo=m.get("code"), arquivos=m.get("arquivos_fonte"), nome=m.get("name"), modo=m.get("modo"))
+    elif req.base_upload:
+        m = uploads.meta(req.base_upload)
+        if not m:
+            raise HTTPException(404, "Não achei o arquivo anexado. Anexe de novo.")
+        t = uploads.texto(req.base_upload, 60000)
+        if t and m["tipo"] in ("ino", "texto"):
+            base.update(codigo=t, arquivos={m["name"]: t}, nome=Path(m["name"]).stem)
+    return base
 
 
 @app.post("/app/generate", dependencies=[Depends(require_token)])
 async def app_generate(req: AppRequest):
     desc = req.description.strip()[:1500]
+    base = _base_de(req)
     if not desc:
         raise HTTPException(400, "Descreva o app que você quer.")
-    return _stream_job(lambda emit: androidgen.gera_app(desc, emit))
+    if req.avancado or base["modo"] == "avancado":
+        return _stream_job(lambda emit: codegen.gera_app_avancado(desc, base["arquivos"], base["nome"], emit))
+    return _stream_job(lambda emit: androidgen.gera_app(desc, emit, base["codigo"], base["nome"]))
 
 
 @app.post("/esp32/generate", dependencies=[Depends(require_token)])
 async def esp32_generate(req: AppRequest):
     desc = req.description.strip()[:1500]
+    base = _base_de(req)
+    if not desc and not base["codigo"]:
+        raise HTTPException(400, "Descreva o firmware que você quer, ou anexe um .ino para compilar.")
+    return _stream_job(lambda emit: esp32gen.gera_firmware(desc, req.board, emit, base["codigo"], base["nome"]))
+
+
+@app.post("/codigo/generate", dependencies=[Depends(require_token)])
+async def codigo_generate(req: AppRequest):
+    desc = req.description.strip()[:1500]
     if not desc:
-        raise HTTPException(400, "Descreva o firmware que você quer.")
-    return _stream_job(lambda emit: esp32gen.gera_firmware(desc, req.board, emit))
+        raise HTTPException(400, "Descreva o que você quer criar.")
+    base = _base_de(req)
+    return _stream_job(lambda emit: codegen.gera_codigo(req.alvo, desc, base["arquivos"], base["nome"], emit))
+
+
+@app.post("/imagem/generate", dependencies=[Depends(require_token)])
+async def imagem_generate(req: AppRequest):
+    desc = req.description.strip()[:1200]
+    if not desc:
+        raise HTTPException(400, "Descreva a imagem que você quer.")
+    init = req.base_upload
+    if req.base_entrega:  # modificar uma imagem que a IA criou: copia para a pasta de anexos
+        m = entregas.meta(req.base_entrega)
+        arq = entregas.caminho(req.base_entrega, m["files"][0]["name"]) if m and m.get("files") else None
+        if arq is None:
+            raise HTTPException(404, "Não achei a imagem que você quer modificar.")
+        init = uploads.salva(arq.name, shutil.copy(arq, config.WORK_DIR / f"copia-{arq.name}"))["id"]
+    return _stream_job(lambda emit: imagens.gera_imagem(desc, init, req.tamanho, req.passos, req.forca, req.melhorar, emit))
+
+
+@app.get("/imagem/modelo", dependencies=[Depends(require_token)])
+async def imagem_modelo():
+    return imagens.estado()
+
+
+@app.post("/imagem/modelo", dependencies=[Depends(require_token)])
+async def imagem_modelo_baixar():
+    try:
+        imagens.baixar()
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True}
+
+
+# ----------------------------------------------------------------------------- anexos
+@app.post("/upload", dependencies=[Depends(require_token)])
+async def upload(arquivo: UploadFile = File(...)):
+    nome = arquivo.filename or "arquivo"
+    if uploads.tipo_de(nome) is None:
+        raise HTTPException(400, "Tipo de arquivo não aceito. Aceito: imagens, .ino, .bin, .apk e arquivos de código/texto.")
+    tmp = config.WORK_DIR / f"up-{uuid.uuid4().hex[:8]}"
+    tam = 0
+    with tmp.open("wb") as f:
+        while pedaco := await arquivo.read(1024 * 1024):
+            tam += len(pedaco)
+            if tam > config.MAX_UPLOAD_MB * 1024 * 1024:
+                f.close()
+                tmp.unlink(missing_ok=True)
+                raise HTTPException(413, f"Arquivo grande demais (máximo {config.MAX_UPLOAD_MB} MB).")
+            f.write(pedaco)
+    try:
+        meta = await asyncio.to_thread(uploads.salva, nome, tmp)
+    except ValueError as e:
+        tmp.unlink(missing_ok=True)
+        raise HTTPException(400, str(e))
+    # APK criado por esta IA? então dá para modificar pelo código-fonte
+    pacote = (meta["analise"] or {}).get("pacote")
+    entrega = uploads.encontra_app_por_pacote(pacote) if pacote else None
+    return {**meta, "entrega": entrega}
+
+
+@app.get("/uploads/{up_id}/{nome}", dependencies=[Depends(require_token)])
+async def upload_baixa(up_id: str, nome: str):
+    m = uploads.meta(up_id)
+    p = uploads.caminho(up_id)
+    if not m or p is None or nome != m["name"]:
+        raise HTTPException(404, "Arquivo não encontrado")
+    return FileResponse(p, filename=nome)
+
+
+@app.delete("/upload/{up_id}", dependencies=[Depends(require_token)])
+async def upload_apaga(up_id: str):
+    await asyncio.to_thread(uploads.apaga, up_id)
+    return {"ok": True}
 
 
 @app.get("/boards", dependencies=[Depends(require_token)])
@@ -567,6 +709,24 @@ _kokoro = None
 _voice_lock = threading.Lock()
 
 
+def _descarrega_whisper():
+    global _whisper
+    if _voice_lock.acquire(blocking=False):   # se está em uso agora, deixa para depois
+        try:
+            _whisper = None
+        finally:
+            _voice_lock.release()
+
+
+def _descarrega_kokoro():
+    global _kokoro
+    if _voice_lock.acquire(blocking=False):
+        try:
+            _kokoro = None
+        finally:
+            _voice_lock.release()
+
+
 def _carrega_whisper():
     from faster_whisper import WhisperModel
     nucleos = max(2, (os.cpu_count() or 4) // 2)  # núcleos físicos: rende mais que usar todos os threads
@@ -581,6 +741,8 @@ def _stt_sync(path: str) -> str:
     with _voice_lock:
         if _whisper is None:
             _whisper = _carrega_whisper()
+            recursos.registra("whisper", _descarrega_whisper)
+        recursos.usou("whisper")
         segments, _ = _whisper.transcribe(
             path, language="pt", beam_size=5, vad_filter=True,
             vad_parameters={"min_silence_duration_ms": 500},
@@ -593,6 +755,8 @@ def _get_kokoro():
     if _kokoro is None:
         from kokoro_onnx import Kokoro
         _kokoro = Kokoro(str(config.KOKORO_MODEL), str(config.KOKORO_VOICES))
+        recursos.registra("kokoro", _descarrega_kokoro)
+    recursos.usou("kokoro")
     return _kokoro
 
 
@@ -907,6 +1071,7 @@ import httpx
 
 import config
 import entregas
+import recursos
 
 PACKAGE = "com.localai.app"
 
@@ -1167,7 +1332,8 @@ async def compila(pasta: Path) -> tuple[bool, str, Path | None]:
     # start_new_session: o Gradle e os processos que ele cria ficam num grupo próprio,
     # para podermos matar tudo de uma vez ao cancelar (senão sobra Java rodando escondido)
     proc = await asyncio.create_subprocess_exec(
-        gradle, "assembleDebug", "--no-daemon", "--console=plain", "-q",
+        *recursos.baixa_prioridade([gradle, "assembleDebug", "--no-daemon", "--console=plain", "-q",
+                                    "-Dorg.gradle.workers.max=2"]),
         cwd=pasta, env=env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
         start_new_session=True,
     )
@@ -1196,10 +1362,10 @@ async def compila(pasta: Path) -> tuple[bool, str, Path | None]:
 
 
 # ------------------------------------------------------------------ fluxo principal
-_trava = asyncio.Lock()
+_trava = recursos.pesado   # uma tarefa pesada por vez (RAM/CPU compartilhadas)
 
 
-async def gera_app(descricao: str, emit) -> None:
+async def gera_app(descricao: str, emit, base_codigo: str | None = None, base_nome: str | None = None) -> None:
     """Executa o fluxo completo, mandando eventos por emit(dict)."""
     if _trava.locked():
         await emit({"type": "error", "msg": "Ainda estou criando outro app. Espere ele terminar ou clique em Parar."})
@@ -1209,7 +1375,10 @@ async def gera_app(descricao: str, emit) -> None:
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": f"Crie: {EXEMPLO_PEDIDO}"},
             {"role": "assistant", "content": EXEMPLO_RESPOSTA},
-            {"role": "user", "content": f"Crie: {descricao}"},
+            {"role": "user", "content": (
+                f"Código ATUAL do app:\n```java\n{base_codigo[:14000]}\n```\n\nModifique o app conforme o pedido e "
+                f"devolva o arquivo COMPLETO no mesmo formato. Pedido: {descricao}") if base_codigo
+             else f"Crie: {descricao}"},
         ]
         id_ = uuid.uuid4().hex[:10]
         pasta = config.WORK_DIR / f"app-{id_}"
@@ -1223,6 +1392,8 @@ async def gera_app(descricao: str, emit) -> None:
                 texto = await pede_codigo(mensagens, emit)
                 try:
                     nome, codigo = extrai_resposta(texto)
+                    if base_nome and nome == "App IA":
+                        nome = base_nome
                 except ValueError as e:
                     await emit({"type": "error", "msg": str(e), "log": texto[-1500:]})
                     return
@@ -1272,7 +1443,8 @@ from pathlib import Path
 import config
 
 ID_RE = re.compile(r"[0-9a-f]{10}")
-TIPOS = {".apk": "application/vnd.android.package-archive", ".bin": "application/octet-stream"}
+TIPOS = {".apk": "application/vnd.android.package-archive", ".bin": "application/octet-stream",
+         ".png": "image/png", ".html": "text/html", ".py": "text/x-python", ".zip": "application/zip"}
 
 
 def salva(id_: str, nome: str, descricao: str, tipo: str, arquivos: list, extra: dict | None = None) -> dict:
@@ -1300,8 +1472,20 @@ def lista() -> list[dict]:
             m = json.loads(f.read_text())
         except Exception:
             continue
-        out.append({k: m.get(k) for k in ("id", "name", "description", "kind", "created", "files")})
+        item = {k: m.get(k) for k in ("id", "name", "description", "kind", "created", "files")}
+        item["editavel"] = bool(m.get("code") or m.get("arquivos_fonte") or m.get("kind") == "img")
+        out.append(item)
     return sorted(out, key=lambda m: m["created"] or 0, reverse=True)
+
+
+def meta(id_: str) -> dict | None:
+    """meta.json completo de uma entrega (inclui o código-fonte guardado), ou None."""
+    if not ID_RE.fullmatch(id_):
+        return None
+    try:
+        return json.loads((config.APPS_DIR / id_ / "meta.json").read_text())
+    except (OSError, ValueError):
+        return None
 
 
 def caminho(id_: str, nome: str) -> Path | None:
@@ -1342,6 +1526,7 @@ from pathlib import Path
 import androidgen
 import config
 import entregas
+import recursos
 
 # id da tela -> (nome para o usuário, FQBN do arduino-cli)
 PLACAS = {
@@ -1407,7 +1592,7 @@ async def compila(pasta: Path, fqbn: str) -> tuple[bool, str, Path]:
     cli = config.ARDUINO_CLI
     env = dict(os.environ)
     proc = await asyncio.create_subprocess_exec(
-        cli, "compile", "--fqbn", fqbn, "--output-dir", str(saida_dir), str(pasta / "sketch"),
+        *recursos.baixa_prioridade([cli, "compile", "--fqbn", fqbn, "--output-dir", str(saida_dir), str(pasta / "sketch")]),
         cwd=pasta, env=env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
         start_new_session=True,
     )
@@ -1429,7 +1614,8 @@ async def compila(pasta: Path, fqbn: str) -> tuple[bool, str, Path]:
     return proc.returncode == 0, saida.decode(errors="replace"), saida_dir
 
 
-async def gera_firmware(descricao: str, placa: str, emit) -> None:
+async def gera_firmware(descricao: str, placa: str, emit, base_codigo: str | None = None,
+                        base_nome: str | None = None) -> None:
     if placa not in PLACAS:
         await emit({"type": "error", "msg": "Placa desconhecida."})
         return
@@ -1441,11 +1627,20 @@ async def gera_firmware(descricao: str, placa: str, emit) -> None:
         await emit({"type": "error", "msg": "Ainda estou criando outra coisa. Espere terminar ou clique em Parar."})
         return
     async with androidgen._trava:
+        try:
+            recursos.garante_ram(1500, "compilar o firmware")
+        except RuntimeError as e:
+            await emit({"type": "error", "msg": str(e)})
+            return
+        so_compilar = bool(base_codigo) and not descricao.strip()
         mensagens = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": f"Crie: {EXEMPLO_PEDIDO}"},
             {"role": "assistant", "content": EXEMPLO_RESPOSTA},
-            {"role": "user", "content": f"Placa: {nome_placa}. Crie: {descricao}"},
+            {"role": "user", "content": (
+                f"Placa: {nome_placa}. Código ATUAL do sketch:\n```cpp\n{base_codigo[:14000]}\n```\n\n"
+                f"Modifique conforme o pedido e devolva o sketch COMPLETO no mesmo formato. Pedido: {descricao or 'corrigir os erros'}")
+             if base_codigo else f"Placa: {nome_placa}. Crie: {descricao}"},
         ]
         id_ = uuid.uuid4().hex[:10]
         pasta = config.WORK_DIR / f"esp-{id_}"
@@ -1456,12 +1651,17 @@ async def gera_firmware(descricao: str, placa: str, emit) -> None:
                 else:
                     await emit({"type": "status",
                                 "msg": f"Deu erro ao compilar. A IA está corrigindo (tentativa {tentativa} de {config.MAX_FIX_ATTEMPTS})…"})
-                texto = await androidgen.pede_codigo(mensagens, emit)
-                try:
-                    nome, codigo = extrai_resposta(texto)
-                except ValueError as e:
-                    await emit({"type": "error", "msg": str(e), "log": texto[-1500:]})
-                    return
+                if tentativa == 0 and so_compilar:   # sem pedido de mudança: compila o sketch como está
+                    nome, codigo = base_nome or "Firmware", base_codigo
+                    texto = f"NOME: {nome}\n```cpp\n{codigo}\n```"
+                    await emit({"type": "status", "msg": "Compilando o seu sketch como ele está…"})
+                else:
+                    texto = await androidgen.pede_codigo(mensagens, emit)
+                    try:
+                        nome, codigo = extrai_resposta(texto)
+                    except ValueError as e:
+                        await emit({"type": "error", "msg": str(e), "log": texto[-1500:]})
+                        return
                 await emit({"type": "code", "text": codigo})
 
                 if pasta.exists():
@@ -1588,7 +1788,7 @@ def seleciona(id_: str) -> None:
     if not presente(p):
         raise ValueError("Esse modelo ainda não foi baixado.")
     config.MODELO_ENV.parent.mkdir(parents=True, exist_ok=True)
-    config.MODELO_ENV.write_text(f"MODEL={caminho(p)}\nNGL={p['ngl']}\n")
+    config.MODELO_ENV.write_text(f"MODEL={caminho(p)}\nNGL=auto\n")
     try:
         r = subprocess.run(["sudo", "-n", "systemctl", "restart", "localai-llm.service"],
                            capture_output=True, text=True, timeout=30)
@@ -1642,6 +1842,8 @@ EOF
 """Leituras do PC para a tela: temperaturas, ventoinhas, uso da GPU e da memória."""
 import os
 import subprocess
+
+import recursos
 import time
 from pathlib import Path
 
@@ -1724,7 +1926,8 @@ def ler() -> dict:
         return _cache[1]
     temp, fans = _hwmon()
     dado = {"gpu": _gpu(), "cpu": {"temp": temp, "carga": round(os.getloadavg()[0], 2), "nucleos": os.cpu_count()},
-            "ventoinhas": fans, "ram": _ram(), "controle_ventoinha": _controle_ventoinha()}
+            "ventoinhas": fans, "ram": _ram(), "controle_ventoinha": _controle_ventoinha(),
+            "modelos_na_ram": sorted(recursos._modelos)}
     _cache = (agora, dado)
     return dado
 EOF
@@ -1976,6 +2179,1103 @@ def main():
 if __name__ == "__main__":
     main()
 EOF
+  cat > recursos.py <<'EOF'
+"""Gerenciador de recursos: RAM, VRAM e CPU divididos entre as tarefas do servidor.
+
+Ideias (o PC tem 16 GB de RAM, 2 GB de VRAM e 4 núcleos):
+  * Só UMA tarefa pesada por vez (compilar, gerar imagem, escrever um app): elas competem
+    pela mesma memória e pelos mesmos núcleos. As demais esperam na fila.
+  * Modelos de voz grandes ficam na RAM só enquanto são usados: depois de alguns minutos sem
+    uso eles são descarregados, e a RAM volta para o resto.
+  * Programas pesados (Gradle, arduino-cli, gerador de imagens) rodam com prioridade baixa
+    ("nice"), para a conversa continuar respondendo enquanto eles trabalham.
+  * A escolha entre GPU, CPU ou os dois juntos depende da VRAM que está livre naquela hora.
+"""
+import asyncio
+import gc
+import os
+import shutil
+import subprocess
+import time
+
+import config
+
+# Trabalhos pesados (compilar, gerar imagem, criar app/firmware): um de cada vez.
+pesado = asyncio.Lock()
+
+_cache_nucleos: int | None = None
+
+
+def nucleos_fisicos() -> int:
+    """Núcleos físicos (os threads extras do SMT quase não ajudam em IA, que depende da memória)."""
+    global _cache_nucleos
+    if _cache_nucleos is None:
+        n = 0
+        try:
+            r = subprocess.run(["lscpu", "-p=CORE,SOCKET"], capture_output=True, text=True, timeout=3)
+            n = len({ln for ln in r.stdout.splitlines() if ln and not ln.startswith("#")})
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        _cache_nucleos = n if n >= 1 else max(1, (os.cpu_count() or 2) // 2)
+    return _cache_nucleos
+
+
+def ram_livre_mb() -> int:
+    """RAM que dá para usar agora (inclui o cache de arquivos, que o sistema devolve quando precisa)."""
+    try:
+        for ln in open("/proc/meminfo"):
+            if ln.startswith("MemAvailable:"):
+                return int(ln.split()[1]) // 1024
+    except OSError:
+        pass
+    return 0
+
+
+def vram_livre_mb() -> int | None:
+    """VRAM livre da GPU NVIDIA em MiB, ou None se não houver GPU/nvidia-smi."""
+    try:
+        r = subprocess.run(["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+                           capture_output=True, text=True, timeout=3)
+        if r.returncode == 0 and r.stdout.strip():
+            return int(float(r.stdout.strip().splitlines()[0]))
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        pass
+    return None
+
+
+def baixa_prioridade(cmd: list[str]) -> list[str]:
+    """Roda o comando com prioridade baixa, se o 'nice' existir."""
+    return (["nice", "-n", "10"] + cmd) if shutil.which("nice") else cmd
+
+
+# ------------------------------------------------------------ modelos ociosos
+_modelos: dict[str, dict] = {}
+
+
+def registra(nome: str, descarrega) -> None:
+    """Registra um modelo carregado e a função que o descarrega da memória."""
+    _modelos[nome] = {"descarrega": descarrega, "uso": time.time()}
+
+
+def usou(nome: str) -> None:
+    if nome in _modelos:
+        _modelos[nome]["uso"] = time.time()
+
+
+def libera_ociosos(forcar: bool = False) -> list[str]:
+    """Descarrega modelos que ficaram parados. Com forcar=True, descarrega todos (falta de RAM)."""
+    limite = config.OCIOSO_MIN * 60
+    soltos = []
+    for nome, m in list(_modelos.items()):
+        if forcar or time.time() - m["uso"] > limite:
+            try:
+                m["descarrega"]()
+            finally:
+                _modelos.pop(nome, None)
+                soltos.append(nome)
+    if soltos:
+        gc.collect()
+    return soltos
+
+
+async def vigia() -> None:
+    """Tarefa de fundo: a cada minuto descarrega o que está parado há muito tempo."""
+    while True:
+        await asyncio.sleep(60)
+        try:
+            libera_ociosos()
+        except Exception:
+            pass
+
+
+def garante_ram(minimo_mb: int, o_que: str) -> None:
+    """Confere se há RAM para uma tarefa pesada; tenta liberar modelos de voz antes de desistir."""
+    if ram_livre_mb() >= minimo_mb:
+        return
+    libera_ociosos(forcar=True)
+    livre = ram_livre_mb()
+    if livre < minimo_mb:
+        raise RuntimeError(
+            f"Pouca memória livre para {o_que}: {livre} MB livres e preciso de uns {minimo_mb} MB. "
+            "Feche programas pesados (navegador com muitas abas) e tente de novo.")
+
+
+# ------------------------------------------------------------ GPU, CPU ou os dois
+def modo_imagem() -> str:
+    """Onde rodar o gerador de imagens, conforme a VRAM livre agora.
+
+    gpu     : tudo na placa (precisa de ~1,5 GB livres)
+    hibrido : o modelo de difusão na placa e o texto/decodificador na CPU (~0,8 GB livres)
+    cpu     : tudo na CPU (a placa está ocupada pelo modelo de linguagem)
+    """
+    v = vram_livre_mb()
+    if v is None:
+        return "cpu"
+    if v >= 1500:
+        return "gpu"
+    if v >= 800:
+        return "hibrido"
+    return "cpu"
+EOF
+  cat > uploads.py <<'EOF'
+"""Anexos do usuário (imagens, .ino, .bin, .apk, código): guarda no disco e analisa."""
+import glob
+import json
+import re
+import shutil
+import struct
+import subprocess
+import time
+import uuid
+from pathlib import Path
+
+import config
+
+IMAGENS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+CODIGO = {".py", ".java", ".kt", ".xml", ".gradle", ".html", ".htm", ".js", ".css", ".json", ".md", ".txt",
+          ".c", ".cpp", ".h", ".hpp", ".ts", ".sh", ".ini", ".yaml", ".yml", ".toml", ".csv", ".cfg", ".properties"}
+ID_RE = re.compile(r"[0-9a-f]{10}")
+LIMITE_TEXTO = 14000   # caracteres de código que cabem no contexto do modelo
+
+CHIPS = {0: "ESP32", 2: "ESP32-S2", 5: "ESP32-C3", 9: "ESP32-S3", 12: "ESP32-C2", 13: "ESP32-C6",
+         16: "ESP32-H2", 18: "ESP32-P4", 23: "ESP32-C5"}
+FLASH = {0: "1 MB", 1: "2 MB", 2: "4 MB", 3: "8 MB", 4: "16 MB", 5: "32 MB"}
+
+
+def tipo_de(nome: str) -> str | None:
+    ext = Path(nome).suffix.lower()
+    if ext == ".ino":
+        return "ino"
+    if ext == ".bin":
+        return "bin"
+    if ext == ".apk":
+        return "apk"
+    if ext in IMAGENS:
+        return "imagem"
+    if ext in CODIGO:
+        return "texto"
+    return None
+
+
+def nome_seguro(nome: str) -> str:
+    nome = Path(nome).name
+    nome = re.sub(r"[^\w.\- ]", "_", nome).strip(" .")[:80]
+    return nome or "arquivo"
+
+
+# ----------------------------------------------------------------------------- análises
+def _ferramenta(nome: str) -> str | None:
+    base = __import__("os").environ.get("ANDROID_HOME") or __import__("os").environ.get("ANDROID_SDK_ROOT") or ""
+    achados = sorted(glob.glob(f"{base}/build-tools/*/{nome}"))
+    return achados[-1] if achados else None
+
+
+def _analisa_apk(p: Path) -> dict:
+    out = {"pacote": None, "versao": None, "nome": None, "permissoes": [], "min_sdk": None, "alvo_sdk": None,
+           "atividade": None, "assinatura": None}
+    aapt = _ferramenta("aapt2")
+    if not aapt:
+        return {**out, "resumo": "Não consegui analisar: o Android SDK não está instalado no servidor."}
+    r = subprocess.run([aapt, "dump", "badging", str(p)], capture_output=True, text=True, timeout=60)
+    for ln in r.stdout.splitlines():
+        if ln.startswith("package:"):
+            m = re.search(r"name='([^']*)' versionCode='([^']*)' versionName='([^']*)'", ln)
+            if m:
+                out["pacote"], out["versao"] = m.group(1), f"{m.group(3)} ({m.group(2)})"
+        elif ln.startswith("application-label:") and not out["nome"]:
+            out["nome"] = ln.split(":", 1)[1].strip("'")
+        elif ln.startswith("application:"):
+            m = re.search(r"label='([^']*)'", ln)
+            if m and m.group(1):
+                out["nome"] = m.group(1)
+        elif ln.startswith("uses-permission:"):
+            m = re.search(r"name='([^']*)'", ln)
+            if m:
+                out["permissoes"].append(m.group(1).replace("android.permission.", ""))
+        elif ln.startswith("sdkVersion:"):
+            out["min_sdk"] = ln.split(":", 1)[1].strip("'")
+        elif ln.startswith("targetSdkVersion:"):
+            out["alvo_sdk"] = ln.split(":", 1)[1].strip("'")
+        elif ln.startswith("launchable-activity:"):
+            m = re.search(r"name='([^']*)'", ln)
+            out["atividade"] = m.group(1) if m else None
+    sg = _ferramenta("apksigner")
+    if sg:
+        s = subprocess.run([sg, "verify", "--print-certs", str(p)], capture_output=True, text=True, timeout=60)
+        m = re.search(r"Signer #1 certificate DN: (.*)", s.stdout)
+        out["assinatura"] = m.group(1) if m else ("não assinado ou inválido" if s.returncode else None)
+    linhas = [f"Aplicativo Android: {out['nome'] or '(sem nome)'}", f"Pacote: {out['pacote']}",
+              f"Versão: {out['versao']}", f"Android mínimo (API): {out['min_sdk']} | alvo: {out['alvo_sdk']}",
+              f"Tela principal: {out['atividade']}", f"Assinado por: {out['assinatura']}",
+              "Permissões: " + (", ".join(out["permissoes"]) if out["permissoes"] else "nenhuma")]
+    out["resumo"] = "\n".join(linhas)
+    return out
+
+
+def _analisa_bin(p: Path) -> dict:
+    dados = p.read_bytes()[: 0x9000 + 4096]
+    tam = p.stat().st_size
+
+    def cabecalho(off: int):
+        if len(dados) < off + 24 or dados[off] != 0xE9:
+            return None
+        nseg, modo, fs = dados[off + 1], dados[off + 2], dados[off + 3]
+        entrada = struct.unpack_from("<I", dados, off + 4)[0]
+        chip = struct.unpack_from("<H", dados, off + 12)[0]
+        segs, pos = [], off + 24
+        for _ in range(min(nseg, 16)):
+            if len(dados) < pos + 8:
+                break
+            addr, ln = struct.unpack_from("<II", dados, pos)
+            segs.append((addr, ln))
+            pos += 8 + ln
+        return {"chip": CHIPS.get(chip, f"desconhecido ({chip})"), "segmentos": segs, "flash": FLASH.get(fs >> 4, "?"),
+                "entrada": entrada}
+
+    linhas = [f"Arquivo .bin de {tam / 1024:.0f} KB"]
+    info: dict = {"tipo_bin": "desconhecido"}
+    h0, h1 = cabecalho(0), cabecalho(0x1000)
+    parts = []
+    if len(dados) > 0x8000 + 32 and dados[0x8000:0x8002] == b"\xaa\x50":
+        for i in range(0, 96):
+            off = 0x8000 + i * 32
+            if len(dados) < off + 32 or dados[off:off + 2] != b"\xaa\x50":
+                break
+            _, tp, sub, ofs, sz = struct.unpack_from("<2sBBII", dados, off)
+            nome = dados[off + 12:off + 28].split(b"\0")[0].decode(errors="replace")
+            parts.append((nome, tp, sub, ofs, sz))
+    if h1 and parts:
+        info["tipo_bin"] = "imagem completa de flash"
+        linhas += [f"Tipo: imagem COMPLETA de flash (bootloader em 0x1000) para {h1['chip']}",
+                   "Para gravar: endereço 0x0."]
+    elif h0 and parts:
+        info["tipo_bin"] = "imagem completa de flash"
+        linhas += [f"Tipo: imagem COMPLETA de flash para {h0['chip']}", "Para gravar: endereço 0x0."]
+    elif h0:
+        info["tipo_bin"] = "aplicativo ou bootloader"
+        linhas += [f"Tipo: imagem de aplicativo/bootloader para {h0['chip']}", f"Flash: {h0['flash']}",
+                   f"Segmentos: {len(h0['segmentos'])} | entrada: 0x{h0['entrada']:08X}",
+                   "Para gravar: normalmente 0x10000 (aplicativo) ou 0x1000/0x0 (bootloader)."]
+    else:
+        linhas += ["Não reconheci como imagem ESP32 (falta o byte mágico 0xE9). Pode ser outro tipo de binário."]
+    if parts:
+        linhas.append("Partições: " + "; ".join(f"{n} @0x{o:X} ({s // 1024} KB)" for n, _, _, o, s in parts))
+    info["resumo"] = "\n".join(linhas)
+    return info
+
+
+def _analisa_ino(p: Path) -> dict:
+    t = p.read_text(errors="replace")
+    incs = sorted(set(re.findall(r'#include\s*[<"]([^>"]+)[>"]', t)))
+    linhas = [f"Sketch Arduino com {len(t.splitlines())} linhas.",
+              "Tem setup(): " + ("sim" if re.search(r"void\s+setup\s*\(", t) else "NÃO"),
+              "Tem loop(): " + ("sim" if re.search(r"void\s+loop\s*\(", t) else "NÃO"),
+              "Bibliotecas: " + (", ".join(incs) if incs else "nenhuma")]
+    return {"resumo": "\n".join(linhas), "bibliotecas": incs}
+
+
+def _analisa_imagem(p: Path) -> dict:
+    from PIL import Image
+    with Image.open(p) as im:
+        return {"resumo": f"Imagem {im.format} de {im.width}×{im.height} pixels, modo {im.mode}.",
+                "largura": im.width, "altura": im.height}
+
+
+def _analisa_texto(p: Path) -> dict:
+    t = p.read_text(errors="replace")
+    return {"resumo": f"Arquivo de texto/código com {len(t.splitlines())} linhas e {len(t)} caracteres."}
+
+
+ANALISES = {"apk": _analisa_apk, "bin": _analisa_bin, "ino": _analisa_ino, "imagem": _analisa_imagem,
+            "texto": _analisa_texto}
+
+
+# ----------------------------------------------------------------------------- armazenamento
+def salva(nome: str, origem: Path) -> dict:
+    """Move o arquivo recebido para a pasta de anexos e o analisa."""
+    tipo = tipo_de(nome)
+    if tipo is None:
+        raise ValueError("Tipo de arquivo não aceito. Aceito: imagens, .ino, .bin, .apk e arquivos de código/texto.")
+    id_ = uuid.uuid4().hex[:10]
+    pasta = config.UPLOADS_DIR / id_
+    pasta.mkdir(parents=True, exist_ok=True)
+    seguro = nome_seguro(nome)
+    destino = pasta / seguro
+    shutil.move(str(origem), destino)
+    try:
+        analise = ANALISES[tipo](destino)
+    except Exception as e:  # análise é um extra: nunca derruba o envio
+        analise = {"resumo": f"Não consegui analisar o arquivo ({type(e).__name__})."}
+    meta = {"id": id_, "name": seguro, "tipo": tipo, "size": destino.stat().st_size, "created": time.time(),
+            "analise": analise, "url": f"/uploads/{id_}/{seguro}"}
+    (pasta / "meta.json").write_text(json.dumps(meta, ensure_ascii=False))
+    return meta
+
+
+def meta(id_: str) -> dict | None:
+    if not ID_RE.fullmatch(id_):
+        return None
+    f = config.UPLOADS_DIR / id_ / "meta.json"
+    try:
+        return json.loads(f.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def caminho(id_: str) -> Path | None:
+    m = meta(id_)
+    if not m:
+        return None
+    p = config.UPLOADS_DIR / id_ / m["name"]
+    return p if p.exists() else None
+
+
+def texto(id_: str, limite: int = LIMITE_TEXTO) -> str | None:
+    p = caminho(id_)
+    if p is None:
+        return None
+    return p.read_text(errors="replace")[:limite]
+
+
+def apaga(id_: str) -> None:
+    if ID_RE.fullmatch(id_):
+        shutil.rmtree(config.UPLOADS_DIR / id_, ignore_errors=True)
+
+
+def limpa_antigos(dias: int = 14) -> None:
+    limite = time.time() - dias * 86400
+    for f in config.UPLOADS_DIR.glob("*/meta.json"):
+        try:
+            if json.loads(f.read_text())["created"] < limite:
+                shutil.rmtree(f.parent, ignore_errors=True)
+        except (OSError, ValueError, KeyError):
+            pass
+
+
+def contexto_do_anexo(id_: str) -> str:
+    """Texto que descreve o anexo para o modelo de linguagem usar na conversa."""
+    m = meta(id_)
+    if not m:
+        return ""
+    cab = f"Arquivo anexado: {m['name']} ({m['tipo']}, {m['size'] // 1024} KB)\n{m['analise'].get('resumo', '')}"
+    if m["tipo"] in ("ino", "texto"):
+        conteudo = texto(id_)
+        if conteudo:
+            cab += f"\n--- conteúdo ---\n{conteudo}\n--- fim ---"
+    return cab
+
+
+def encontra_app_por_pacote(pacote: str) -> str | None:
+    """Se o APK anexado foi criado por esta IA, devolve o id da entrega (para modificar pelo código-fonte)."""
+    for f in config.APPS_DIR.glob("*/meta.json"):
+        try:
+            m = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        if m.get("app_id") == pacote:
+            return m["id"]
+    return None
+EOF
+  cat > imagens.py <<'EOF'
+"""Criar e modificar imagens (texto para imagem e imagem para imagem), 100% local.
+
+Usa o Stable Diffusion Turbo pelo stable-diffusion.cpp. Não existe filtro de conteúdo.
+A IA de texto traduz e detalha o pedido para inglês (os modelos de imagem entendem inglês bem melhor).
+"""
+import asyncio
+import json
+import random
+import re
+import shutil
+import sys
+import uuid
+from pathlib import Path
+
+import httpx
+
+import androidgen
+import config
+import entregas
+import recursos
+import uploads
+
+TAMANHOS = {"512x512": (512, 512), "512x768": (512, 768), "768x512": (768, 512)}
+_download: asyncio.Task | None = None
+
+
+# ------------------------------------------------------------------ modelo de imagem (download)
+def presente() -> bool:
+    return config.IMG_MODEL.exists() and config.IMG_MODEL.stat().st_size >= config.IMG_TAM * 0.999
+
+
+def estado() -> dict:
+    parte = config.IMG_MODEL.with_suffix(".gguf.part")
+    baixando = _download is not None and not _download.done()
+    prog = (parte.stat().st_size / config.IMG_TAM) if baixando and parte.exists() else 0.0
+    return {"presente": presente(), "baixando": baixando, "progresso": round(min(prog, 1.0), 3),
+            "tam": config.IMG_TAM, "motor": motor_instalado()}
+
+
+def motor_instalado() -> bool:
+    try:
+        import importlib.util
+        return importlib.util.find_spec("stable_diffusion_cpp") is not None
+    except Exception:
+        return False
+
+
+async def _baixa() -> None:
+    config.IMG_MODEL.parent.mkdir(parents=True, exist_ok=True)
+    parte = config.IMG_MODEL.with_suffix(".gguf.part")
+    proc = await asyncio.create_subprocess_exec(
+        "curl", "-L", "--fail", "-C", "-", "-o", str(parte), config.IMG_URL,
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL, start_new_session=True)
+    rc = await proc.wait()
+    if rc == 0 and parte.exists() and parte.stat().st_size >= config.IMG_TAM * 0.999:
+        parte.rename(config.IMG_MODEL)
+
+
+def baixar() -> None:
+    global _download
+    if presente() or (_download is not None and not _download.done()):
+        return
+    config.IMG_MODEL.parent.mkdir(parents=True, exist_ok=True)
+    if shutil.disk_usage(config.IMG_MODEL.parent).free < config.IMG_TAM * 1.1:
+        raise ValueError("Falta espaço no disco: preciso de uns 3 GB livres.")
+    _download = asyncio.get_running_loop().create_task(_baixa())
+
+
+# ------------------------------------------------------------------ prompt em inglês
+async def melhora_prompt(texto: str) -> str:
+    """Pede à IA de texto para traduzir e detalhar o pedido. Se ela não responder, usa o texto original."""
+    msgs = [{"role": "system", "content": (
+        "You write prompts for a text-to-image model. Translate the user's request to English and make it a "
+        "single detailed line: subject, setting, style, lighting, camera/composition, quality keywords. "
+        "Keep the user's intent exactly; do not add or remove subjects; do not refuse or moralize. "
+        "Output ONLY the prompt, no quotes, no explanation.")}, {"role": "user", "content": texto}]
+    try:
+        async with httpx.AsyncClient(timeout=60) as c:
+            r = await c.post(f"{config.LLAMA_URL}/v1/chat/completions",
+                             json={"messages": msgs, "max_tokens": 110, "temperature": 0.4, "cache_prompt": True})
+        if r.status_code == 200:
+            t = r.json()["choices"][0]["message"]["content"].strip().strip('"').replace("\n", " ")
+            if 8 <= len(t) <= 900:
+                return t
+    except Exception:
+        pass
+    return texto
+
+
+# ------------------------------------------------------------------ geração
+async def _roda_worker(cfg: dict, emit) -> tuple[bool, str]:
+    """Roda o gerador numa sub-rotina com prioridade baixa. Devolve (ok, mensagem_de_erro)."""
+    cmd = recursos.baixa_prioridade([sys.executable, str(Path(__file__).with_name("imggen.py"))])
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        start_new_session=True)
+    proc.stdin.write(json.dumps(cfg).encode())
+    await proc.stdin.drain()
+    proc.stdin.close()
+    erro = ""
+    try:
+        async for linha in proc.stdout:
+            try:
+                ev = json.loads(linha)
+            except ValueError:
+                continue
+            if ev.get("tipo") == "passo":
+                await emit({"type": "passo", "passo": ev["passo"], "total": ev["total"]})
+            elif ev.get("tipo") == "erro":
+                erro = ev.get("msg", "")
+        await proc.wait()
+    except asyncio.CancelledError:  # o usuário clicou em Parar
+        import os
+        import signal
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        raise
+    return proc.returncode == 0, erro
+
+
+async def gera_imagem(descricao: str, init_id: str | None, tamanho: str, passos: int, forca: float,
+                      melhorar: bool, emit) -> None:
+    if not motor_instalado():
+        await emit({"type": "error", "msg": "O gerador de imagens não está instalado. Rode: bash atualizar.sh"})
+        return
+    if not presente():
+        await emit({"type": "error", "msg": "Falta baixar o modelo de imagens (2 GB). Use o botão de baixar abaixo.",
+                    "precisa_modelo": True})
+        return
+    if androidgen._trava.locked():
+        await emit({"type": "error", "msg": "Ainda estou criando outra coisa. Espere terminar ou clique em Parar."})
+        return
+    largura, altura = TAMANHOS.get(tamanho, (512, 512))
+    passos = max(1, min(int(passos), 8))
+    async with androidgen._trava:
+        try:
+            recursos.garante_ram(3500, "gerar a imagem")
+        except RuntimeError as e:
+            await emit({"type": "error", "msg": str(e)})
+            return
+        init = None
+        if init_id:
+            init = uploads.caminho(init_id)
+            m = uploads.meta(init_id)
+            if init is None or not m or m["tipo"] != "imagem":
+                await emit({"type": "error", "msg": "A imagem anexada não foi encontrada. Anexe de novo."})
+                return
+        prompt = descricao
+        if melhorar:
+            await emit({"type": "status", "msg": "A IA está traduzindo e detalhando o seu pedido…"})
+            prompt = await melhora_prompt(descricao)
+        id_ = uuid.uuid4().hex[:10]
+        pasta = config.WORK_DIR / f"img-{id_}"
+        pasta.mkdir(parents=True, exist_ok=True)
+        saida = pasta / "imagem.png"
+        seed = random.randint(1, 2**31 - 1)
+        modo = recursos.modo_imagem()
+        base = {"modelo": str(config.IMG_MODEL), "threads": recursos.nucleos_fisicos(), "prompt": prompt,
+                "largura": largura, "altura": altura, "passos": passos, "seed": seed, "saida": str(saida),
+                "cfg": 1.0, "init": str(init) if init else None, "forca": forca}
+        try:
+            rotulo = {"gpu": "na placa de vídeo", "hibrido": "na placa de vídeo e na CPU", "cpu": "na CPU"}[modo]
+            await emit({"type": "status", "msg": f"Gerando a imagem {rotulo}… (leva cerca de 1 minuto na CPU)"})
+            ok, erro = await _roda_worker({**base, "modo": modo}, emit)
+            if not ok and modo != "cpu":
+                await emit({"type": "status", "msg": "A placa de vídeo não deu conta; tentando só pela CPU…"})
+                ok, erro = await _roda_worker({**base, "modo": "cpu"}, emit)
+            if not ok or not saida.exists():
+                await emit({"type": "error", "msg": "Não consegui gerar a imagem.", "log": erro})
+                return
+            slug = androidgen.slugify(descricao) or "imagem"
+            nome = (descricao[:40] or "Imagem").strip()
+            meta = entregas.salva(id_, nome, descricao, "img", [(saida, f"{slug}.png", "Imagem (.png)")],
+                                  {"prompt": prompt, "seed": seed, "tamanho": f"{largura}x{altura}",
+                                   "modificada_de": init_id})
+            await emit({"type": "done", "id": id_, "name": nome, "kind": "img", "files": meta["files"],
+                        "preview": meta["files"][0]["url"], "prompt": prompt,
+                        "note": f"Prompt usado: {prompt}"})
+        finally:
+            shutil.rmtree(pasta, ignore_errors=True)
+EOF
+  cat > imggen.py <<'EOF'
+#!/usr/bin/env python3
+"""Processo isolado que gera UMA imagem com o stable-diffusion.cpp (Stable Diffusion Turbo).
+
+Lê um JSON na entrada padrão e escreve eventos JSON (um por linha) na saída. Roda separado do
+servidor para: (1) poder ser cancelado na hora (botão Parar), (2) devolver toda a memória ao
+terminar, (3) se a GPU não der conta, o servidor repete só pela CPU.
+Não há filtro de conteúdo: o modelo gera o que foi pedido.
+"""
+import json
+import os
+import sys
+
+
+def evento(**kw):
+    print(json.dumps(kw, ensure_ascii=False), flush=True)
+
+
+def main():
+    cfg = json.loads(sys.stdin.read())
+    modo = cfg.get("modo", "cpu")
+    if modo == "cpu":
+        os.environ["CUDA_VISIBLE_DEVICES"] = "-1"   # sem GPU: tudo na CPU, mesmo que o binding tenha CUDA
+    try:
+        from stable_diffusion_cpp import StableDiffusion
+        kw = dict(model_path=cfg["modelo"], n_threads=cfg["threads"], vae_decode_only=not cfg.get("init"))
+        if modo == "hibrido":                         # modelo de difusão na placa; texto e decodificador na CPU
+            kw.update(keep_clip_on_cpu=True, keep_vae_on_cpu=True)
+        elif modo == "gpu":
+            kw.update(keep_clip_on_cpu=False, keep_vae_on_cpu=False)
+        sd = StableDiffusion(**kw)
+        evento(tipo="carregado", modo=modo)
+
+        def passo(i, total, tempo):
+            evento(tipo="passo", passo=int(i), total=int(total), seg=round(float(tempo), 1))
+
+        args = dict(prompt=cfg["prompt"], negative_prompt=cfg.get("negativo", ""), width=cfg["largura"],
+                    height=cfg["altura"], cfg_scale=cfg.get("cfg", 1.0), sample_steps=cfg["passos"],
+                    seed=cfg["seed"], sample_method="euler_a", progress_callback=passo,
+                    vae_tiling=(modo != "cpu"))  # em GPU o decodificador precisa ser fatiado para caber na VRAM
+        if cfg.get("init"):
+            args.update(init_image=cfg["init"], strength=cfg.get("forca", 0.6))
+        imagens = sd.generate_image(**args)
+        imagens[0].save(cfg["saida"])
+        evento(tipo="pronto", arquivo=cfg["saida"])
+    except Exception as e:  # o servidor decide o que fazer (por exemplo, repetir só pela CPU)
+        evento(tipo="erro", msg=f"{type(e).__name__}: {e}"[:300])
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
+EOF
+  cat > codegen.py <<'EOF'
+"""Programar projetos com VÁRIOS arquivos: app Android avançado, página Web e script Python.
+
+Diferente do modo simples (um arquivo só), aqui a IA devolve vários arquivos no formato
+
+    NOME: <nome>
+    ### caminho/do/arquivo.ext
+    ```linguagem
+    conteúdo
+    ```
+
+O servidor valida os caminhos, monta o projeto, confere/compila e devolve os arquivos prontos.
+Para MODIFICAR algo que já existe, a IA recebe os arquivos atuais e devolve só o que mudou.
+"""
+import asyncio
+import re
+import shutil
+import sys
+import uuid
+import zipfile
+from pathlib import Path
+
+import androidgen
+import config
+import entregas
+import recursos
+
+ARQ_RE = re.compile(r"^###\s*(?:ARQUIVO:\s*)?`?([^\s`]+)`?\s*\n```[^\n]*\n(.*?)\n```", re.S | re.M)
+LIMITE_ARQ = 60_000
+MAX_ARQUIVOS = 20
+
+
+def extrai_arquivos(texto: str) -> dict[str, str]:
+    arqs: dict[str, str] = {}
+    for caminho, conteudo in ARQ_RE.findall(texto):
+        arqs[caminho.strip().lstrip("./")] = conteudo.rstrip() + "\n"
+    return arqs
+
+
+def extrai_nome(texto: str, padrao: str) -> str:
+    m = re.search(r"NOME:\s*(.+)", texto)
+    return ((m.group(1).strip() if m else padrao)[:40]) or padrao
+
+
+def caminho_seguro(c: str) -> bool:
+    p = Path(c)
+    return not p.is_absolute() and ".." not in p.parts and len(c) < 160 and bool(re.fullmatch(r"[\w./\- ]+", c))
+
+
+def formata_base(arqs: dict[str, str], limite: int = 12_000) -> str:
+    """Mostra os arquivos atuais à IA (cortando se for muito grande)."""
+    out, usado = [], 0
+    for c, t in arqs.items():
+        trecho = t if usado + len(t) <= limite else t[: max(0, limite - usado)] + "\n…(cortado)"
+        out.append(f"### {c}\n```\n{trecho.rstrip()}\n```")
+        usado += len(t)
+        if usado >= limite:
+            break
+    return "\n".join(out)
+
+
+async def _compila_comando(cmd: list[str], pasta: Path) -> tuple[bool, str]:
+    proc = await asyncio.create_subprocess_exec(
+        *recursos.baixa_prioridade(cmd), cwd=pasta, stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT, start_new_session=True)
+    try:
+        saida, _ = await asyncio.wait_for(proc.communicate(), timeout=120)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        import os
+        import signal
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        raise
+    return proc.returncode == 0, saida.decode(errors="replace")
+
+
+def zipa(pasta: Path, arquivos: dict[str, str], destino: Path) -> Path:
+    with zipfile.ZipFile(destino, "w", zipfile.ZIP_DEFLATED) as z:
+        for c, t in arquivos.items():
+            z.writestr(c, t)
+    return destino
+
+
+# =============================================================================== Android avançado
+SYS_ANDROID = """Você é um programador Android sênior. Crie um aplicativo Android completo com VÁRIOS arquivos.
+
+REGRAS OBRIGATÓRIAS:
+1. Linguagem: Java (NÃO use Kotlin). Pacote: com.localai.app.
+2. Já estão no projeto: AppCompat, Material, ConstraintLayout, RecyclerView, CardView, ViewPager2 e SwipeRefreshLayout. NENHUMA outra biblioteca.
+3. A tela principal é com.localai.app.MainActivity (extends AppCompatActivity), com layout em app/src/main/res/layout/activity_main.xml. Pode criar outras Activities, Fragments e classes (arquivos .java), layouts, e res/values (strings.xml, colors.xml, themes.xml) e res/drawable (somente XML).
+4. Se criar OUTRAS Activities, envie TAMBÉM o app/src/main/AndroidManifest.xml completo declarando todas (MainActivity com o filtro MAIN/LAUNCHER). Se não precisar, NÃO envie o manifesto.
+5. Tema do app: @style/Theme.AppCompat.Light.DarkActionBar (ou um tema Material, se usar Material).
+6. Todos os IDs usados no código (R.id.x) devem existir nos layouts. Inclua TODOS os imports. O projeto precisa compilar na primeira tentativa.
+7. Sem imagens binárias (use cores e drawables XML). Textos em português do Brasil. Permissão de internet já existe.
+8. Todo caminho começa com app/src/main/.
+
+FORMATO (siga exatamente, sem explicações):
+NOME: <nome curto do app>
+### app/src/main/java/com/localai/app/MainActivity.java
+```java
+<código>
+```
+### app/src/main/res/layout/activity_main.xml
+```xml
+<layout>
+```
+(um bloco ### + código para cada arquivo)"""
+
+EX_PEDIDO_AND = "um contador com botões de mais e menos"
+EX_RESP_AND = """NOME: Contador
+### app/src/main/java/com/localai/app/MainActivity.java
+```java
+package com.localai.app;
+
+import android.os.Bundle;
+import android.widget.Button;
+import android.widget.TextView;
+
+import androidx.appcompat.app.AppCompatActivity;
+
+public class MainActivity extends AppCompatActivity {
+    private int valor = 0;
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        setContentView(R.layout.activity_main);
+        final TextView texto = findViewById(R.id.texto);
+        Button mais = findViewById(R.id.mais);
+        Button menos = findViewById(R.id.menos);
+        mais.setOnClickListener(v -> texto.setText(String.valueOf(++valor)));
+        menos.setOnClickListener(v -> texto.setText(String.valueOf(--valor)));
+    }
+}
+```
+### app/src/main/res/layout/activity_main.xml
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:gravity="center"
+    android:orientation="vertical"
+    android:padding="24dp">
+
+    <TextView
+        android:id="@+id/texto"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="0"
+        android:textSize="48sp" />
+
+    <Button
+        android:id="@+id/mais"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="+1" />
+
+    <Button
+        android:id="@+id/menos"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="-1" />
+</LinearLayout>
+```"""
+
+APP_BUILD_AVANCADO = """plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.localai.app'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "%(app_id)s"
+        minSdk 24
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    lint {
+        abortOnError false
+        checkReleaseBuilds false
+    }
+}
+
+dependencies {
+    implementation 'androidx.appcompat:appcompat:1.6.1'
+    implementation 'com.google.android.material:material:1.11.0'
+    implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
+    implementation 'androidx.recyclerview:recyclerview:1.3.2'
+    implementation 'androidx.cardview:cardview:1.0.0'
+    implementation 'androidx.viewpager2:viewpager2:1.0.0'
+    implementation 'androidx.swiperefreshlayout:swiperefreshlayout:1.1.0'
+}
+"""
+
+GRADLE_PROPS_AVANCADO = """org.gradle.jvmargs=-Xmx1536m -Dfile.encoding=UTF-8
+org.gradle.workers.max=2
+android.useAndroidX=true
+android.nonTransitiveRClass=true
+"""
+
+MANIFEST_AVANCADO = """<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <application
+        android:label="%(label)s"
+        android:allowBackup="true"
+        android:usesCleartextTraffic="true"
+        android:theme="@style/Theme.AppCompat.Light.DarkActionBar">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
+"""
+
+
+def valida_android(arqs: dict[str, str]) -> str | None:
+    """Devolve uma mensagem de erro se os arquivos do app não forem aceitáveis."""
+    if not arqs:
+        return "A IA não devolveu nenhum arquivo no formato pedido."
+    if len(arqs) > MAX_ARQUIVOS:
+        return f"Arquivos demais ({len(arqs)}). O máximo é {MAX_ARQUIVOS}."
+    for c, t in arqs.items():
+        if not caminho_seguro(c) or not c.startswith("app/src/main/"):
+            return f"Caminho não permitido: {c}"
+        if not (c.endswith(".java") or c.endswith(".xml")):
+            return f"Tipo de arquivo não permitido: {c} (só .java e .xml)"
+        if len(t) > LIMITE_ARQ:
+            return f"Arquivo grande demais: {c}"
+    return None
+
+
+def escreve_projeto_avancado(pasta: Path, nome: str, app_id: str, arqs: dict[str, str]) -> None:
+    pasta.mkdir(parents=True, exist_ok=True)
+    (pasta / "settings.gradle").write_text(androidgen.SETTINGS_GRADLE)
+    (pasta / "build.gradle").write_text(androidgen.ROOT_BUILD_GRADLE)
+    (pasta / "gradle.properties").write_text(GRADLE_PROPS_AVANCADO)
+    import os
+    sdk = os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT") or ""
+    (pasta / "local.properties").write_text(f"sdk.dir={sdk}\n")
+    (pasta / "app").mkdir(exist_ok=True)
+    (pasta / "app/build.gradle").write_text(APP_BUILD_AVANCADO % {"app_id": app_id})
+    todos = dict(arqs)
+    todos.setdefault("app/src/main/AndroidManifest.xml", MANIFEST_AVANCADO % {"label": androidgen.xml_escape(nome)})
+    for c, t in todos.items():
+        f = pasta / c
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(t)
+
+
+async def gera_app_avancado(descricao: str, base: dict[str, str] | None, base_nome: str | None, emit) -> None:
+    if androidgen._trava.locked():
+        await emit({"type": "error", "msg": "Ainda estou criando outra coisa. Espere terminar ou clique em Parar."})
+        return
+    async with androidgen._trava:
+        try:
+            recursos.garante_ram(2500, "compilar o app")
+        except RuntimeError as e:
+            await emit({"type": "error", "msg": str(e)})
+            return
+        if base:
+            pedido = (f"Estes são os arquivos ATUAIS do app:\n{formata_base(base)}\n\n"
+                      f"Modifique o app conforme o pedido e devolva SOMENTE os arquivos que mudaram ou são novos, "
+                      f"cada um COMPLETO (não use reticências). Pedido: {descricao}")
+        else:
+            pedido = f"Crie: {descricao}"
+        mensagens = [{"role": "system", "content": SYS_ANDROID},
+                     {"role": "user", "content": f"Crie: {EX_PEDIDO_AND}"},
+                     {"role": "assistant", "content": EX_RESP_AND},
+                     {"role": "user", "content": pedido}]
+        id_ = uuid.uuid4().hex[:10]
+        pasta = config.WORK_DIR / f"appx-{id_}"
+        try:
+            for tentativa in range(config.MAX_FIX_ATTEMPTS + 1):
+                if tentativa == 0:
+                    await emit({"type": "status", "msg": "A IA está escrevendo os arquivos do app… (pode levar vários minutos)"})
+                else:
+                    await emit({"type": "status", "msg": f"Deu erro ao compilar. A IA está corrigindo (tentativa {tentativa} de {config.MAX_FIX_ATTEMPTS})…"})
+                texto = await androidgen.pede_codigo(mensagens, emit)
+                novos = extrai_arquivos(texto)
+                erro = valida_android(novos)
+                if erro:
+                    await emit({"type": "error", "msg": erro, "log": texto[-1500:]})
+                    return
+                arqs = {**(base or {}), **novos}
+                if not any(c.endswith("MainActivity.java") for c in arqs):
+                    await emit({"type": "error", "msg": "Faltou a MainActivity.java.", "log": texto[-800:]})
+                    return
+                nome = extrai_nome(texto, base_nome or "App IA")
+                await emit({"type": "code", "text": "\n\n".join(f"// {c}\n{t}" for c, t in novos.items())})
+                if pasta.exists():
+                    shutil.rmtree(pasta)
+                app_id = f"com.localai.{androidgen.slugify(nome)}{id_[:4]}"
+                escreve_projeto_avancado(pasta, nome, app_id, arqs)
+                await emit({"type": "status", "msg": "Compilando o app… (a primeira vez baixa as bibliotecas e demora mais)"})
+                ok, log, apk = await androidgen.compila(pasta)
+                if ok:
+                    meta = entregas.salva(id_, nome, descricao, "apk",
+                                          [(apk, f"{androidgen.slugify(nome)}.apk", "App Android (.apk)")],
+                                          {"app_id": app_id, "modo": "avancado", "arquivos_fonte": arqs})
+                    await emit({"type": "done", "id": id_, "name": nome, "kind": "apk", "files": meta["files"],
+                                "note": "Passe o arquivo para o celular e abra-o para instalar. Para mudar o app, use ✏ Modificar."})
+                    return
+                erros = androidgen.resumo_erros(log)
+                if tentativa >= config.MAX_FIX_ATTEMPTS:
+                    await emit({"type": "error", "msg": "Não consegui compilar o app depois das correções.", "log": erros})
+                    return
+                mensagens += [{"role": "assistant", "content": texto},
+                              {"role": "user", "content": (
+                                  "O código NÃO compilou. ERROS DE COMPILAÇÃO:\n" + erros +
+                                  "\n\nCorrija e devolva SOMENTE os arquivos que precisam mudar, completos, no mesmo formato.")}]
+        except RuntimeError as e:
+            await emit({"type": "error", "msg": str(e)})
+        finally:
+            shutil.rmtree(pasta, ignore_errors=True)
+
+
+# =============================================================================== Web e Python
+SYS_WEB = """Você é um desenvolvedor web experiente. Crie uma página/aplicação web completa.
+
+REGRAS:
+1. O arquivo principal é index.html, com HTML, CSS e JavaScript. Pode enviar também outros arquivos (.css, .js) se ajudar.
+2. NÃO use bibliotecas externas, CDNs nem imagens da internet: tudo precisa funcionar offline, abrindo o index.html.
+3. Layout responsivo (funciona no celular), visual limpo e moderno. Textos em português do Brasil.
+4. O código precisa funcionar na primeira tentativa.
+
+FORMATO (siga exatamente, sem explicações):
+NOME: <nome curto>
+### index.html
+```html
+<código>
+```
+(um bloco ### + código para cada arquivo)"""
+
+SYS_PY = """Você é um programador Python experiente. Crie o programa pedido.
+
+REGRAS:
+1. Python 3. Use apenas a biblioteca padrão, a menos que o usuário peça outra biblioteca.
+2. O arquivo principal é main.py. Pode enviar outros arquivos .py se ajudar.
+3. O código precisa rodar na primeira tentativa. Comentários e mensagens em português do Brasil.
+
+FORMATO (siga exatamente, sem explicações):
+NOME: <nome curto>
+### main.py
+```python
+<código>
+```
+(um bloco ### + código para cada arquivo)"""
+
+EX_WEB = ("um contador de cliques",
+          "NOME: Contador\n### index.html\n```html\n<!doctype html>\n<html lang=\"pt-BR\">\n<head>\n<meta charset=\"utf-8\">\n"
+          "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>Contador</title>\n"
+          "<style>body{font-family:sans-serif;text-align:center;padding:40px}button{font-size:24px;padding:12px 24px}</style>\n"
+          "</head>\n<body>\n<h1 id=\"n\">0</h1>\n<button onclick=\"n.textContent=++c\">+1</button>\n"
+          "<script>let c=0;</script>\n</body>\n</html>\n```")
+EX_PY = ("somar dois números digitados",
+         "NOME: Somador\n### main.py\n```python\ndef main():\n    a = float(input(\"Primeiro número: \"))\n"
+         "    b = float(input(\"Segundo número: \"))\n    print(f\"Soma: {a + b}\")\n\n\nif __name__ == \"__main__\":\n    main()\n```")
+
+ALVOS = {
+    "web": dict(sys=SYS_WEB, ex=EX_WEB, rotulo="página web", principal="index.html", icone="web"),
+    "python": dict(sys=SYS_PY, ex=EX_PY, rotulo="programa Python", principal="main.py", icone="python"),
+}
+
+
+async def confere_python(pasta: Path, arqs: dict[str, str]) -> str:
+    erros = []
+    for c in arqs:
+        if c.endswith(".py"):
+            ok, saida = await _compila_comando([sys.executable, "-m", "py_compile", c], pasta)
+            if not ok:
+                erros.append(saida.strip()[-600:])
+    return "\n".join(erros)
+
+
+async def gera_codigo(alvo: str, descricao: str, base: dict[str, str] | None, base_nome: str | None, emit) -> None:
+    a = ALVOS.get(alvo)
+    if not a:
+        await emit({"type": "error", "msg": "Tipo de projeto desconhecido."})
+        return
+    if androidgen._trava.locked():
+        await emit({"type": "error", "msg": "Ainda estou criando outra coisa. Espere terminar ou clique em Parar."})
+        return
+    async with androidgen._trava:
+        if base:
+            pedido = (f"Estes são os arquivos ATUAIS:\n{formata_base(base)}\n\nModifique conforme o pedido e devolva "
+                      f"SOMENTE os arquivos que mudaram ou são novos, cada um COMPLETO. Pedido: {descricao}")
+        else:
+            pedido = f"Crie: {descricao}"
+        mensagens = [{"role": "system", "content": a["sys"]}, {"role": "user", "content": f"Crie: {a['ex'][0]}"},
+                     {"role": "assistant", "content": a["ex"][1]}, {"role": "user", "content": pedido}]
+        id_ = uuid.uuid4().hex[:10]
+        pasta = config.WORK_DIR / f"cod-{id_}"
+        try:
+            for tentativa in range(config.MAX_FIX_ATTEMPTS + 1):
+                await emit({"type": "status", "msg": (f"A IA está escrevendo o {a['rotulo']}…" if tentativa == 0 else
+                            f"Achei um erro. A IA está corrigindo (tentativa {tentativa} de {config.MAX_FIX_ATTEMPTS})…")})
+                texto = await androidgen.pede_codigo(mensagens, emit)
+                novos = extrai_arquivos(texto)
+                if not novos or not all(caminho_seguro(c) for c in novos) or len(novos) > MAX_ARQUIVOS:
+                    await emit({"type": "error", "msg": "A IA não devolveu os arquivos no formato pedido.", "log": texto[-1200:]})
+                    return
+                arqs = {**(base or {}), **novos}
+                if a["principal"] not in arqs:
+                    await emit({"type": "error", "msg": f"Faltou o arquivo {a['principal']}.", "log": texto[-800:]})
+                    return
+                nome = extrai_nome(texto, base_nome or a["rotulo"].capitalize())
+                await emit({"type": "code", "text": "\n\n".join(f"// {c}\n{t}" for c, t in novos.items())})
+                erros = ""
+                if alvo == "python":
+                    await emit({"type": "status", "msg": "Conferindo se o código Python é válido…"})
+                    if pasta.exists():
+                        shutil.rmtree(pasta)
+                    for c, t in arqs.items():
+                        (pasta / c).parent.mkdir(parents=True, exist_ok=True)
+                        (pasta / c).write_text(t)
+                    erros = await confere_python(pasta, arqs)
+                if erros:
+                    if tentativa >= config.MAX_FIX_ATTEMPTS:
+                        await emit({"type": "error", "msg": "O código continua com erros de sintaxe.", "log": erros})
+                        return
+                    mensagens += [{"role": "assistant", "content": texto},
+                                  {"role": "user", "content": "O código tem erros:\n" + erros +
+                                   "\n\nCorrija e devolva SOMENTE os arquivos que precisam mudar, completos, no mesmo formato."}]
+                    continue
+                slug = androidgen.slugify(nome)
+                pasta.mkdir(parents=True, exist_ok=True)
+                saidas = []
+                for c, t in arqs.items():
+                    dest = pasta / "saida" / c.replace("/", "_")
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    dest.write_text(t)
+                    saidas.append((dest, c.replace("/", "_"), f"Arquivo {c}"))
+                zip_dest = zipa(pasta, arqs, pasta / f"{slug}.zip")
+                saidas.append((zip_dest, f"{slug}.zip", "Projeto completo (.zip)"))
+                meta = entregas.salva(id_, nome, descricao, alvo, saidas, {"arquivos_fonte": arqs})
+                nota = ("Abra o index.html no navegador (funciona offline)." if alvo == "web"
+                        else "Rode com: python3 main.py")
+                await emit({"type": "done", "id": id_, "name": nome, "kind": alvo, "files": meta["files"],
+                            "note": nota + " Para mudar, use ✏ Modificar."})
+                return
+        except RuntimeError as e:
+            await emit({"type": "error", "msg": str(e)})
+        finally:
+            shutil.rmtree(pasta, ignore_errors=True)
+EOF
   cat > "$BASE/diagnostico_fans.sh" <<'EOF'
 #!/usr/bin/env bash
 # Mostra o que dá para controlar nas ventoinhas pelo Linux (GPU e CPU).
@@ -2181,6 +3481,25 @@ EOF
   .copia { font:13px var(--mono); word-break:break-all; background:var(--bg); border:1px solid var(--line); border-radius:10px; padding:7px 10px; margin:5px 0; }
   table.sis { width:100%; border-collapse:collapse; font-size:14px; margin-top:10px; } table.sis td { padding:6px 4px; border-bottom:1px solid var(--line); } table.sis td:last-child { text-align:right; font-variant-numeric:tabular-nums; }
 
+  /* anexos e imagens */
+  #anexos { display:flex; gap:8px; flex-wrap:wrap; padding:0 4px 8px; } #anexos:empty { display:none; }
+  .anx { display:flex; align-items:center; gap:8px; max-width:100%; background:var(--user); border:1px solid var(--line); border-radius:12px; padding:5px 8px; font-size:13px; }
+  .anx img { width:34px; height:34px; object-fit:cover; border-radius:8px; }
+  .anx .ico { font-size:20px; } .anx .nome { max-width:180px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .anx small { color:var(--mut); } .anx button { border:0; background:none; color:var(--mut); padding:0 4px; font-size:15px; }
+  .anx button:hover { color:var(--err); }
+  .anx.base { background:var(--acc-soft); border-color:var(--acc); }
+  .msg.user .anexos-msg { display:flex; gap:6px; flex-wrap:wrap; justify-content:flex-end; margin-bottom:4px; max-width:85%; }
+  .msg.user .anexos-msg .anx { background:var(--card); }
+  .miniatura { max-width:min(100%,420px); width:100%; border-radius:14px; border:1px solid var(--line); margin-top:10px; display:block; background:var(--code); }
+  .acoes-cartao { display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; }
+  .acoes-cartao button, .bt-mini { border:1px solid var(--line); background:var(--card); border-radius:10px; padding:7px 12px; font-size:13.5px; }
+  .acoes-cartao button:hover, .bt-mini:hover { border-color:var(--acc); color:var(--acc); }
+  .caixa.arrastando { border-color:var(--acc); background:var(--acc-soft); }
+  #imgOpts { padding:2px 10px 6px; } #imgOpts label { padding:5px 0; } #imgOpts .linha-opt { display:flex; align-items:center; gap:8px; font-size:13px; color:var(--mut); }
+  #imgOpts input[type=range] { flex:1; }
+  .barra-img { height:6px; background:var(--line); border-radius:99px; overflow:hidden; margin-top:8px; } .barra-img i { display:block; height:100%; background:var(--acc); width:0; transition:width .5s; }
+  .sec-btn { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:6px 10px; font-size:13px; color:var(--mut); }
   /* ---------- celular ---------- */
   @media (max-width: 860px) {
     #side { position:fixed; inset:0 auto 0 0; width:min(300px,86vw); transform:translateX(-102%); transition:transform .22s; box-shadow:none; }
@@ -2233,19 +3552,34 @@ EOF
           <div class="sec">O que você quer fazer?</div>
           <select id="modo">
             <option value="chat">💬 Conversa</option>
-            <option value="app">📱 Criar app Android (.apk)</option>
-            <option value="esp32">🔌 Criar firmware ESP32 (.bin)</option>
+            <option value="app">📱 App Android rápido (1 arquivo)</option>
+            <option value="appx">📱 App Android avançado (vários arquivos)</option>
+            <option value="esp32">🔌 Firmware ESP32 (.ino / .bin)</option>
+            <option value="web">🌐 Página web</option>
+            <option value="python">🐍 Programa Python</option>
+            <option value="img">🎨 Criar ou modificar imagem</option>
           </select>
           <select id="placa" hidden></select>
+          <div id="imgOpts" hidden>
+            <select id="imgTam"><option value="512x512">Quadrada 512×512</option><option value="512x768">Em pé 512×768</option><option value="768x512">Deitada 768×512</option></select>
+            <div class="linha-opt">Qualidade (passos) <input type="range" id="imgPassos" min="1" max="8" value="4"> <span id="imgPassosV">4</span></div>
+            <div class="linha-opt" id="imgForcaLinha" hidden>Quanto mudar <input type="range" id="imgForca" min="0.2" max="0.95" step="0.05" value="0.6"> <span id="imgForcaV">0.60</span></div>
+            <label title="A IA traduz o pedido para inglês e o detalha; os modelos de imagem entendem muito melhor"><input type="checkbox" id="imgMelhorar" checked> ✨ Melhorar o pedido com a IA</label>
+            <div class="sec-btn"><span id="imgModeloTxt">Modelo de imagens: verificando…</span><button class="bt-mini" id="imgBaixar" hidden>Baixar (2 GB)</button></div>
+            <div class="barra-img" id="imgBaixarBarra" hidden><i></i></div>
+          </div>
           <div class="sec">Opções</div>
           <label><input type="checkbox" id="web"> 🌐 Pesquisar na web</label>
           <label title="Guarda na memória o que descobrir pesquisando"><input type="checkbox" id="learn" checked> 📚 Aprender com as pesquisas</label>
           <label><input type="checkbox" id="speak"> 🔊 Falar as respostas</label>
         </div>
+        <div id="anexos"></div>
         <div id="modoChips"></div>
         <textarea id="txt" rows="1" placeholder="Escreva sua mensagem…"></textarea>
         <div class="linha">
           <button class="ic" id="plus" title="Modo e opções" aria-label="Modo e opções">＋</button>
+          <button class="ic" id="clipe" title="Anexar arquivos: imagens, .ino, .bin, .apk, código" aria-label="Anexar">📎</button>
+          <input type="file" id="arq" multiple hidden accept="image/*,.ino,.bin,.apk,.py,.java,.kt,.xml,.gradle,.html,.js,.css,.json,.md,.txt,.c,.cpp,.h,.ts,.sh,.yaml,.yml">
           <span class="esp"></span>
           <button class="ic" id="mic" title="Falar (clique de novo para enviar)" aria-label="Falar">🎤</button>
           <button id="stop" hidden title="Parar (Esc)" aria-label="Parar">■</button>
@@ -2395,6 +3729,8 @@ function abre(id) {
 function nova() {
   if (busy) return;
   pararVoz(); const c = conv();
+  // conversa nova começa do zero: modo Conversa, sem anexos nem item a modificar
+  anexos = []; baseMod = null; $('modo').value = 'chat'; $('modo').onchange(); $('web').checked = false; $('speak').checked = false; atualizaChips(); renderAnexos();
   if (!(c && !c.msgs.length)) { const n = novaConv(); convs.push(n); atualId = n.id; }
   document.body.classList.remove('lateral'); desenha(); txt.focus();
 }
@@ -2411,6 +3747,8 @@ const SUGESTOES = [
   ['🔌 Firmware ESP32 que pisca um LED', 'esp32', 'piscar o LED da placa a cada meio segundo e escrever na serial'],
   ['🌐 Novidades de hoje na web', 'chat', 'Quais são as principais notícias de tecnologia hoje?', true],
   ['💡 Explicar o que é o Tailscale', 'chat', 'Explique de forma simples o que é o Tailscale e para que serve'],
+  ['🎨 Criar uma imagem', 'img', 'um farol numa ilha ao pôr do sol, estilo pintura a óleo'],
+  ['🐍 Programa Python', 'python', 'um programa que renomeia todos os arquivos de uma pasta colocando a data na frente'],
 ];
 function boasVindas() {
   const d = document.createElement('div'); d.className = 'vazio'; d.id = 'vazio';
@@ -2426,6 +3764,16 @@ function boasVindas() {
 function criaMsg(m) {
   const el = document.createElement('div'); el.className = 'msg ' + m.role + (m.erro ? ' erro' : '');
   if (m.kind === 'criacao') { el.className = 'msg assistant'; el.appendChild(cartaoCriacao(m)); return el; }
+  if (m.role === 'user' && ((m.anexos && m.anexos.length) || m.modifica)) {
+    const lista = document.createElement('div'); lista.className = 'anexos-msg';
+    if (m.modifica) { const d = document.createElement('div'); d.className = 'anx base'; d.innerHTML = '<span class="ico">✏️</span><span class="nome"></span>'; d.querySelector('.nome').textContent = m.modifica; lista.appendChild(d); }
+    for (const a of m.anexos || []) {
+      const d = document.createElement('div'); d.className = 'anx';
+      if (a.tipo === 'imagem') { const im = document.createElement('img'); im.src = a.url; d.appendChild(im); } else { const i = document.createElement('span'); i.className = 'ico'; i.textContent = ICONES[a.tipo] || '📄'; d.appendChild(i); }
+      const n = document.createElement('span'); n.className = 'nome'; n.textContent = a.name; d.appendChild(n); lista.appendChild(d);
+    }
+    el.appendChild(lista);
+  }
   const corpo = document.createElement('div'); corpo.className = 'corpo'; el.appendChild(corpo);
   if (m.role === 'user') corpo.textContent = m.content; else corpo.innerHTML = mdHtml(m.content || '');
   if (m.role === 'assistant' && !m.erro && m.content) acoesMsg(el, m);
@@ -2471,6 +3819,64 @@ async function salvaMemoria(text, source) {
 }
 const TEACH = /^\s*(lembre-se|lembre|guarde|aprenda|anote)(\s+disso|\s+que)?[:,]?\s+(.{4,})/is;
 
+/* ======================= Anexos e modificação ======================= */
+let anexos = [];      // arquivos enviados e ainda não usados: {id, name, tipo, size, url, analise, entrega}
+let baseMod = null;   // item que a IA já criou e que será modificado: {id, nome, kind}
+const ICONES = {apk: '📱', bin: '🔌', ino: '🔌', imagem: '🖼️', texto: '📄', img: '🎨', web: '🌐', python: '🐍'};
+function renderAnexos() {
+  const box = $('anexos'); box.textContent = '';
+  if (baseMod) {
+    const d = document.createElement('div'); d.className = 'anx base';
+    d.innerHTML = '<span class="ico">✏️</span><span class="nome"></span><small>será modificado</small><button type="button" title="Cancelar a modificação">✕</button>';
+    d.querySelector('.nome').textContent = baseMod.nome; d.querySelector('button').onclick = () => { baseMod = null; renderAnexos(); };
+    box.appendChild(d);
+  }
+  for (const a of anexos) {
+    const d = document.createElement('div'); d.className = 'anx'; d.title = (a.analise && a.analise.resumo) || a.name;
+    if (a.tipo === 'imagem') { const im = document.createElement('img'); im.src = a.url; d.appendChild(im); }
+    else { const i = document.createElement('span'); i.className = 'ico'; i.textContent = ICONES[a.tipo] || '📄'; d.appendChild(i); }
+    const n = document.createElement('span'); n.className = 'nome'; n.textContent = a.name; const t = document.createElement('small'); t.textContent = fmtTam(a.size);
+    const x = document.createElement('button'); x.type = 'button'; x.textContent = '✕'; x.title = 'Remover';
+    x.onclick = () => { fetch('/upload/' + a.id, {method: 'DELETE'}).catch(() => {}); anexos = anexos.filter(y => y !== a); renderAnexos(); };
+    d.append(n, t, x); box.appendChild(d);
+  }
+  atualizaBotoes(); if (typeof atualizaForca === 'function') atualizaForca();
+}
+async function sobe(arquivos) {
+  for (const f of arquivos) {
+    if (f.size > 100 * 1048576) { setStatus('“' + f.name + '” passa de 100 MB.'); continue; }
+    setStatus('Enviando ' + f.name + '…');
+    try {
+      const fd = new FormData(); fd.append('arquivo', f, f.name || 'imagem.png');
+      const r = await fetch('/upload', {method: 'POST', body: fd});
+      if (!r.ok) throw new Error((await r.json()).detail || ('Servidor respondeu ' + r.status));
+      const a = await r.json(); anexos.push(a);
+      if (a.tipo === 'apk' && a.entrega) { baseMod = {id: a.entrega, nome: (a.analise && a.analise.nome) || a.name, kind: 'apk'}; setStatus('Este app foi criado aqui: dá para modificar pelo código-fonte. Escolha “App Android” e peça a mudança.'); }
+      else setStatus(a.analise && a.analise.resumo ? a.analise.resumo.split('\n')[0] : '');
+      sugereModo(a);
+    } catch (e) { setStatus('Não consegui enviar: ' + e.message); }
+  }
+  renderAnexos();
+}
+function sugereModo(a) {   // escolhe o modo mais provável para o tipo de arquivo, se ainda estiver em Conversa
+  if ($('modo').value !== 'chat') return;
+  const alvo = {ino: 'esp32', bin: null, apk: null, imagem: 'img'}[a.tipo];
+  if (alvo) { $('modo').value = alvo; $('modo').onchange(); }
+}
+$('clipe').onclick = () => $('arq').click();
+$('arq').onchange = () => { sobe([...$('arq').files]); $('arq').value = ''; };
+const caixaEl = document.querySelector('.caixa');
+['dragenter', 'dragover'].forEach(ev => caixaEl.addEventListener(ev, e => { if (e.dataTransfer && [...e.dataTransfer.types].includes('Files')) { e.preventDefault(); caixaEl.classList.add('arrastando'); } }));
+['dragleave', 'drop'].forEach(ev => caixaEl.addEventListener(ev, () => caixaEl.classList.remove('arrastando')));
+caixaEl.addEventListener('drop', e => { if (e.dataTransfer && e.dataTransfer.files.length) { e.preventDefault(); sobe([...e.dataTransfer.files]); } });
+txt.addEventListener('paste', e => { const fs = [...(e.clipboardData?.files || [])]; if (fs.length) { e.preventDefault(); sobe(fs); } });
+function modificar(item) {   // botão ✏ Modificar de um cartão ou da lista de arquivos
+  baseMod = {id: item.id, nome: item.name || item.nome, kind: item.kind};
+  const m = {apk: item.modo === 'avancado' ? 'appx' : 'app', bin: 'esp32', web: 'web', python: 'python', img: 'img'}[item.kind] || 'chat';
+  $('modo').value = m; $('modo').onchange(); renderAnexos(); document.getElementById('filesDlg').close(); txt.focus();
+  setStatus('Descreva o que mudar em “' + baseMod.nome + '”.');
+}
+
 /* ======================= Enviar mensagem ======================= */
 const historicoModelo = c => c.msgs.filter(m => !m.kind && !m.ignorar && m.content).map(m => ({role: m.role, content: m.content}));
 function mensagemAmigavel(e) {
@@ -2479,16 +3885,20 @@ function mensagemAmigavel(e) {
 }
 async function send(text) {
   text = (text || '').trim();
-  if (!text || busy) return;
+  if ((!text && !podeEnviarVazio()) || busy) return;
+  if (!text) text = '(compilar o sketch anexado como está)';
   pararVoz(); busy = true; atualizaBotoes();
   txt.value = ''; autoAltura(); setStatus('');
   let c = conv(); if (!c) { c = novaConv(); convs.push(c); atualId = c.id; }
   if (!c.titulo) c.titulo = text.length > 42 ? text.slice(0, 42) + '…' : text;
   c.t = Date.now();
-  const mu = {role: 'user', content: text}; c.msgs.push(mu);
+  const usados = anexos.slice(), base = baseMod;
+  const mu = {role: 'user', content: text, anexos: usados.map(a => ({name: a.name, tipo: a.tipo, url: a.url, size: a.size}))};
+  if (base) mu.modifica = base.nome;
+  c.msgs.push(mu); anexos = []; baseMod = null; renderAnexos();
   tiraBoasVindas(); coluna.appendChild(criaMsg(mu)); $('titulo').textContent = c.titulo; desceFim(true);
   try {
-    if ($('modo').value !== 'chat') { await criarArquivo($('modo').value, text, c); return; }
+    if ($('modo').value !== 'chat') { await criarArquivo($('modo').value, text, c, usados, base); return; }
     const historico = historicoModelo(c);
     const teach = text.match(TEACH);
     if (teach) { try { await salvaMemoria(teach[3].trim(), 'usuario'); } catch (e) {} }
@@ -2500,7 +3910,7 @@ async function send(text) {
     try {
       ctrl = new AbortController();
       const r = await fetch('/chat', {method: 'POST', headers: {'Content-Type': 'application/json'}, signal: ctrl.signal,
-        body: JSON.stringify({messages: historico.slice(-14), web: wantWeb})});
+        body: JSON.stringify({messages: historico.slice(-14), web: wantWeb, anexos: usados.map(a => a.id)})});
       if (!r.ok) throw new Error('Servidor respondeu ' + r.status);
       webResults = parseInt(r.headers.get('X-Web-Results') || '0', 10);
       const reader = r.body.getReader(), dec = new TextDecoder(); let buf = '';
@@ -2621,10 +4031,12 @@ function parar() {
 }
 $('stop').onclick = parar;
 document.addEventListener('keydown', e => { if (e.key === 'Escape') { fechaMenus(); parar(); } });
+// no modo ESP32, um .ino anexado (ou um firmware a modificar) pode ser compilado mesmo sem texto
+function podeEnviarVazio() { return $('modo').value === 'esp32' && (anexos.some(a => a.tipo === 'ino') || (baseMod && baseMod.kind === 'bin')); }
 function atualizaBotoes() {
   const ativo = busy || falando || !!rec || gravandoNativo;
   $('stop').hidden = !ativo; $('send').hidden = busy;
-  $('send').disabled = !txt.value.trim();
+  $('send').disabled = !txt.value.trim() && !podeEnviarVazio();
 }
 setInterval(atualizaBotoes, 300);
 
@@ -2642,18 +4054,38 @@ document.addEventListener('click', e => { if (!e.target.closest('.menu')) fechaM
 $('menuBtn').onclick = () => document.body.classList.add('lateral');
 $('fundo').onclick = () => document.body.classList.remove('lateral');
 
-const PLACEHOLDERS = {chat: 'Escreva sua mensagem…', app: 'Descreva o app que você quer criar (ex.: lista de compras)…', esp32: 'Descreva o firmware (ex.: ligar um LED por uma página no Wi-Fi)…'};
+const PLACEHOLDERS = {
+  chat: 'Escreva sua mensagem…', app: 'Descreva o app (ex.: lista de compras)… ou anexe um app para modificar',
+  appx: 'Descreva o app com várias telas (ex.: agenda com lista e detalhes)…', esp32: 'Descreva o firmware… ou anexe um .ino para modificar/compilar',
+  web: 'Descreva a página ou o sistema web (ex.: calculadora de gorjeta)…', python: 'Descreva o programa Python (ex.: renomear arquivos em lote)…',
+  img: 'Descreva a imagem… ou anexe uma imagem para modificar'};
+const ROTULOS_MODO = {app: '📱 App Android rápido', appx: '📱 App Android avançado', esp32: '🔌 Firmware ESP32', web: '🌐 Página web', python: '🐍 Python', img: '🎨 Imagem'};
 function atualizaChips() {
   const box = $('modoChips'); box.textContent = '';
   const m = $('modo').value;
   const add = t => { const s = document.createElement('span'); s.textContent = t; box.appendChild(s); };
-  if (m === 'app') add('📱 Criar app Android'); if (m === 'esp32') add('🔌 Criar firmware ESP32');
+  if (ROTULOS_MODO[m]) add(ROTULOS_MODO[m]);
   if ($('web').checked) add('🌐 Web'); if ($('speak').checked) add('🔊 Voz');
   txt.placeholder = PLACEHOLDERS[m];
 }
 for (const id of ['web', 'speak', 'learn']) $(id).onchange = atualizaChips;
+function atualizaForca() { $('imgForcaLinha').hidden = !(anexos.some(a => a.tipo === 'imagem') || (baseMod && baseMod.kind === 'img')); }
+$('imgPassos').oninput = () => $('imgPassosV').textContent = $('imgPassos').value;
+$('imgForca').oninput = () => $('imgForcaV').textContent = parseFloat($('imgForca').value).toFixed(2);
+let imgTimer = null;
+async function checaModeloImagem() {
+  try {
+    const e = await (await fetch('/imagem/modelo')).json();
+    $('imgModeloTxt').textContent = !e.motor ? 'Motor de imagens não instalado (rode: bash atualizar.sh)' : e.presente ? 'Modelo de imagens pronto ✓' : e.baixando ? 'Baixando o modelo… ' + Math.round(e.progresso * 100) + '%' : 'Falta o modelo de imagens (2 GB)';
+    $('imgBaixar').hidden = !(e.motor && !e.presente && !e.baixando); $('imgBaixarBarra').hidden = !e.baixando;
+    if (e.baixando) $('imgBaixarBarra').firstChild.style.width = Math.round(e.progresso * 100) + '%';
+    if (e.baixando && !imgTimer) imgTimer = setInterval(checaModeloImagem, 2500); if (!e.baixando && imgTimer) { clearInterval(imgTimer); imgTimer = null; }
+  } catch (e) {}
+}
+$('imgBaixar').onclick = async () => { await fetch('/imagem/modelo', {method: 'POST'}); checaModeloImagem(); };
 $('modo').onchange = async () => {
-  const m = $('modo').value; $('placa').hidden = m !== 'esp32'; atualizaChips();
+  const m = $('modo').value; $('placa').hidden = m !== 'esp32'; $('imgOpts').hidden = m !== 'img'; atualizaChips(); atualizaForca();
+  if (m === 'img') checaModeloImagem();
   if (m === 'esp32' && !$('placa').options.length) {
     try { for (const b of await (await fetch('/boards')).json()) { const o = document.createElement('option'); o.value = b.id; o.textContent = b.label; $('placa').appendChild(o); } } catch (e) {}
   }
@@ -2675,22 +4107,41 @@ function cartaoCriacao(m) {
   const k = m.criacao, d = document.createElement('div'); d.className = 'cartao' + (k.erro ? ' erro' : '');
   const st = document.createElement('div'); st.className = 'st'; st.textContent = k.status; d.appendChild(st);
   if (k.codigo) { const det = document.createElement('details'), sm = document.createElement('summary'), pre = document.createElement('pre'); sm.textContent = 'Ver o código que a IA escreveu'; pre.textContent = k.codigo; det.append(sm, pre); d.appendChild(det); }
+  if (k.preview) { const im = document.createElement('img'); im.className = 'miniatura'; im.src = k.preview; im.alt = 'Imagem criada'; d.appendChild(im); }
   for (const f of k.files || []) d.appendChild(linkArquivo(f));
+  if (k.passo) { const b = document.createElement('div'); b.className = 'barra-img'; b.innerHTML = '<i></i>'; b.firstChild.style.width = Math.round(100 * k.passo[0] / k.passo[1]) + '%'; d.appendChild(b); }
+  if (k.id && !k.erro && (k.files || []).length) {
+    const ac = document.createElement('div'); ac.className = 'acoes-cartao';
+    const mb = document.createElement('button'); mb.textContent = '✏ Modificar'; mb.onclick = () => modificar({id: k.id, name: k.nome, kind: k.kind, modo: k.modo}); ac.appendChild(mb);
+    if (k.kind === 'img' && k.descricao) { const ob = document.createElement('button'); ob.textContent = '↻ Outra versão'; ob.onclick = () => { $('modo').value = 'img'; $('modo').onchange(); txt.value = k.descricao; autoAltura(); send(txt.value); }; ac.appendChild(ob); }
+    d.appendChild(ac);
+  }
   if (k.nota) { const n = document.createElement('div'); n.className = 'dica'; n.textContent = k.nota; d.appendChild(n); }
   if (k.log) { const det = document.createElement('details'), sm = document.createElement('summary'), pre = document.createElement('pre'); sm.textContent = 'Ver os erros'; pre.textContent = k.log; det.append(sm, pre); d.appendChild(det); }
   return d;
 }
-async function criarArquivo(tipo, desc, c) {
-  const rotulo = tipo === 'app' ? 'app' : 'firmware';
-  const m = {role: 'assistant', kind: 'criacao', ignorar: true, criacao: {status: '⏳ Enviando o pedido…'}}; c.msgs.push(m);
+async function criarArquivo(tipo, desc, c, usados, base) {
+  usados = usados || []; const rotulo = {app: 'app', appx: 'app', esp32: 'firmware', web: 'página web', python: 'programa', img: 'imagem'}[tipo];
+  const m = {role: 'assistant', kind: 'criacao', ignorar: true, criacao: {status: '⏳ Enviando o pedido…', descricao: desc}}; c.msgs.push(m);
   let atual = criaMsg(m); coluna.appendChild(atual); desceFim(true);
   const k = m.criacao, att = () => { const n = criaMsg(m); atual.replaceWith(n); atual = n; desceFim(false); };
-  setStatus(`Criando o ${rotulo}… (■ cancela)`); let terminou = false;
+  // o que será usado como base: um item já criado (✏) ou um arquivo anexado
+  const body = {description: desc === '(compilar o sketch anexado como está)' ? '' : desc, board: $('placa').value || 'esp32'};
+  if (base) body.base_entrega = base.id;
+  else {
+    const preferido = {esp32: ['ino'], app: ['texto'], appx: ['texto'], web: ['texto'], python: ['texto'], img: ['imagem']}[tipo] || [];
+    const a = usados.find(x => preferido.includes(x.tipo)); if (a) body.base_upload = a.id;
+  }
+  let rota = '/app/generate';
+  if (tipo === 'appx') body.avancado = true;
+  else if (tipo === 'esp32') rota = '/esp32/generate';
+  else if (tipo === 'web' || tipo === 'python') { rota = '/codigo/generate'; body.alvo = tipo; }
+  else if (tipo === 'img') { rota = '/imagem/generate'; body.tamanho = $('imgTam').value; body.passos = parseInt($('imgPassos').value, 10); body.forca = parseFloat($('imgForca').value); body.melhorar = $('imgMelhorar').checked; }
+  setStatus(`Criando: ${rotulo}… (■ cancela)`); let terminou = false;
   try {
     ctrl = new AbortController();
-    const r = await fetch(tipo === 'app' ? '/app/generate' : '/esp32/generate', {method: 'POST', headers: {'Content-Type': 'application/json'}, signal: ctrl.signal,
-      body: JSON.stringify({description: desc, board: $('placa').value || 'esp32'})});
-    if (!r.ok) throw new Error('Servidor respondeu ' + r.status);
+    const r = await fetch(rota, {method: 'POST', headers: {'Content-Type': 'application/json'}, signal: ctrl.signal, body: JSON.stringify(body)});
+    if (!r.ok) throw new Error(r.status === 400 || r.status === 404 ? (await r.json()).detail : 'Servidor respondeu ' + r.status);
     const reader = r.body.getReader(), dec = new TextDecoder(); let buf = '';
     for (;;) {
       const {value, done} = await reader.read(); if (done) break;
@@ -2700,15 +4151,19 @@ async function criarArquivo(tipo, desc, c) {
         if (!ln.startsWith('data:')) continue;
         const ev = JSON.parse(ln.slice(5).trim());
         if (ev.type === 'status') { k.status = '⏳ ' + ev.msg; att(); }
+        else if (ev.type === 'passo') { k.passo = [ev.passo, ev.total]; k.status = `⏳ Gerando a imagem… passo ${ev.passo} de ${ev.total}`; att(); }
         else if (ev.type === 'progress') setStatus(`A IA já escreveu ${ev.tokens} pedaços de código… (■ cancela)`);
         else if (ev.type === 'code') { k.codigo = ev.text; att(); }
-        else if (ev.type === 'done') { terminou = true; k.status = `✅ "${ev.name}" pronto!`; k.files = ev.files; k.nota = ev.note; att(); }
-        else if (ev.type === 'error') { terminou = true; k.erro = true; k.status = '⚠ ' + ev.msg; k.log = ev.log; att(); }
+        else if (ev.type === 'done') { terminou = true; k.passo = null; k.status = `✅ "${ev.name}" pronto!`; k.files = ev.files; k.nota = ev.note; k.preview = ev.preview; k.id = ev.id; k.nome = ev.name; k.kind = ev.kind; k.modo = tipo === 'appx' ? 'avancado' : undefined; att(); }
+        else if (ev.type === 'error') {
+          terminou = true; k.passo = null; k.erro = true; k.status = '⚠ ' + ev.msg; k.log = ev.log; att();
+          if (ev.precisa_modelo) { $('plusMenu').hidden = false; checaModeloImagem(); }
+        }
       }
     }
-    if (!terminou) { k.erro = true; k.status = `⚠ A conexão terminou antes do ${rotulo} ficar pronto.`; att(); }
+    if (!terminou) { k.erro = true; k.status = `⚠ A conexão terminou antes de ficar pronto.`; att(); }
   } catch (e) {
-    if (e.name === 'AbortError') k.status = `⏹ Criação do ${rotulo} cancelada por você.`;
+    if (e.name === 'AbortError') k.status = `⏹ Criação cancelada por você.`;
     else { k.erro = true; k.status = '⚠ ' + mensagemAmigavel(e); }
     att();
   } finally { setStatus(''); }
@@ -2742,9 +4197,13 @@ async function carregaArquivos() {
   box.textContent = itens.length ? '' : 'Ainda não há nenhum arquivo criado.';
   for (const it of itens) {
     const row = document.createElement('div'); row.className = 'item-l'; row.style.flexDirection = 'column';
-    const t = document.createElement('div'); t.textContent = (it.kind === 'apk' ? '📱 ' : '🔌 ') + it.name;
+    const t = document.createElement('div'); t.textContent = (ICONES[it.kind === 'bin' ? 'bin' : it.kind] || '📄') + ' ' + it.name;
     const sm = document.createElement('small'); sm.textContent = it.description + ' · ' + new Date(it.created * 1000).toLocaleDateString('pt-BR');
-    row.append(t, sm); for (const f of it.files) row.appendChild(linkArquivo(f)); box.appendChild(row);
+    row.append(t, sm);
+    if (it.kind === 'img') { const im = document.createElement('img'); im.className = 'miniatura'; im.src = it.files[0].url; row.appendChild(im); }
+    for (const f of it.files) row.appendChild(linkArquivo(f));
+    if (it.editavel) { const ac = document.createElement('div'); ac.className = 'acoes-cartao'; const mb = document.createElement('button'); mb.textContent = '✏ Modificar'; mb.onclick = () => modificar(it); ac.appendChild(mb); row.appendChild(ac); }
+    box.appendChild(row);
   }
 }
 $('filesBtn').onclick = () => { abreDlg('filesDlg'); carregaArquivos(); };
@@ -2884,11 +4343,27 @@ EOF
 #!/usr/bin/env bash
 # Inicia o modelo de IA. O perfil (arquivo do modelo e camadas na placa) pode ser trocado pela
 # tela do IA Local (Configurações > Modelo de IA); a escolha fica em ~/localai/modelo.env.
-# NGL = camadas na GPU. Com 2 GB de VRAM ajuste de 2 em 2 olhando o nvidia-smi:
-# perto de 1800 MiB é o limite (7B: comece em 4; 3B: em 16).
-NGL="${NGL:-__NGL__}"
+# NGL = camadas na GPU: "auto" (padrão) calcula pela VRAM livre; ou um número fixo (ex.: NGL=4).
+NGL="${NGL:-auto}"
 MODEL="${MODEL:-$HOME/models/__MODEL__}"
 [ -f "$HOME/localai/modelo.env" ] && . "$HOME/localai/modelo.env"
+
+# NGL=auto: calcula quantas camadas cabem na placa pela VRAM LIVRE agora, deixando folga para as contas
+# do modelo e para a tela (RESERVA_VRAM, em MiB). Assim a placa é aproveitada ao máximo sem estourar.
+if [ "$NGL" = "auto" ]; then
+  LIVRE=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -dc '0-9')
+  TAM=$(( $(stat -c %s "$MODEL" 2>/dev/null || echo 0) / 1048576 ))
+  case "$MODEL" in *14B*|*14b*) CAMADAS=48 ;; *3B*|*3b*) CAMADAS=36 ;; *7B*|*7b*|*1.5B*) CAMADAS=28 ;; *) CAMADAS=32 ;; esac
+  if [ -n "$LIVRE" ] && [ "$LIVRE" -gt 0 ] && [ "$TAM" -gt 0 ]; then
+    POR_CAMADA=$(( TAM / CAMADAS + 1 ))
+    NGL=$(( (LIVRE - ${RESERVA_VRAM:-1000}) / POR_CAMADA ))
+    [ "$NGL" -lt 0 ] && NGL=0
+    [ "$NGL" -gt "$CAMADAS" ] && NGL=$CAMADAS
+  else
+    NGL=0
+  fi
+  echo "[start_llm] camadas na placa (automático): $NGL | VRAM livre: ${LIVRE:-?} MiB | camadas do modelo: $CAMADAS"
+fi
 
 BIN="$HOME/llama.cpp/build/bin/llama-server"
 AJUDA="$("$BIN" --help 2>&1)"
@@ -2942,6 +4417,23 @@ instalar_esp32() {
   "$CLI" config init >/dev/null 2>&1 || true
   "$CLI" config add board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
   "$CLI" core update-index && "$CLI" core install esp32:esp32
+}
+
+# ------------------------------------------------ gerador de imagens (stable-diffusion.cpp)
+instalar_imagens() {
+  if "$SRV/.venv/bin/python" -c "import stable_diffusion_cpp" 2>/dev/null; then
+    echo "Motor de imagens já instalado."; return 0
+  fi
+  echo "==> Motor de imagens (stable-diffusion.cpp). Compila com suporte à placa de vídeo; demora de 10 a 25 minutos."
+  local PIP="$SRV/.venv/bin/pip"
+  if [ -x "$CUDA_DIR/bin/nvcc" ] && PATH="$CUDA_DIR/bin:$PATH" CUDACXX="$CUDA_DIR/bin/nvcc" \
+       CMAKE_ARGS="-DSD_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=52 -DCMAKE_CUDA_COMPILER=$CUDA_DIR/bin/nvcc" \
+       "$PIP" install --no-cache-dir stable-diffusion-cpp-python; then
+    echo "Motor de imagens instalado COM suporte à placa de vídeo."
+  else
+    echo "AVISO: a versão com placa de vídeo não compilou; instalando a versão só de CPU (funciona, mais lenta)."
+    "$PIP" install --no-cache-dir stable-diffusion-cpp-python || return 1
+  fi
 }
 
 # ---------------------------------------------------- Tailscale (acesso de qualquer lugar)
@@ -3120,20 +4612,21 @@ UNIT
   sudo systemctl try-restart localai-llm.service localai-server.service || true  # só se já estiverem ativos
 }
 
-step "1/14 Pacotes"                  instalar_pacotes
-step "2/14 Driver NVIDIA 580"        instalar_driver
-step "3/14 CUDA 12.6"                instalar_cuda
-step "4/14 Telemetria e GPU"         instalar_telemetria
-step "5/14 Servidor"                 instalar_servidor
-step "6/14 Android SDK"              instalar_android_sdk
-step "7/14 Gradle (compila apps)"    instalar_gradle
-step "8/14 ESP32 (compila firmware)" instalar_esp32
-step "9/14 llama.cpp + modelo"       instalar_llama
-step "10/14 Voz (ouvir e falar)"     instalar_voz
-step "11/14 Tailscale (automático)"  instalar_tailscale
-step "12/14 Serviços automáticos"    instalar_servicos
-step "13/14 Desempenho e ventoinhas" instalar_desempenho
-step "14/14 Atalho na área de trabalho" instalar_atalho
+step "1/15 Pacotes"                  instalar_pacotes
+step "2/15 Driver NVIDIA 580"        instalar_driver
+step "3/15 CUDA 12.6"                instalar_cuda
+step "4/15 Telemetria e GPU"         instalar_telemetria
+step "5/15 Servidor"                 instalar_servidor
+step "6/15 Android SDK"              instalar_android_sdk
+step "7/15 Gradle (compila apps)"    instalar_gradle
+step "8/15 ESP32 (compila firmware)" instalar_esp32
+step "9/15 llama.cpp + modelo"       instalar_llama
+step "10/15 Voz (ouvir e falar)"     instalar_voz
+step "11/15 Gerador de imagens"      instalar_imagens
+step "12/15 Tailscale (automático)"  instalar_tailscale
+step "13/15 Serviços automáticos"    instalar_servicos
+step "14/15 Desempenho e ventoinhas" instalar_desempenho
+step "15/15 Atalho na área de trabalho" instalar_atalho
 
 echo
 echo "=============================================================="

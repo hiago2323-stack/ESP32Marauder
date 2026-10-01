@@ -151,6 +151,25 @@
   .copia { font:13px var(--mono); word-break:break-all; background:var(--bg); border:1px solid var(--line); border-radius:10px; padding:7px 10px; margin:5px 0; }
   table.sis { width:100%; border-collapse:collapse; font-size:14px; margin-top:10px; } table.sis td { padding:6px 4px; border-bottom:1px solid var(--line); } table.sis td:last-child { text-align:right; font-variant-numeric:tabular-nums; }
 
+  /* anexos e imagens */
+  #anexos { display:flex; gap:8px; flex-wrap:wrap; padding:0 4px 8px; } #anexos:empty { display:none; }
+  .anx { display:flex; align-items:center; gap:8px; max-width:100%; background:var(--user); border:1px solid var(--line); border-radius:12px; padding:5px 8px; font-size:13px; }
+  .anx img { width:34px; height:34px; object-fit:cover; border-radius:8px; }
+  .anx .ico { font-size:20px; } .anx .nome { max-width:180px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .anx small { color:var(--mut); } .anx button { border:0; background:none; color:var(--mut); padding:0 4px; font-size:15px; }
+  .anx button:hover { color:var(--err); }
+  .anx.base { background:var(--acc-soft); border-color:var(--acc); }
+  .msg.user .anexos-msg { display:flex; gap:6px; flex-wrap:wrap; justify-content:flex-end; margin-bottom:4px; max-width:85%; }
+  .msg.user .anexos-msg .anx { background:var(--card); }
+  .miniatura { max-width:min(100%,420px); width:100%; border-radius:14px; border:1px solid var(--line); margin-top:10px; display:block; background:var(--code); }
+  .acoes-cartao { display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; }
+  .acoes-cartao button, .bt-mini { border:1px solid var(--line); background:var(--card); border-radius:10px; padding:7px 12px; font-size:13.5px; }
+  .acoes-cartao button:hover, .bt-mini:hover { border-color:var(--acc); color:var(--acc); }
+  .caixa.arrastando { border-color:var(--acc); background:var(--acc-soft); }
+  #imgOpts { padding:2px 10px 6px; } #imgOpts label { padding:5px 0; } #imgOpts .linha-opt { display:flex; align-items:center; gap:8px; font-size:13px; color:var(--mut); }
+  #imgOpts input[type=range] { flex:1; }
+  .barra-img { height:6px; background:var(--line); border-radius:99px; overflow:hidden; margin-top:8px; } .barra-img i { display:block; height:100%; background:var(--acc); width:0; transition:width .5s; }
+  .sec-btn { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:6px 10px; font-size:13px; color:var(--mut); }
   /* ---------- celular ---------- */
   @media (max-width: 860px) {
     #side { position:fixed; inset:0 auto 0 0; width:min(300px,86vw); transform:translateX(-102%); transition:transform .22s; box-shadow:none; }
@@ -203,19 +222,34 @@
           <div class="sec">O que você quer fazer?</div>
           <select id="modo">
             <option value="chat">💬 Conversa</option>
-            <option value="app">📱 Criar app Android (.apk)</option>
-            <option value="esp32">🔌 Criar firmware ESP32 (.bin)</option>
+            <option value="app">📱 App Android rápido (1 arquivo)</option>
+            <option value="appx">📱 App Android avançado (vários arquivos)</option>
+            <option value="esp32">🔌 Firmware ESP32 (.ino / .bin)</option>
+            <option value="web">🌐 Página web</option>
+            <option value="python">🐍 Programa Python</option>
+            <option value="img">🎨 Criar ou modificar imagem</option>
           </select>
           <select id="placa" hidden></select>
+          <div id="imgOpts" hidden>
+            <select id="imgTam"><option value="512x512">Quadrada 512×512</option><option value="512x768">Em pé 512×768</option><option value="768x512">Deitada 768×512</option></select>
+            <div class="linha-opt">Qualidade (passos) <input type="range" id="imgPassos" min="1" max="8" value="4"> <span id="imgPassosV">4</span></div>
+            <div class="linha-opt" id="imgForcaLinha" hidden>Quanto mudar <input type="range" id="imgForca" min="0.2" max="0.95" step="0.05" value="0.6"> <span id="imgForcaV">0.60</span></div>
+            <label title="A IA traduz o pedido para inglês e o detalha; os modelos de imagem entendem muito melhor"><input type="checkbox" id="imgMelhorar" checked> ✨ Melhorar o pedido com a IA</label>
+            <div class="sec-btn"><span id="imgModeloTxt">Modelo de imagens: verificando…</span><button class="bt-mini" id="imgBaixar" hidden>Baixar (2 GB)</button></div>
+            <div class="barra-img" id="imgBaixarBarra" hidden><i></i></div>
+          </div>
           <div class="sec">Opções</div>
           <label><input type="checkbox" id="web"> 🌐 Pesquisar na web</label>
           <label title="Guarda na memória o que descobrir pesquisando"><input type="checkbox" id="learn" checked> 📚 Aprender com as pesquisas</label>
           <label><input type="checkbox" id="speak"> 🔊 Falar as respostas</label>
         </div>
+        <div id="anexos"></div>
         <div id="modoChips"></div>
         <textarea id="txt" rows="1" placeholder="Escreva sua mensagem…"></textarea>
         <div class="linha">
           <button class="ic" id="plus" title="Modo e opções" aria-label="Modo e opções">＋</button>
+          <button class="ic" id="clipe" title="Anexar arquivos: imagens, .ino, .bin, .apk, código" aria-label="Anexar">📎</button>
+          <input type="file" id="arq" multiple hidden accept="image/*,.ino,.bin,.apk,.py,.java,.kt,.xml,.gradle,.html,.js,.css,.json,.md,.txt,.c,.cpp,.h,.ts,.sh,.yaml,.yml">
           <span class="esp"></span>
           <button class="ic" id="mic" title="Falar (clique de novo para enviar)" aria-label="Falar">🎤</button>
           <button id="stop" hidden title="Parar (Esc)" aria-label="Parar">■</button>
@@ -365,6 +399,8 @@ function abre(id) {
 function nova() {
   if (busy) return;
   pararVoz(); const c = conv();
+  // conversa nova começa do zero: modo Conversa, sem anexos nem item a modificar
+  anexos = []; baseMod = null; $('modo').value = 'chat'; $('modo').onchange(); $('web').checked = false; $('speak').checked = false; atualizaChips(); renderAnexos();
   if (!(c && !c.msgs.length)) { const n = novaConv(); convs.push(n); atualId = n.id; }
   document.body.classList.remove('lateral'); desenha(); txt.focus();
 }
@@ -381,6 +417,8 @@ const SUGESTOES = [
   ['🔌 Firmware ESP32 que pisca um LED', 'esp32', 'piscar o LED da placa a cada meio segundo e escrever na serial'],
   ['🌐 Novidades de hoje na web', 'chat', 'Quais são as principais notícias de tecnologia hoje?', true],
   ['💡 Explicar o que é o Tailscale', 'chat', 'Explique de forma simples o que é o Tailscale e para que serve'],
+  ['🎨 Criar uma imagem', 'img', 'um farol numa ilha ao pôr do sol, estilo pintura a óleo'],
+  ['🐍 Programa Python', 'python', 'um programa que renomeia todos os arquivos de uma pasta colocando a data na frente'],
 ];
 function boasVindas() {
   const d = document.createElement('div'); d.className = 'vazio'; d.id = 'vazio';
@@ -396,6 +434,16 @@ function boasVindas() {
 function criaMsg(m) {
   const el = document.createElement('div'); el.className = 'msg ' + m.role + (m.erro ? ' erro' : '');
   if (m.kind === 'criacao') { el.className = 'msg assistant'; el.appendChild(cartaoCriacao(m)); return el; }
+  if (m.role === 'user' && ((m.anexos && m.anexos.length) || m.modifica)) {
+    const lista = document.createElement('div'); lista.className = 'anexos-msg';
+    if (m.modifica) { const d = document.createElement('div'); d.className = 'anx base'; d.innerHTML = '<span class="ico">✏️</span><span class="nome"></span>'; d.querySelector('.nome').textContent = m.modifica; lista.appendChild(d); }
+    for (const a of m.anexos || []) {
+      const d = document.createElement('div'); d.className = 'anx';
+      if (a.tipo === 'imagem') { const im = document.createElement('img'); im.src = a.url; d.appendChild(im); } else { const i = document.createElement('span'); i.className = 'ico'; i.textContent = ICONES[a.tipo] || '📄'; d.appendChild(i); }
+      const n = document.createElement('span'); n.className = 'nome'; n.textContent = a.name; d.appendChild(n); lista.appendChild(d);
+    }
+    el.appendChild(lista);
+  }
   const corpo = document.createElement('div'); corpo.className = 'corpo'; el.appendChild(corpo);
   if (m.role === 'user') corpo.textContent = m.content; else corpo.innerHTML = mdHtml(m.content || '');
   if (m.role === 'assistant' && !m.erro && m.content) acoesMsg(el, m);
@@ -441,6 +489,64 @@ async function salvaMemoria(text, source) {
 }
 const TEACH = /^\s*(lembre-se|lembre|guarde|aprenda|anote)(\s+disso|\s+que)?[:,]?\s+(.{4,})/is;
 
+/* ======================= Anexos e modificação ======================= */
+let anexos = [];      // arquivos enviados e ainda não usados: {id, name, tipo, size, url, analise, entrega}
+let baseMod = null;   // item que a IA já criou e que será modificado: {id, nome, kind}
+const ICONES = {apk: '📱', bin: '🔌', ino: '🔌', imagem: '🖼️', texto: '📄', img: '🎨', web: '🌐', python: '🐍'};
+function renderAnexos() {
+  const box = $('anexos'); box.textContent = '';
+  if (baseMod) {
+    const d = document.createElement('div'); d.className = 'anx base';
+    d.innerHTML = '<span class="ico">✏️</span><span class="nome"></span><small>será modificado</small><button type="button" title="Cancelar a modificação">✕</button>';
+    d.querySelector('.nome').textContent = baseMod.nome; d.querySelector('button').onclick = () => { baseMod = null; renderAnexos(); };
+    box.appendChild(d);
+  }
+  for (const a of anexos) {
+    const d = document.createElement('div'); d.className = 'anx'; d.title = (a.analise && a.analise.resumo) || a.name;
+    if (a.tipo === 'imagem') { const im = document.createElement('img'); im.src = a.url; d.appendChild(im); }
+    else { const i = document.createElement('span'); i.className = 'ico'; i.textContent = ICONES[a.tipo] || '📄'; d.appendChild(i); }
+    const n = document.createElement('span'); n.className = 'nome'; n.textContent = a.name; const t = document.createElement('small'); t.textContent = fmtTam(a.size);
+    const x = document.createElement('button'); x.type = 'button'; x.textContent = '✕'; x.title = 'Remover';
+    x.onclick = () => { fetch('/upload/' + a.id, {method: 'DELETE'}).catch(() => {}); anexos = anexos.filter(y => y !== a); renderAnexos(); };
+    d.append(n, t, x); box.appendChild(d);
+  }
+  atualizaBotoes(); if (typeof atualizaForca === 'function') atualizaForca();
+}
+async function sobe(arquivos) {
+  for (const f of arquivos) {
+    if (f.size > 100 * 1048576) { setStatus('“' + f.name + '” passa de 100 MB.'); continue; }
+    setStatus('Enviando ' + f.name + '…');
+    try {
+      const fd = new FormData(); fd.append('arquivo', f, f.name || 'imagem.png');
+      const r = await fetch('/upload', {method: 'POST', body: fd});
+      if (!r.ok) throw new Error((await r.json()).detail || ('Servidor respondeu ' + r.status));
+      const a = await r.json(); anexos.push(a);
+      if (a.tipo === 'apk' && a.entrega) { baseMod = {id: a.entrega, nome: (a.analise && a.analise.nome) || a.name, kind: 'apk'}; setStatus('Este app foi criado aqui: dá para modificar pelo código-fonte. Escolha “App Android” e peça a mudança.'); }
+      else setStatus(a.analise && a.analise.resumo ? a.analise.resumo.split('\n')[0] : '');
+      sugereModo(a);
+    } catch (e) { setStatus('Não consegui enviar: ' + e.message); }
+  }
+  renderAnexos();
+}
+function sugereModo(a) {   // escolhe o modo mais provável para o tipo de arquivo, se ainda estiver em Conversa
+  if ($('modo').value !== 'chat') return;
+  const alvo = {ino: 'esp32', bin: null, apk: null, imagem: 'img'}[a.tipo];
+  if (alvo) { $('modo').value = alvo; $('modo').onchange(); }
+}
+$('clipe').onclick = () => $('arq').click();
+$('arq').onchange = () => { sobe([...$('arq').files]); $('arq').value = ''; };
+const caixaEl = document.querySelector('.caixa');
+['dragenter', 'dragover'].forEach(ev => caixaEl.addEventListener(ev, e => { if (e.dataTransfer && [...e.dataTransfer.types].includes('Files')) { e.preventDefault(); caixaEl.classList.add('arrastando'); } }));
+['dragleave', 'drop'].forEach(ev => caixaEl.addEventListener(ev, () => caixaEl.classList.remove('arrastando')));
+caixaEl.addEventListener('drop', e => { if (e.dataTransfer && e.dataTransfer.files.length) { e.preventDefault(); sobe([...e.dataTransfer.files]); } });
+txt.addEventListener('paste', e => { const fs = [...(e.clipboardData?.files || [])]; if (fs.length) { e.preventDefault(); sobe(fs); } });
+function modificar(item) {   // botão ✏ Modificar de um cartão ou da lista de arquivos
+  baseMod = {id: item.id, nome: item.name || item.nome, kind: item.kind};
+  const m = {apk: item.modo === 'avancado' ? 'appx' : 'app', bin: 'esp32', web: 'web', python: 'python', img: 'img'}[item.kind] || 'chat';
+  $('modo').value = m; $('modo').onchange(); renderAnexos(); document.getElementById('filesDlg').close(); txt.focus();
+  setStatus('Descreva o que mudar em “' + baseMod.nome + '”.');
+}
+
 /* ======================= Enviar mensagem ======================= */
 const historicoModelo = c => c.msgs.filter(m => !m.kind && !m.ignorar && m.content).map(m => ({role: m.role, content: m.content}));
 function mensagemAmigavel(e) {
@@ -449,16 +555,20 @@ function mensagemAmigavel(e) {
 }
 async function send(text) {
   text = (text || '').trim();
-  if (!text || busy) return;
+  if ((!text && !podeEnviarVazio()) || busy) return;
+  if (!text) text = '(compilar o sketch anexado como está)';
   pararVoz(); busy = true; atualizaBotoes();
   txt.value = ''; autoAltura(); setStatus('');
   let c = conv(); if (!c) { c = novaConv(); convs.push(c); atualId = c.id; }
   if (!c.titulo) c.titulo = text.length > 42 ? text.slice(0, 42) + '…' : text;
   c.t = Date.now();
-  const mu = {role: 'user', content: text}; c.msgs.push(mu);
+  const usados = anexos.slice(), base = baseMod;
+  const mu = {role: 'user', content: text, anexos: usados.map(a => ({name: a.name, tipo: a.tipo, url: a.url, size: a.size}))};
+  if (base) mu.modifica = base.nome;
+  c.msgs.push(mu); anexos = []; baseMod = null; renderAnexos();
   tiraBoasVindas(); coluna.appendChild(criaMsg(mu)); $('titulo').textContent = c.titulo; desceFim(true);
   try {
-    if ($('modo').value !== 'chat') { await criarArquivo($('modo').value, text, c); return; }
+    if ($('modo').value !== 'chat') { await criarArquivo($('modo').value, text, c, usados, base); return; }
     const historico = historicoModelo(c);
     const teach = text.match(TEACH);
     if (teach) { try { await salvaMemoria(teach[3].trim(), 'usuario'); } catch (e) {} }
@@ -470,7 +580,7 @@ async function send(text) {
     try {
       ctrl = new AbortController();
       const r = await fetch('/chat', {method: 'POST', headers: {'Content-Type': 'application/json'}, signal: ctrl.signal,
-        body: JSON.stringify({messages: historico.slice(-14), web: wantWeb})});
+        body: JSON.stringify({messages: historico.slice(-14), web: wantWeb, anexos: usados.map(a => a.id)})});
       if (!r.ok) throw new Error('Servidor respondeu ' + r.status);
       webResults = parseInt(r.headers.get('X-Web-Results') || '0', 10);
       const reader = r.body.getReader(), dec = new TextDecoder(); let buf = '';
@@ -591,10 +701,12 @@ function parar() {
 }
 $('stop').onclick = parar;
 document.addEventListener('keydown', e => { if (e.key === 'Escape') { fechaMenus(); parar(); } });
+// no modo ESP32, um .ino anexado (ou um firmware a modificar) pode ser compilado mesmo sem texto
+function podeEnviarVazio() { return $('modo').value === 'esp32' && (anexos.some(a => a.tipo === 'ino') || (baseMod && baseMod.kind === 'bin')); }
 function atualizaBotoes() {
   const ativo = busy || falando || !!rec || gravandoNativo;
   $('stop').hidden = !ativo; $('send').hidden = busy;
-  $('send').disabled = !txt.value.trim();
+  $('send').disabled = !txt.value.trim() && !podeEnviarVazio();
 }
 setInterval(atualizaBotoes, 300);
 
@@ -612,18 +724,38 @@ document.addEventListener('click', e => { if (!e.target.closest('.menu')) fechaM
 $('menuBtn').onclick = () => document.body.classList.add('lateral');
 $('fundo').onclick = () => document.body.classList.remove('lateral');
 
-const PLACEHOLDERS = {chat: 'Escreva sua mensagem…', app: 'Descreva o app que você quer criar (ex.: lista de compras)…', esp32: 'Descreva o firmware (ex.: ligar um LED por uma página no Wi-Fi)…'};
+const PLACEHOLDERS = {
+  chat: 'Escreva sua mensagem…', app: 'Descreva o app (ex.: lista de compras)… ou anexe um app para modificar',
+  appx: 'Descreva o app com várias telas (ex.: agenda com lista e detalhes)…', esp32: 'Descreva o firmware… ou anexe um .ino para modificar/compilar',
+  web: 'Descreva a página ou o sistema web (ex.: calculadora de gorjeta)…', python: 'Descreva o programa Python (ex.: renomear arquivos em lote)…',
+  img: 'Descreva a imagem… ou anexe uma imagem para modificar'};
+const ROTULOS_MODO = {app: '📱 App Android rápido', appx: '📱 App Android avançado', esp32: '🔌 Firmware ESP32', web: '🌐 Página web', python: '🐍 Python', img: '🎨 Imagem'};
 function atualizaChips() {
   const box = $('modoChips'); box.textContent = '';
   const m = $('modo').value;
   const add = t => { const s = document.createElement('span'); s.textContent = t; box.appendChild(s); };
-  if (m === 'app') add('📱 Criar app Android'); if (m === 'esp32') add('🔌 Criar firmware ESP32');
+  if (ROTULOS_MODO[m]) add(ROTULOS_MODO[m]);
   if ($('web').checked) add('🌐 Web'); if ($('speak').checked) add('🔊 Voz');
   txt.placeholder = PLACEHOLDERS[m];
 }
 for (const id of ['web', 'speak', 'learn']) $(id).onchange = atualizaChips;
+function atualizaForca() { $('imgForcaLinha').hidden = !(anexos.some(a => a.tipo === 'imagem') || (baseMod && baseMod.kind === 'img')); }
+$('imgPassos').oninput = () => $('imgPassosV').textContent = $('imgPassos').value;
+$('imgForca').oninput = () => $('imgForcaV').textContent = parseFloat($('imgForca').value).toFixed(2);
+let imgTimer = null;
+async function checaModeloImagem() {
+  try {
+    const e = await (await fetch('/imagem/modelo')).json();
+    $('imgModeloTxt').textContent = !e.motor ? 'Motor de imagens não instalado (rode: bash atualizar.sh)' : e.presente ? 'Modelo de imagens pronto ✓' : e.baixando ? 'Baixando o modelo… ' + Math.round(e.progresso * 100) + '%' : 'Falta o modelo de imagens (2 GB)';
+    $('imgBaixar').hidden = !(e.motor && !e.presente && !e.baixando); $('imgBaixarBarra').hidden = !e.baixando;
+    if (e.baixando) $('imgBaixarBarra').firstChild.style.width = Math.round(e.progresso * 100) + '%';
+    if (e.baixando && !imgTimer) imgTimer = setInterval(checaModeloImagem, 2500); if (!e.baixando && imgTimer) { clearInterval(imgTimer); imgTimer = null; }
+  } catch (e) {}
+}
+$('imgBaixar').onclick = async () => { await fetch('/imagem/modelo', {method: 'POST'}); checaModeloImagem(); };
 $('modo').onchange = async () => {
-  const m = $('modo').value; $('placa').hidden = m !== 'esp32'; atualizaChips();
+  const m = $('modo').value; $('placa').hidden = m !== 'esp32'; $('imgOpts').hidden = m !== 'img'; atualizaChips(); atualizaForca();
+  if (m === 'img') checaModeloImagem();
   if (m === 'esp32' && !$('placa').options.length) {
     try { for (const b of await (await fetch('/boards')).json()) { const o = document.createElement('option'); o.value = b.id; o.textContent = b.label; $('placa').appendChild(o); } } catch (e) {}
   }
@@ -645,22 +777,41 @@ function cartaoCriacao(m) {
   const k = m.criacao, d = document.createElement('div'); d.className = 'cartao' + (k.erro ? ' erro' : '');
   const st = document.createElement('div'); st.className = 'st'; st.textContent = k.status; d.appendChild(st);
   if (k.codigo) { const det = document.createElement('details'), sm = document.createElement('summary'), pre = document.createElement('pre'); sm.textContent = 'Ver o código que a IA escreveu'; pre.textContent = k.codigo; det.append(sm, pre); d.appendChild(det); }
+  if (k.preview) { const im = document.createElement('img'); im.className = 'miniatura'; im.src = k.preview; im.alt = 'Imagem criada'; d.appendChild(im); }
   for (const f of k.files || []) d.appendChild(linkArquivo(f));
+  if (k.passo) { const b = document.createElement('div'); b.className = 'barra-img'; b.innerHTML = '<i></i>'; b.firstChild.style.width = Math.round(100 * k.passo[0] / k.passo[1]) + '%'; d.appendChild(b); }
+  if (k.id && !k.erro && (k.files || []).length) {
+    const ac = document.createElement('div'); ac.className = 'acoes-cartao';
+    const mb = document.createElement('button'); mb.textContent = '✏ Modificar'; mb.onclick = () => modificar({id: k.id, name: k.nome, kind: k.kind, modo: k.modo}); ac.appendChild(mb);
+    if (k.kind === 'img' && k.descricao) { const ob = document.createElement('button'); ob.textContent = '↻ Outra versão'; ob.onclick = () => { $('modo').value = 'img'; $('modo').onchange(); txt.value = k.descricao; autoAltura(); send(txt.value); }; ac.appendChild(ob); }
+    d.appendChild(ac);
+  }
   if (k.nota) { const n = document.createElement('div'); n.className = 'dica'; n.textContent = k.nota; d.appendChild(n); }
   if (k.log) { const det = document.createElement('details'), sm = document.createElement('summary'), pre = document.createElement('pre'); sm.textContent = 'Ver os erros'; pre.textContent = k.log; det.append(sm, pre); d.appendChild(det); }
   return d;
 }
-async function criarArquivo(tipo, desc, c) {
-  const rotulo = tipo === 'app' ? 'app' : 'firmware';
-  const m = {role: 'assistant', kind: 'criacao', ignorar: true, criacao: {status: '⏳ Enviando o pedido…'}}; c.msgs.push(m);
+async function criarArquivo(tipo, desc, c, usados, base) {
+  usados = usados || []; const rotulo = {app: 'app', appx: 'app', esp32: 'firmware', web: 'página web', python: 'programa', img: 'imagem'}[tipo];
+  const m = {role: 'assistant', kind: 'criacao', ignorar: true, criacao: {status: '⏳ Enviando o pedido…', descricao: desc}}; c.msgs.push(m);
   let atual = criaMsg(m); coluna.appendChild(atual); desceFim(true);
   const k = m.criacao, att = () => { const n = criaMsg(m); atual.replaceWith(n); atual = n; desceFim(false); };
-  setStatus(`Criando o ${rotulo}… (■ cancela)`); let terminou = false;
+  // o que será usado como base: um item já criado (✏) ou um arquivo anexado
+  const body = {description: desc === '(compilar o sketch anexado como está)' ? '' : desc, board: $('placa').value || 'esp32'};
+  if (base) body.base_entrega = base.id;
+  else {
+    const preferido = {esp32: ['ino'], app: ['texto'], appx: ['texto'], web: ['texto'], python: ['texto'], img: ['imagem']}[tipo] || [];
+    const a = usados.find(x => preferido.includes(x.tipo)); if (a) body.base_upload = a.id;
+  }
+  let rota = '/app/generate';
+  if (tipo === 'appx') body.avancado = true;
+  else if (tipo === 'esp32') rota = '/esp32/generate';
+  else if (tipo === 'web' || tipo === 'python') { rota = '/codigo/generate'; body.alvo = tipo; }
+  else if (tipo === 'img') { rota = '/imagem/generate'; body.tamanho = $('imgTam').value; body.passos = parseInt($('imgPassos').value, 10); body.forca = parseFloat($('imgForca').value); body.melhorar = $('imgMelhorar').checked; }
+  setStatus(`Criando: ${rotulo}… (■ cancela)`); let terminou = false;
   try {
     ctrl = new AbortController();
-    const r = await fetch(tipo === 'app' ? '/app/generate' : '/esp32/generate', {method: 'POST', headers: {'Content-Type': 'application/json'}, signal: ctrl.signal,
-      body: JSON.stringify({description: desc, board: $('placa').value || 'esp32'})});
-    if (!r.ok) throw new Error('Servidor respondeu ' + r.status);
+    const r = await fetch(rota, {method: 'POST', headers: {'Content-Type': 'application/json'}, signal: ctrl.signal, body: JSON.stringify(body)});
+    if (!r.ok) throw new Error(r.status === 400 || r.status === 404 ? (await r.json()).detail : 'Servidor respondeu ' + r.status);
     const reader = r.body.getReader(), dec = new TextDecoder(); let buf = '';
     for (;;) {
       const {value, done} = await reader.read(); if (done) break;
@@ -670,15 +821,19 @@ async function criarArquivo(tipo, desc, c) {
         if (!ln.startsWith('data:')) continue;
         const ev = JSON.parse(ln.slice(5).trim());
         if (ev.type === 'status') { k.status = '⏳ ' + ev.msg; att(); }
+        else if (ev.type === 'passo') { k.passo = [ev.passo, ev.total]; k.status = `⏳ Gerando a imagem… passo ${ev.passo} de ${ev.total}`; att(); }
         else if (ev.type === 'progress') setStatus(`A IA já escreveu ${ev.tokens} pedaços de código… (■ cancela)`);
         else if (ev.type === 'code') { k.codigo = ev.text; att(); }
-        else if (ev.type === 'done') { terminou = true; k.status = `✅ "${ev.name}" pronto!`; k.files = ev.files; k.nota = ev.note; att(); }
-        else if (ev.type === 'error') { terminou = true; k.erro = true; k.status = '⚠ ' + ev.msg; k.log = ev.log; att(); }
+        else if (ev.type === 'done') { terminou = true; k.passo = null; k.status = `✅ "${ev.name}" pronto!`; k.files = ev.files; k.nota = ev.note; k.preview = ev.preview; k.id = ev.id; k.nome = ev.name; k.kind = ev.kind; k.modo = tipo === 'appx' ? 'avancado' : undefined; att(); }
+        else if (ev.type === 'error') {
+          terminou = true; k.passo = null; k.erro = true; k.status = '⚠ ' + ev.msg; k.log = ev.log; att();
+          if (ev.precisa_modelo) { $('plusMenu').hidden = false; checaModeloImagem(); }
+        }
       }
     }
-    if (!terminou) { k.erro = true; k.status = `⚠ A conexão terminou antes do ${rotulo} ficar pronto.`; att(); }
+    if (!terminou) { k.erro = true; k.status = `⚠ A conexão terminou antes de ficar pronto.`; att(); }
   } catch (e) {
-    if (e.name === 'AbortError') k.status = `⏹ Criação do ${rotulo} cancelada por você.`;
+    if (e.name === 'AbortError') k.status = `⏹ Criação cancelada por você.`;
     else { k.erro = true; k.status = '⚠ ' + mensagemAmigavel(e); }
     att();
   } finally { setStatus(''); }
@@ -712,9 +867,13 @@ async function carregaArquivos() {
   box.textContent = itens.length ? '' : 'Ainda não há nenhum arquivo criado.';
   for (const it of itens) {
     const row = document.createElement('div'); row.className = 'item-l'; row.style.flexDirection = 'column';
-    const t = document.createElement('div'); t.textContent = (it.kind === 'apk' ? '📱 ' : '🔌 ') + it.name;
+    const t = document.createElement('div'); t.textContent = (ICONES[it.kind === 'bin' ? 'bin' : it.kind] || '📄') + ' ' + it.name;
     const sm = document.createElement('small'); sm.textContent = it.description + ' · ' + new Date(it.created * 1000).toLocaleDateString('pt-BR');
-    row.append(t, sm); for (const f of it.files) row.appendChild(linkArquivo(f)); box.appendChild(row);
+    row.append(t, sm);
+    if (it.kind === 'img') { const im = document.createElement('img'); im.className = 'miniatura'; im.src = it.files[0].url; row.appendChild(im); }
+    for (const f of it.files) row.appendChild(linkArquivo(f));
+    if (it.editavel) { const ac = document.createElement('div'); ac.className = 'acoes-cartao'; const mb = document.createElement('button'); mb.textContent = '✏ Modificar'; mb.onclick = () => modificar(it); ac.appendChild(mb); row.appendChild(ac); }
+    box.appendChild(row);
   }
 }
 $('filesBtn').onclick = () => { abreDlg('filesDlg'); carregaArquivos(); };

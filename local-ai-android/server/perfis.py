@@ -84,7 +84,7 @@ def seleciona(id_: str) -> None:
     if not presente(p):
         raise ValueError("Esse modelo ainda não foi baixado.")
     config.MODELO_ENV.parent.mkdir(parents=True, exist_ok=True)
-    config.MODELO_ENV.write_text(f"MODEL={caminho(p)}\nNGL={p['ngl']}\n")
+    config.MODELO_ENV.write_text(f"MODEL={caminho(p)}\nNGL=auto\n")
     try:
         r = subprocess.run(["sudo", "-n", "systemctl", "restart", "localai-llm.service"],
                            capture_output=True, text=True, timeout=30)

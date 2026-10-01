@@ -16,6 +16,7 @@ Rotas:
 Conexões vindas do próprio PC (127.0.0.1) não precisam de token; as de fora precisam.
 """
 import asyncio
+from contextlib import asynccontextmanager
 import hmac
 import io
 import json
@@ -39,16 +40,30 @@ from fastapi.responses import FileResponse, RedirectResponse, Response, Streamin
 from pydantic import BaseModel
 
 import androidgen
+import codegen
 import config
 import entregas
 import esp32gen
+import imagens
 import memory
 import perfis
+import recursos
 import telemetria
+import uploads
 
-app = FastAPI(title="Local AI Server")
+@asynccontextmanager
+async def ciclo_de_vida(_app):
+    config.UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+    await asyncio.to_thread(uploads.limpa_antigos)
+    vigia = asyncio.create_task(recursos.vigia())   # descarrega da RAM os modelos de voz parados
+    yield
+    vigia.cancel()
+
+
+app = FastAPI(title="Local AI Server", lifespan=ciclo_de_vida)
 config.WORK_DIR.mkdir(parents=True, exist_ok=True)
 config.APPS_DIR.mkdir(parents=True, exist_ok=True)
+config.UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 STATIC = Path(__file__).parent / "static"
@@ -154,6 +169,7 @@ class ChatRequest(BaseModel):
     max_tokens: int = 700
     temperature: float = 0.4   # mais baixo = respostas mais consistentes e precisas
     web: bool = False
+    anexos: list[str] = []     # ids de arquivos enviados (código, .ino, análise de .apk/.bin...)
 
 
 def _sse_error(msg: str) -> bytes:
@@ -179,6 +195,11 @@ async def _build_messages(req: ChatRequest) -> tuple[list[dict], int]:
     mems = await asyncio.to_thread(memory.search, pergunta, 4)
     if mems:
         partes.append("Memórias (podem estar desatualizadas):\n" + "\n".join(f"- {m['text'][:500]}" for m in mems))
+
+    for aid in req.anexos[:4]:
+        ctx = uploads.contexto_do_anexo(aid)
+        if ctx:
+            partes.append(ctx[:9000])
 
     n_web = 0
     if req.web:
@@ -294,24 +315,134 @@ def _stream_job(rodar):
 
 
 class AppRequest(BaseModel):
-    description: str
+    description: str = ""
     board: str = "esp32"
+    base_entrega: str | None = None   # modificar algo que a IA já criou
+    base_upload: str | None = None    # modificar/compilar um arquivo anexado
+    avancado: bool = False            # app Android com vários arquivos (layouts XML, AndroidX)
+    alvo: str = "web"                 # /codigo/generate: web | python
+    tamanho: str = "512x512"          # /imagem/generate
+    passos: int = 4
+    forca: float = 0.6
+    melhorar: bool = True
+
+
+def _base_de(req: AppRequest) -> dict:
+    """Resolve o 'código base' de um pedido de modificação: {'codigo','arquivos','nome','modo'}."""
+    base = {"codigo": None, "arquivos": None, "nome": None, "modo": None}
+    if req.base_entrega:
+        m = entregas.meta(req.base_entrega)
+        if not m:
+            raise HTTPException(404, "Não achei o item que você quer modificar.")
+        base.update(codigo=m.get("code"), arquivos=m.get("arquivos_fonte"), nome=m.get("name"), modo=m.get("modo"))
+    elif req.base_upload:
+        m = uploads.meta(req.base_upload)
+        if not m:
+            raise HTTPException(404, "Não achei o arquivo anexado. Anexe de novo.")
+        t = uploads.texto(req.base_upload, 60000)
+        if t and m["tipo"] in ("ino", "texto"):
+            base.update(codigo=t, arquivos={m["name"]: t}, nome=Path(m["name"]).stem)
+    return base
 
 
 @app.post("/app/generate", dependencies=[Depends(require_token)])
 async def app_generate(req: AppRequest):
     desc = req.description.strip()[:1500]
+    base = _base_de(req)
     if not desc:
         raise HTTPException(400, "Descreva o app que você quer.")
-    return _stream_job(lambda emit: androidgen.gera_app(desc, emit))
+    if req.avancado or base["modo"] == "avancado":
+        return _stream_job(lambda emit: codegen.gera_app_avancado(desc, base["arquivos"], base["nome"], emit))
+    return _stream_job(lambda emit: androidgen.gera_app(desc, emit, base["codigo"], base["nome"]))
 
 
 @app.post("/esp32/generate", dependencies=[Depends(require_token)])
 async def esp32_generate(req: AppRequest):
     desc = req.description.strip()[:1500]
+    base = _base_de(req)
+    if not desc and not base["codigo"]:
+        raise HTTPException(400, "Descreva o firmware que você quer, ou anexe um .ino para compilar.")
+    return _stream_job(lambda emit: esp32gen.gera_firmware(desc, req.board, emit, base["codigo"], base["nome"]))
+
+
+@app.post("/codigo/generate", dependencies=[Depends(require_token)])
+async def codigo_generate(req: AppRequest):
+    desc = req.description.strip()[:1500]
     if not desc:
-        raise HTTPException(400, "Descreva o firmware que você quer.")
-    return _stream_job(lambda emit: esp32gen.gera_firmware(desc, req.board, emit))
+        raise HTTPException(400, "Descreva o que você quer criar.")
+    base = _base_de(req)
+    return _stream_job(lambda emit: codegen.gera_codigo(req.alvo, desc, base["arquivos"], base["nome"], emit))
+
+
+@app.post("/imagem/generate", dependencies=[Depends(require_token)])
+async def imagem_generate(req: AppRequest):
+    desc = req.description.strip()[:1200]
+    if not desc:
+        raise HTTPException(400, "Descreva a imagem que você quer.")
+    init = req.base_upload
+    if req.base_entrega:  # modificar uma imagem que a IA criou: copia para a pasta de anexos
+        m = entregas.meta(req.base_entrega)
+        arq = entregas.caminho(req.base_entrega, m["files"][0]["name"]) if m and m.get("files") else None
+        if arq is None:
+            raise HTTPException(404, "Não achei a imagem que você quer modificar.")
+        init = uploads.salva(arq.name, shutil.copy(arq, config.WORK_DIR / f"copia-{arq.name}"))["id"]
+    return _stream_job(lambda emit: imagens.gera_imagem(desc, init, req.tamanho, req.passos, req.forca, req.melhorar, emit))
+
+
+@app.get("/imagem/modelo", dependencies=[Depends(require_token)])
+async def imagem_modelo():
+    return imagens.estado()
+
+
+@app.post("/imagem/modelo", dependencies=[Depends(require_token)])
+async def imagem_modelo_baixar():
+    try:
+        imagens.baixar()
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True}
+
+
+# ----------------------------------------------------------------------------- anexos
+@app.post("/upload", dependencies=[Depends(require_token)])
+async def upload(arquivo: UploadFile = File(...)):
+    nome = arquivo.filename or "arquivo"
+    if uploads.tipo_de(nome) is None:
+        raise HTTPException(400, "Tipo de arquivo não aceito. Aceito: imagens, .ino, .bin, .apk e arquivos de código/texto.")
+    tmp = config.WORK_DIR / f"up-{uuid.uuid4().hex[:8]}"
+    tam = 0
+    with tmp.open("wb") as f:
+        while pedaco := await arquivo.read(1024 * 1024):
+            tam += len(pedaco)
+            if tam > config.MAX_UPLOAD_MB * 1024 * 1024:
+                f.close()
+                tmp.unlink(missing_ok=True)
+                raise HTTPException(413, f"Arquivo grande demais (máximo {config.MAX_UPLOAD_MB} MB).")
+            f.write(pedaco)
+    try:
+        meta = await asyncio.to_thread(uploads.salva, nome, tmp)
+    except ValueError as e:
+        tmp.unlink(missing_ok=True)
+        raise HTTPException(400, str(e))
+    # APK criado por esta IA? então dá para modificar pelo código-fonte
+    pacote = (meta["analise"] or {}).get("pacote")
+    entrega = uploads.encontra_app_por_pacote(pacote) if pacote else None
+    return {**meta, "entrega": entrega}
+
+
+@app.get("/uploads/{up_id}/{nome}", dependencies=[Depends(require_token)])
+async def upload_baixa(up_id: str, nome: str):
+    m = uploads.meta(up_id)
+    p = uploads.caminho(up_id)
+    if not m or p is None or nome != m["name"]:
+        raise HTTPException(404, "Arquivo não encontrado")
+    return FileResponse(p, filename=nome)
+
+
+@app.delete("/upload/{up_id}", dependencies=[Depends(require_token)])
+async def upload_apaga(up_id: str):
+    await asyncio.to_thread(uploads.apaga, up_id)
+    return {"ok": True}
 
 
 @app.get("/boards", dependencies=[Depends(require_token)])
@@ -364,6 +495,24 @@ _kokoro = None
 _voice_lock = threading.Lock()
 
 
+def _descarrega_whisper():
+    global _whisper
+    if _voice_lock.acquire(blocking=False):   # se está em uso agora, deixa para depois
+        try:
+            _whisper = None
+        finally:
+            _voice_lock.release()
+
+
+def _descarrega_kokoro():
+    global _kokoro
+    if _voice_lock.acquire(blocking=False):
+        try:
+            _kokoro = None
+        finally:
+            _voice_lock.release()
+
+
 def _carrega_whisper():
     from faster_whisper import WhisperModel
     nucleos = max(2, (os.cpu_count() or 4) // 2)  # núcleos físicos: rende mais que usar todos os threads
@@ -378,6 +527,8 @@ def _stt_sync(path: str) -> str:
     with _voice_lock:
         if _whisper is None:
             _whisper = _carrega_whisper()
+            recursos.registra("whisper", _descarrega_whisper)
+        recursos.usou("whisper")
         segments, _ = _whisper.transcribe(
             path, language="pt", beam_size=5, vad_filter=True,
             vad_parameters={"min_silence_duration_ms": 500},
@@ -390,6 +541,8 @@ def _get_kokoro():
     if _kokoro is None:
         from kokoro_onnx import Kokoro
         _kokoro = Kokoro(str(config.KOKORO_MODEL), str(config.KOKORO_VOICES))
+        recursos.registra("kokoro", _descarrega_kokoro)
+    recursos.usou("kokoro")
     return _kokoro
 
 

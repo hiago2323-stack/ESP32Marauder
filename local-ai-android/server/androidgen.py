@@ -21,6 +21,7 @@ import httpx
 
 import config
 import entregas
+import recursos
 
 PACKAGE = "com.localai.app"
 
@@ -281,7 +282,8 @@ async def compila(pasta: Path) -> tuple[bool, str, Path | None]:
     # start_new_session: o Gradle e os processos que ele cria ficam num grupo próprio,
     # para podermos matar tudo de uma vez ao cancelar (senão sobra Java rodando escondido)
     proc = await asyncio.create_subprocess_exec(
-        gradle, "assembleDebug", "--no-daemon", "--console=plain", "-q",
+        *recursos.baixa_prioridade([gradle, "assembleDebug", "--no-daemon", "--console=plain", "-q",
+                                    "-Dorg.gradle.workers.max=2"]),
         cwd=pasta, env=env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
         start_new_session=True,
     )
@@ -310,10 +312,10 @@ async def compila(pasta: Path) -> tuple[bool, str, Path | None]:
 
 
 # ------------------------------------------------------------------ fluxo principal
-_trava = asyncio.Lock()
+_trava = recursos.pesado   # uma tarefa pesada por vez (RAM/CPU compartilhadas)
 
 
-async def gera_app(descricao: str, emit) -> None:
+async def gera_app(descricao: str, emit, base_codigo: str | None = None, base_nome: str | None = None) -> None:
     """Executa o fluxo completo, mandando eventos por emit(dict)."""
     if _trava.locked():
         await emit({"type": "error", "msg": "Ainda estou criando outro app. Espere ele terminar ou clique em Parar."})
@@ -323,7 +325,10 @@ async def gera_app(descricao: str, emit) -> None:
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": f"Crie: {EXEMPLO_PEDIDO}"},
             {"role": "assistant", "content": EXEMPLO_RESPOSTA},
-            {"role": "user", "content": f"Crie: {descricao}"},
+            {"role": "user", "content": (
+                f"Código ATUAL do app:\n```java\n{base_codigo[:14000]}\n```\n\nModifique o app conforme o pedido e "
+                f"devolva o arquivo COMPLETO no mesmo formato. Pedido: {descricao}") if base_codigo
+             else f"Crie: {descricao}"},
         ]
         id_ = uuid.uuid4().hex[:10]
         pasta = config.WORK_DIR / f"app-{id_}"
@@ -337,6 +342,8 @@ async def gera_app(descricao: str, emit) -> None:
                 texto = await pede_codigo(mensagens, emit)
                 try:
                     nome, codigo = extrai_resposta(texto)
+                    if base_nome and nome == "App IA":
+                        nome = base_nome
                 except ValueError as e:
                     await emit({"type": "error", "msg": str(e), "log": texto[-1500:]})
                     return

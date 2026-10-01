@@ -47,7 +47,8 @@ SYSTEM_PROMPT = os.environ.get(
     "Você é uma IA local que roda no computador do usuário. Responda sempre em português do Brasil, "
     "de forma clara, direta e correta. Quando a mensagem trouxer um bloco [CONTEXTO], use-o: ele tem "
     "memórias do usuário e resultados de pesquisa na web; cite os endereços das fontes usadas. "
-    "Se não tiver certeza ou não souber, diga isso em vez de inventar.",
+    "Se não tiver certeza ou não souber, diga isso em vez de inventar. Responda direto ao ponto, sem sermões, "
+    "sem avisos desnecessários e sem rodeios: trate o usuário como um adulto capaz.",
 )
 
 # Banco da memória de longo prazo (o que o usuário ensina e o que a IA aprende)
@@ -68,3 +69,12 @@ ARDUINO_CLI = os.environ.get("ARDUINO_CLI", str(HOME / "bin" / "arduino-cli"))
 # ---- Desempenho e precisão ----
 MODELS_DIR = Path(os.environ.get("MODELS_DIR", str(HOME / "models")))
 MODELO_ENV = Path(os.environ.get("MODELO_ENV", str(HOME / "localai" / "modelo.env")))   # perfil escolhido na tela (o start_llm.sh lê este arquivo)
+
+# ---- Anexos, imagens e recursos ----
+UPLOADS_DIR = Path(os.environ.get("UPLOADS_DIR", str(HOME / "localai" / "uploads")))
+OCIOSO_MIN = int(os.environ.get("OCIOSO_MIN", "10"))   # minutos parado até descarregar um modelo de voz da RAM
+
+# Gerador de imagens (stable-diffusion.cpp): SD-Turbo quantizado (~2 GB), 1 a 4 passos
+IMG_MODEL = Path(os.environ.get("IMG_MODEL", str(HOME / "models" / "imagens" / "sd_turbo-f16-q8_0.gguf")))
+IMG_URL = "https://huggingface.co/Green-Sky/SD-Turbo-GGUF/resolve/main/sd_turbo-f16-q8_0.gguf"
+IMG_TAM = 2023745376

@@ -1,6 +1,8 @@
 """Leituras do PC para a tela: temperaturas, ventoinhas, uso da GPU e da memória."""
 import os
 import subprocess
+
+import recursos
 import time
 from pathlib import Path
 
@@ -83,6 +85,7 @@ def ler() -> dict:
         return _cache[1]
     temp, fans = _hwmon()
     dado = {"gpu": _gpu(), "cpu": {"temp": temp, "carga": round(os.getloadavg()[0], 2), "nucleos": os.cpu_count()},
-            "ventoinhas": fans, "ram": _ram(), "controle_ventoinha": _controle_ventoinha()}
+            "ventoinhas": fans, "ram": _ram(), "controle_ventoinha": _controle_ventoinha(),
+            "modelos_na_ram": sorted(recursos._modelos)}
     _cache = (agora, dado)
     return dado
