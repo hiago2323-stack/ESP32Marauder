@@ -4854,6 +4854,68 @@ instalar_esp32() {
   "$CLI" core update-index && "$CLI" core install esp32:esp32
 }
 
+# ---------------------------------------------------- SSD: o que é lido o tempo todo vai para a parte rápida
+# Se o sistema está num HD (lento) e existe um SSD à parte, os modelos de IA, o Gradle, o Android SDK e o núcleo
+# ESP32 passam a ficar no SSD (a pasta antiga vira um link, então nada mais precisa mudar).
+# Nunca formata nem apaga disco: só usa partição Linux (ext4/btrfs/xfs) que já exista no SSD.
+# Para pular:  SEM_SSD=1 bash atualizar.sh        Para escolher a pasta:  SSD_DESTINO=/caminho bash atualizar.sh
+mover_para() {   # mover_para ORIGEM DESTINO  (ORIGEM vira um link para DESTINO)
+  local o="$1" d="$2" kb livre
+  [ -L "$o" ] && return 0
+  if [ ! -e "$o" ]; then mkdir -p "$d" "$(dirname "$o")" && ln -s "$d" "$o"; return 0; fi
+  kb=$(du -sk "$o" 2>/dev/null | cut -f1); livre=$(df -k --output=avail "$(dirname "$d")" 2>/dev/null | tail -1 | tr -d ' ')
+  if [ "${kb:-0}" -ge "${livre:-0}" ]; then echo "AVISO: sem espaço no SSD para $o; deixei onde estava."; return 1; fi
+  mkdir -p "$d" || return 1
+  if command -v rsync >/dev/null; then rsync -a "$o"/ "$d"/ || return 1; else cp -a "$o"/. "$d"/ || return 1; fi
+  mv "$o" "$o.antigo" && ln -s "$d" "$o" && rm -rf "$o.antigo"
+  SSD_MOVEU=1
+}
+
+ssd_rapido() {
+  local raiz_dev raiz_disk rota dest="" nome tam fs mp tipo pk dev mnt disco_ok
+  [ -n "${SSD_DESTINO:-}" ] && dest="$SSD_DESTINO"
+  if [ -z "$dest" ] && [ -L "$HOME/models" ] && [ -d "$(readlink -f "$HOME/models")" ]; then
+    echo "SSD: os modelos já estão em $(readlink -f "$HOME/models")"; return 0
+  fi
+  if [ -z "$dest" ]; then
+    raiz_dev=$(findmnt -no SOURCE / 2>/dev/null)
+    raiz_disk=$(lsblk -no PKNAME "$raiz_dev" 2>/dev/null | head -1)
+    rota=$(cat "/sys/block/$raiz_disk/queue/rotational" 2>/dev/null || echo "?")
+    if [ "$rota" = 0 ]; then echo "SSD: o sistema já está num SSD; nada a mover."; return 0; fi
+    echo "SSD: o sistema está em /dev/${raiz_disk:-?} ($([ "$rota" = 1 ] && echo HD || echo desconhecido)). Procurando um SSD à parte..."
+    while read -r nome tam fs mp tipo pk; do
+      [ "$tipo" = part ] && [ -n "$pk" ] && [ "$pk" != "$raiz_disk" ] || continue
+      [ "$(cat "/sys/block/$pk/queue/rotational" 2>/dev/null)" = 0 ] || continue
+      [ "${tam:-0}" -ge 30000000000 ] || continue
+      case "$fs" in ext4|btrfs|xfs) ;; *) echo "SSD: /dev/$nome é $fs (não uso; deixo como está)."; continue;; esac
+      dev="/dev/$nome"; mnt="$mp"
+      if [ -z "$mnt" ]; then
+        mnt=$(udisksctl mount -b "$dev" 2>/dev/null | sed -n 's/.* at \(.*\)\.$/\1/p' | head -1)
+        [ -n "$mnt" ] && persistir_montagem "$dev" "$fs" /mnt/ssd-betina && mnt=/mnt/ssd-betina
+      fi
+      [ -n "$mnt" ] && [ -d "$mnt" ] || continue
+      [ "$(df -k --output=avail "$mnt" | tail -1 | tr -d ' ')" -ge 20000000 ] || { echo "SSD: pouco espaço livre em $mnt."; continue; }
+      dest="$mnt/betina-rapido"; break
+    done < <(lsblk -rnbo NAME,SIZE,FSTYPE,MOUNTPOINT,TYPE,PKNAME 2>/dev/null)
+  fi
+  if [ -z "$dest" ]; then
+    echo "SSD: não achei um SSD utilizável. Tudo continua no disco do sistema."
+    echo "     (Se o SSD estiver VAZIO e você quiser usá-lo: abra o app 'Discos', crie uma partição ext4 nele e rode de novo: bash atualizar.sh)"
+    return 0
+  fi
+  mkdir -p "$dest" 2>/dev/null || { sudo mkdir -p "$dest" && sudo chown "$USER": "$dest"; } || return 1
+  [ -w "$dest" ] || sudo chown "$USER": "$dest" || return 1
+  echo "SSD: usando $dest para modelos, Gradle, Android SDK e núcleo ESP32."
+  SSD_MOVEU=0
+  for item in models .gradle gradle Android .arduino15 .cache/huggingface; do
+    mover_para "$HOME/$item" "$dest/$(echo "$item" | tr '/' '_')" || true
+  done
+  if [ "${SSD_MOVEU:-0}" = 1 ]; then
+    LLM_UNIT_MUDOU=1   # o modelo mudou de lugar: o atualizador recarrega o llama-server no fim
+    echo "SSD: pronto. A IA vai carregar os modelos do SSD (bem mais rápido que do HD)."
+  fi
+}
+
 # ---------------------------------------------------- Biblioteca no disco grande (documentação e exemplos para a IA)
 # Escolhe sozinho o disco grande (>= 100 GB, que não seja o do sistema). Nunca formata nem apaga nada.
 # Para escolher outro lugar:  BIBLIOTECA_DESTINO=/media/$USER/MEUDISCO/biblioteca bash atualizar.sh
@@ -4882,7 +4944,7 @@ disco_biblioteca() {
 
 # Se o disco foi montado agora, deixa montado em todo boot (entrada com "nofail": se o disco faltar, o PC liga normal).
 persistir_montagem() {
-  local dev="$1" fs="$2" uuid ponto=/mnt/disco-betina opts="defaults,nofail,x-systemd.device-timeout=5"
+  local dev="$1" fs="$2" uuid ponto="${3:-/mnt/disco-betina}" opts="defaults,nofail,x-systemd.device-timeout=5"
   uuid=$(lsblk -no UUID "$dev" 2>/dev/null | head -1); [ -n "$uuid" ] || return 1
   grep -q "$uuid" /etc/fstab 2>/dev/null && return 0
   case "$fs" in ntfs) fs=ntfs-3g; opts="$opts,uid=$(id -u),gid=$(id -g),umask=022";; exfat) opts="$opts,uid=$(id -u),gid=$(id -g),umask=022";; esac
@@ -5190,6 +5252,7 @@ UNIT
 }
 
 step "1/15 Pacotes"                  instalar_pacotes
+step "Acelerar com o SSD"            ssd_rapido
 step "2/15 Driver NVIDIA 580"        instalar_driver
 step "3/15 CUDA 12.6"                instalar_cuda
 step "4/15 Telemetria e GPU"         instalar_telemetria
