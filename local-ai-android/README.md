@@ -41,8 +41,8 @@ O instalador é gerado a partir de `server/`; mantenha os dois iguais.
 ## Atualizar sem reinstalar
 
 ```
-bash atualizar.sh          # troca o código e reinicia os serviços (mantém token, memória e modelo)
-NGL=4 bash atualizar.sh    # menos camadas na placa = menos memória de vídeo (se der "network error")
+bash atualizar.sh          # troca o código e reinicia os serviços (mantém token, memória e modelo); NGL=4
+NGL=2 bash atualizar.sh    # menos camadas na placa = menos memória de vídeo (se der "CUDA out of memory")
 ```
 
 ## Como a IA "aprende com o tempo"

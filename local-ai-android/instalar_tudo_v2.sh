@@ -25,7 +25,7 @@ case "$MODELO" in
       NGL_PADRAO=16; MODEL_TAM="~1,9 GB" ;;
   *)  MODEL_FILE=Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf
       MODEL_URL=https://huggingface.co/bartowski/Qwen2.5-Coder-7B-Instruct-GGUF/resolve/main/$MODEL_FILE
-      NGL_PADRAO=6; MODEL_TAM="~4,7 GB" ;;
+      NGL_PADRAO=4; MODEL_TAM="~4,7 GB" ;;
 esac
 MODEL="$HOME/models/$MODEL_FILE"
 FAILED=()
@@ -830,7 +830,7 @@ EOF
   cat > "$BASE/start_llm.sh" <<'EOF'
 #!/usr/bin/env bash
 # NGL = camadas na GPU. Com 2 GB de VRAM ajuste de 2 em 2 olhando o nvidia-smi:
-# perto de 1800 MiB é o limite (7B: comece em 6; 3B: em 16).
+# perto de 1800 MiB é o limite (7B: comece em 4; 3B: em 16).
 # Para trocar de modelo, mude MODEL (qualquer arquivo .gguf em ~/models).
 NGL="${NGL:-__NGL__}"
 MODEL="${MODEL:-$HOME/models/__MODEL__}"

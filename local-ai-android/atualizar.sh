@@ -3,8 +3,8 @@
 #  ATUALIZA o servidor da IA local (tela, memória, correções) SEM reinstalar
 #  nada. Mantém token, memórias e o modelo que já estão em uso.
 #
-#  Uso:   bash atualizar.sh               (camadas na placa: 6)
-#         NGL=4 bash atualizar.sh         (menos memória de vídeo; use se der erro)
+#  Uso:   bash atualizar.sh               (camadas na placa: 4)
+#         NGL=2 bash atualizar.sh         (ainda menos memória de vídeo; use se ainda der erro)
 #  Reinicia o modelo: ele leva alguns minutos para carregar de novo.
 # =====================================================================
 set -euo pipefail
@@ -15,7 +15,7 @@ SRV="$BASE/server"
 # descobre qual modelo já está configurado (mantém o mesmo)
 MODEL_FILE=$(grep -o 'models/[^}"]*\.gguf' "$BASE/start_llm.sh" 2>/dev/null | head -1 | cut -d/ -f2 || true)
 [ -n "$MODEL_FILE" ] || MODEL_FILE=Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf
-NGL_PADRAO="${NGL:-6}"
+NGL_PADRAO="${NGL:-4}"
 echo "==> Modelo: $MODEL_FILE | camadas na placa (NGL): $NGL_PADRAO"
 
 escrever_arquivos() {
@@ -760,7 +760,7 @@ EOF
   cat > "$BASE/start_llm.sh" <<'EOF'
 #!/usr/bin/env bash
 # NGL = camadas na GPU. Com 2 GB de VRAM ajuste de 2 em 2 olhando o nvidia-smi:
-# perto de 1800 MiB é o limite (7B: comece em 6; 3B: em 16).
+# perto de 1800 MiB é o limite (7B: comece em 4; 3B: em 16).
 # Para trocar de modelo, mude MODEL (qualquer arquivo .gguf em ~/models).
 NGL="${NGL:-__NGL__}"
 MODEL="${MODEL:-$HOME/models/__MODEL__}"
