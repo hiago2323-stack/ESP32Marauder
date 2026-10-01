@@ -197,6 +197,7 @@
         <button class="item" id="memBtn">🧠 Memória</button>
         <button class="item" id="filesBtn">📁 Arquivos criados</button>
         <button class="item" id="sisBtn">🖥 Sistema e ventoinhas</button>
+        <button class="item" id="libBtn">📚 Biblioteca</button>
         <button class="item" id="pairBtn" hidden>📲 Conectar celular</button>
         <button class="item" id="cfgBtn" hidden>⚙ Servidor do app</button>
         <div class="sec">Aparência</div>
@@ -289,6 +290,16 @@
   <div class="dica">Aplicativos (.apk) e firmwares (.bin). Ficam guardados no PC, na pasta ~/localai/apps.</div>
   <div class="lista" id="fileslist"></div>
   <button class="bt" id="filesClose">Fechar</button>
+</dialog>
+
+<dialog id="libDlg">
+  <h2>Biblioteca</h2>
+  <div class="dica">Documentação e exemplos guardados no disco grande. A IA consulta isto sozinha ao responder e ao criar apps e firmware. Coloque seus próprios arquivos na pasta <b>meus</b>.</div>
+  <table class="sis" id="libTab"></table>
+  <div class="dica" id="libNota"></div>
+  <div style="display:flex;gap:8px;margin-top:10px"><input id="libQ" placeholder="Buscar na biblioteca…" style="flex:1"><button class="bt" id="libBusca">Buscar</button></div>
+  <div class="lista" id="libRes" style="max-height:34vh;overflow:auto"></div>
+  <div style="margin-top:14px;display:flex;gap:8px"><button class="bt" id="libIdx">Atualizar índice</button><button class="bt" id="libClose">Fechar</button></div>
 </dialog>
 
 <dialog id="sisDlg">
@@ -840,7 +851,7 @@ async function criarArquivo(tipo, desc, c, usados, base) {
 
 /* ======================= Janelas ======================= */
 const abreDlg = id => { fechaMenus(); document.body.classList.remove('lateral'); $(id).showModal(); };
-for (const [btn, dlg] of [['memClose', 'memDlg'], ['filesClose', 'filesDlg'], ['vozClose', 'vozDlg'], ['pairClose', 'pairDlg'], ['sisClose', 'sisDlg'], ['llmClose', 'llmDlg']]) $(btn).onclick = () => $(dlg).close();
+for (const [btn, dlg] of [['memClose', 'memDlg'], ['filesClose', 'filesDlg'], ['vozClose', 'vozDlg'], ['pairClose', 'pairDlg'], ['sisClose', 'sisDlg'], ['libClose', 'libDlg'], ['llmClose', 'llmDlg']]) $(btn).onclick = () => $(dlg).close();
 
 // --- memória
 async function carregaMem() {
@@ -947,7 +958,7 @@ async function lerTele() {
       h += linhaSis('Placa de vídeo', t.gpu.nome) + linhaSis('Temperatura da GPU', t.gpu.temp + ' °C', t.gpu.temp >= 80 ? 'err' : t.gpu.temp >= 70 ? 'warn' : '') + linhaSis('Uso da GPU', t.gpu.uso + ' %') +
            linhaSis('Memória da placa', t.gpu.mem_usada + ' / ' + t.gpu.mem_total + ' MiB') + linhaSis('Ventoinha da GPU', t.gpu.ventoinha + ' %') + linhaSis('Consumo da GPU', t.gpu.watts + ' W');
     }
-    h += linhaSis('Temperatura da CPU', t.cpu.temp != null ? t.cpu.temp.toFixed(0) + ' °C' : 'indisponível', t.cpu.temp >= 85 ? 'err' : t.cpu.temp >= 75 ? 'warn' : '') + linhaSis('Carga da CPU (1 min)', t.cpu.carga + ' (de ' + t.cpu.nucleos + ' threads)');
+    h += linhaSis('Temperatura da CPU', t.cpu.temp != null ? t.cpu.temp.toFixed(0) + ' °C' : 'indisponível', t.cpu.temp >= 85 ? 'err' : t.cpu.temp >= 75 ? 'warn' : '') + linhaSis('Uso da CPU', t.cpu.uso != null ? t.cpu.uso + ' %' : 'indisponível', t.cpu.uso >= 90 ? 'warn' : '') + linhaSis('Carga da CPU (1 min)', t.cpu.carga + ' (de ' + t.cpu.nucleos + ' threads)');
     for (const [k, v] of Object.entries(t.ventoinhas)) h += linhaSis('Ventoinha ' + k, v + ' RPM');
     h += linhaSis('Memória RAM', t.ram.usada + ' / ' + t.ram.total + ' MB');
     $('sisTab').innerHTML = h;
@@ -956,6 +967,33 @@ async function lerTele() {
   } catch (e) {}
 }
 $('sisBtn').onclick = () => { abreDlg('sisDlg'); lerTele(); clearInterval(sisTimer); sisTimer = setInterval(() => { if ($('sisDlg').open) lerTele(); else clearInterval(sisTimer); }, 2000); };
+// --- biblioteca local
+let libTimer = null;
+async function lerBib() {
+  try {
+    const b = await (await fetch('/biblioteca')).json(); let h = '';
+    h += linhaSis('Pasta', b.destino || b.pasta) + linhaSis('Disco', b.total_gb != null ? b.livre_gb + ' GB livres de ' + b.total_gb + ' GB' : 'indisponível');
+    for (const f of b.fontes) h += linhaSis(f.nome, f.arquivos + ' arquivos · ' + f.trechos + ' trechos');
+    for (const z of b.zims) h += linhaSis('Wikipedia offline', z.nome.replace(/\.zim$/, '') + ' · ' + z.gb + ' GB');
+    $('libTab').innerHTML = h;
+    $('libNota').textContent = !b.disponivel ? 'A pasta da biblioteca não está acessível. Rode: bash atualizar.sh (ele escolhe o disco grande) ou conecte/monte o disco.'
+      : b.indexando ? '⏳ Indexando em segundo plano… (os números sobem sozinhos)'
+      : b.fontes.length ? '✔ Biblioteca pronta.' : 'Ainda vazia: o download roda em segundo plano depois do atualizar.sh (acompanhe: tail -f ~/localai/biblioteca.log).';
+  } catch (e) { $('libNota').textContent = 'Não consegui ler a biblioteca.'; }
+}
+$('libBtn').onclick = () => { abreDlg('libDlg'); lerBib(); clearInterval(libTimer); libTimer = setInterval(() => { if ($('libDlg').open) lerBib(); else clearInterval(libTimer); }, 4000); };
+$('libIdx').onclick = async () => { await fetch('/biblioteca/indexar', { method: 'POST' }); setTimeout(lerBib, 400); };
+async function buscaBib() {
+  const q = $('libQ').value.trim(); if (!q) return;
+  $('libRes').textContent = 'Buscando…';
+  try {
+    const r = await (await fetch('/biblioteca/buscar?q=' + encodeURIComponent(q))).json(); let h = '';
+    for (const t of r.trechos) h += `<div class="item-l"><div class="t"><small>${esc(t.caminho)}</small>${esc(t.texto)}</div></div>`;
+    for (const w of r.wikipedia) h += `<div class="item-l"><div class="t"><small>Wikipedia · ${esc(w.titulo)}</small>${esc(w.texto)}</div></div>`;
+    $('libRes').innerHTML = h || '<div class="dica">Nada encontrado.</div>';
+  } catch (e) { $('libRes').textContent = 'Falha na busca.'; }
+}
+$('libBusca').onclick = buscaBib; $('libQ').onkeydown = e => { if (e.key === 'Enter') buscaBib(); };
 function montaChips(t) {
   const box = $('chips'); box.textContent = '';
   const add = (txtc, cls) => { const s = document.createElement('span'); s.textContent = txtc; if (cls) s.className = cls; box.appendChild(s); };

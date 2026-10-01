@@ -213,6 +213,9 @@ OCIOSO_MIN = int(os.environ.get("OCIOSO_MIN", "10"))   # minutos parado até des
 IMG_MODEL = Path(os.environ.get("IMG_MODEL", str(HOME / "models" / "imagens" / "sd_turbo-f16-q8_0.gguf")))
 IMG_URL = "https://huggingface.co/Green-Sky/SD-Turbo-GGUF/resolve/main/sd_turbo-f16-q8_0.gguf"
 IMG_TAM = 2023745376
+
+# ---- Biblioteca local (documentação e código de referência; fica no disco grande via link ~/biblioteca) ----
+BIBLIOTECA_DIR = Path(os.environ.get("BIBLIOTECA_DIR", str(HOME / "biblioteca")))
 EOF
   cat > main.py <<'EOF'
 """Servidor do PC: conversa com o modelo, pesquisa na web e compila projetos Android.
@@ -258,6 +261,7 @@ from fastapi.responses import FileResponse, RedirectResponse, Response, Streamin
 from pydantic import BaseModel
 
 import androidgen
+import biblioteca
 import codegen
 import config
 import entregas
@@ -274,8 +278,21 @@ async def ciclo_de_vida(_app):
     config.UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
     await asyncio.to_thread(uploads.limpa_antigos)
     vigia = asyncio.create_task(recursos.vigia())   # descarrega da RAM os modelos de voz parados
+    indexador = asyncio.create_task(_indexa_biblioteca())
     yield
     vigia.cancel()
+    indexador.cancel()
+
+
+async def _indexa_biblioteca() -> None:
+    """Mantém o índice da biblioteca em dia (devagar e em segundo plano; os downloads novos entram sozinhos)."""
+    await asyncio.sleep(45)  # deixa o servidor e o modelo subirem primeiro
+    while True:
+        try:
+            await asyncio.to_thread(biblioteca.indexar)
+        except Exception:
+            pass
+        await asyncio.sleep(20 * 60)
 
 
 app = FastAPI(title="Local AI Server", lifespan=ciclo_de_vida)
@@ -432,6 +449,13 @@ async def _build_messages(req: ChatRequest) -> tuple[list[dict], int]:
         if ctx:
             partes.append(ctx[:9000])
 
+    try:  # a biblioteca local vale com ou sem pesquisa na web
+        lib = await asyncio.to_thread(biblioteca.contexto_chat, pergunta)
+    except Exception:
+        lib = ""
+    if lib:
+        partes.append(lib)
+
     n_web = 0
     if req.web:
         try:
@@ -444,6 +468,14 @@ async def _build_messages(req: ChatRequest) -> tuple[list[dict], int]:
             n_web = len(results)
             partes.append("Pesquisa na web:\n" + "\n".join(
                 f"[{i+1}] {r['title']} - {r['url']}\n{(r['snippet'] or '')[:260]}" for i, r in enumerate(results)))
+
+    if req.web and n_web == 0:  # sem internet (ou sem resultados): a Wikipedia offline do disco grande ajuda
+        try:
+            wiki = await asyncio.to_thread(biblioteca.wikipedia, pergunta)
+        except Exception:
+            wiki = []
+        if wiki:
+            partes.append("Wikipedia (offline):\n" + "\n".join(f"- {w['titulo']}: {w['texto']}" for w in wiki))
 
     if partes:
         msgs[ultimo]["content"] = "[CONTEXTO]\n" + "\n\n".join(partes) + "\n[FIM DO CONTEXTO]\n\n" + pergunta
@@ -583,12 +615,44 @@ def _base_de(req: AppRequest) -> dict:
     return base
 
 
+async def _com_referencias(desc: str) -> str:
+    """Junta ao pedido alguns exemplos/documentação da biblioteca local (se houver e se casarem com o pedido)."""
+    if not desc:
+        return desc
+    try:
+        return desc + await asyncio.to_thread(biblioteca.referencias, desc)
+    except Exception:
+        return desc
+
+
+@app.get("/biblioteca", dependencies=[Depends(require_token)])
+async def biblioteca_status():
+    return await asyncio.to_thread(biblioteca.status)
+
+
+@app.post("/biblioteca/indexar", dependencies=[Depends(require_token)])
+async def biblioteca_indexar(forcar: bool = False):
+    if biblioteca._estado["rodando"]:
+        return {"ok": True, "ja_rodando": True}
+    threading.Thread(target=biblioteca.indexar, args=(forcar,), daemon=True).start()
+    return {"ok": True}
+
+
+@app.get("/biblioteca/buscar", dependencies=[Depends(require_token)])
+async def biblioteca_buscar(q: str):
+    achados = await asyncio.to_thread(biblioteca.busca, q, 5)
+    wiki = await asyncio.to_thread(biblioteca.wikipedia, q)
+    return {"trechos": [{"fonte": a["fonte"], "caminho": a["caminho"], "texto": a["texto"][:700]} for a in achados],
+            "wikipedia": wiki}
+
+
 @app.post("/app/generate", dependencies=[Depends(require_token)])
 async def app_generate(req: AppRequest):
     desc = req.description.strip()[:1500]
     base = _base_de(req)
     if not desc:
         raise HTTPException(400, "Descreva o app que você quer.")
+    desc = await _com_referencias(desc)
     if req.avancado or base["modo"] == "avancado":
         return _stream_job(lambda emit: codegen.gera_app_avancado(desc, base["arquivos"], base["nome"], emit))
     return _stream_job(lambda emit: androidgen.gera_app(desc, emit, base["codigo"], base["nome"]))
@@ -600,6 +664,7 @@ async def esp32_generate(req: AppRequest):
     base = _base_de(req)
     if not desc and not base["codigo"]:
         raise HTTPException(400, "Descreva o firmware que você quer, ou anexe um .ino para compilar.")
+    desc = await _com_referencias(desc)
     return _stream_job(lambda emit: esp32gen.gera_firmware(desc, req.board, emit, base["codigo"], base["nome"]))
 
 
@@ -609,6 +674,7 @@ async def codigo_generate(req: AppRequest):
     if not desc:
         raise HTTPException(400, "Descreva o que você quer criar.")
     base = _base_de(req)
+    desc = await _com_referencias(desc)
     return _stream_job(lambda emit: codegen.gera_codigo(req.alvo, desc, base["arquivos"], base["nome"], emit))
 
 
@@ -3324,6 +3390,290 @@ async def gera_codigo(alvo: str, descricao: str, base: dict[str, str] | None, ba
         finally:
             shutil.rmtree(pasta, ignore_errors=True)
 EOF
+  cat > biblioteca.py <<'EOF'
+"""Biblioteca local: documentação e código de referência guardados no disco grande.
+
+A pasta ~/biblioteca (um link para o disco de 500 GB) tem:
+  docs/    documentação (Python, MDN/web...)       codigo/  exemplos e bibliotecas (ESP32, Android...)
+  zim/     Wikipedia em português (offline)         meus/    qualquer arquivo seu: a IA passa a consultar
+O servidor cria um índice de busca (SQLite FTS5) com tudo isso, em segundo plano e com prioridade baixa.
+Na hora de responder ou de criar apps/firmware, os trechos mais parecidos com o pedido entram no contexto
+da IA, assim ela acerta nomes de funções e usos sem depender da internet.
+"""
+import html
+import os
+import re
+import shutil
+import sqlite3
+import threading
+import time
+from pathlib import Path
+
+import config
+
+EXTENSOES = {".md", ".rst", ".txt", ".h", ".hpp", ".c", ".cpp", ".ino", ".java", ".kt", ".py",
+             ".html", ".htm", ".gradle", ".xml", ".js", ".ts", ".css"}
+IGNORAR = {".git", "node_modules", "build", "__pycache__", ".gradle", "dist", "venv", ".venv"}
+MAX_ARQUIVO = 400_000
+TAM_TRECHO = 1300
+PARADAS = {"para", "como", "qual", "quais", "com", "uma", "que", "por", "mais", "isso", "este", "esta", "the", "and",
+           "for", "you", "with", "create", "crie", "faca", "fazer", "app", "quero", "preciso", "gere", "pode"}
+
+_estado = {"rodando": False, "arquivos": 0, "trechos": 0, "inicio": 0.0, "fim": 0.0, "erro": ""}
+_trava = threading.Lock()
+
+
+def raiz() -> Path:
+    return config.BIBLIOTECA_DIR
+
+
+def disponivel() -> bool:
+    try:
+        return raiz().is_dir() and os.access(raiz(), os.W_OK)
+    except OSError:
+        return False
+
+
+def _db() -> sqlite3.Connection:
+    con = sqlite3.connect(str(raiz() / "indice.db"), timeout=30)
+    con.execute("CREATE TABLE IF NOT EXISTS arquivos(caminho TEXT PRIMARY KEY, mtime REAL, fonte TEXT)")
+    con.execute("CREATE VIRTUAL TABLE IF NOT EXISTS trechos USING fts5("
+                "texto, caminho UNINDEXED, fonte UNINDEXED, tokenize='unicode61 remove_diacritics 2')")
+    return con
+
+
+def _fonte(rel: Path) -> str:
+    return "/".join(rel.parts[:2]) if len(rel.parts) > 2 else (rel.parts[0] if rel.parts else "")
+
+
+def _texto(path: Path) -> str:
+    try:
+        if path.stat().st_size > MAX_ARQUIVO:
+            return ""
+        t = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return ""
+    if path.suffix.lower() in (".html", ".htm"):
+        t = re.sub(r"(?is)<(script|style).*?</\1>", " ", t)
+        t = html.unescape(re.sub(r"<[^>]+>", " ", t))
+    return t
+
+
+def _trechos(texto: str) -> list[str]:
+    saida, atual = [], ""
+    for bloco in re.split(r"\n\s*\n", texto):
+        bloco = bloco.strip()
+        if not bloco:
+            continue
+        if len(atual) + len(bloco) + 2 <= TAM_TRECHO:
+            atual = (atual + "\n\n" + bloco) if atual else bloco
+            continue
+        if atual:
+            saida.append(atual)
+        while len(bloco) > TAM_TRECHO:  # bloco enorme (código sem linhas em branco): corta nas quebras de linha
+            corte = bloco.rfind("\n", 0, TAM_TRECHO)
+            corte = corte if corte > 200 else TAM_TRECHO
+            saida.append(bloco[:corte])
+            bloco = bloco[corte:].strip()
+        atual = bloco
+    if atual:
+        saida.append(atual)
+    return [t for t in saida if len(t) > 40]
+
+
+def indexar(forcar: bool = False) -> dict:
+    """Indexa arquivos novos ou alterados (e esquece os apagados). Roda em segundo plano, devagar."""
+    if not disponivel() or not _trava.acquire(blocking=False):
+        return dict(_estado)
+    try:
+        _estado.update(rodando=True, arquivos=0, trechos=0, inicio=time.time(), erro="")
+        try:
+            os.nice(10)
+        except (OSError, AttributeError):
+            pass
+        con = _db()
+        if forcar:
+            con.execute("DELETE FROM arquivos")
+            con.execute("DELETE FROM trechos")
+        conhecidos = {c: m for c, m in con.execute("SELECT caminho, mtime FROM arquivos")}
+        vistos = set()
+        base = raiz()
+        feitos = 0
+        for dirpath, dirs, files in os.walk(base):
+            dirs[:] = [d for d in dirs if d not in IGNORAR and not d.startswith(".")]
+            for nome in files:
+                p = Path(dirpath) / nome
+                if p.suffix.lower() not in EXTENSOES or nome == "indice.db":
+                    continue
+                rel = p.relative_to(base)
+                chave = str(rel)
+                vistos.add(chave)
+                try:
+                    mt = p.stat().st_mtime
+                except OSError:
+                    continue
+                if conhecidos.get(chave) == mt:
+                    continue
+                con.execute("DELETE FROM trechos WHERE caminho=?", (chave,))
+                partes = _trechos(_texto(p))
+                fonte = _fonte(rel)
+                con.executemany("INSERT INTO trechos(texto, caminho, fonte) VALUES (?,?,?)",
+                                [(t, chave, fonte) for t in partes])
+                con.execute("INSERT OR REPLACE INTO arquivos VALUES (?,?,?)", (chave, mt, fonte))
+                _estado["arquivos"] += 1
+                _estado["trechos"] += len(partes)
+                feitos += 1
+                if feitos % 200 == 0:
+                    con.commit()
+                    time.sleep(0.05)  # deixa o resto do PC respirar
+        for velho in set(conhecidos) - vistos:
+            con.execute("DELETE FROM trechos WHERE caminho=?", (velho,))
+            con.execute("DELETE FROM arquivos WHERE caminho=?", (velho,))
+        con.commit()
+        con.close()
+    except Exception as e:  # disco desmontado no meio, banco travado...
+        _estado["erro"] = f"{type(e).__name__}: {e}"[:200]
+    finally:
+        _estado.update(rodando=False, fim=time.time())
+        _trava.release()
+    return dict(_estado)
+
+
+def _palavras(consulta: str) -> list[str]:
+    vistos = []
+    for w in re.findall(r"[\w.+#]{3,}", consulta.lower()):
+        w = w.strip(".+#")
+        if len(w) >= 3 and w not in PARADAS and w not in vistos:
+            vistos.append(w)
+    return vistos[:8]
+
+
+def busca(consulta: str, k: int = 3, fontes: tuple[str, ...] | None = None) -> list[dict]:
+    """Trechos mais parecidos com a consulta. Só devolve os que casam com pelo menos 2 palavras (ou 1, se
+    a consulta só tem uma), para não encher a conversa de ruído."""
+    palavras = _palavras(consulta)
+    if not palavras or not disponivel() or not (raiz() / "indice.db").exists():
+        return []
+    consulta_fts = " OR ".join('"' + w.replace('"', "") + '"' for w in palavras)
+    try:
+        con = _db()
+        linhas = con.execute("SELECT texto, caminho, fonte FROM trechos WHERE trechos MATCH ? "
+                             "ORDER BY bm25(trechos) LIMIT 40", (consulta_fts,)).fetchall()
+        con.close()
+    except sqlite3.Error:
+        return []
+    minimo = min(2, len(palavras))
+    saida = []
+    for texto, caminho, fonte in linhas:
+        if fontes and not any(fonte.startswith(f) for f in fontes):
+            continue
+        baixo = texto.lower()
+        # nome técnico (os.listdir, esp32, set_server...) é raro o bastante para valer por duas palavras
+        pontos = sum(2 if re.search(r"[._\d]", w) else 1 for w in palavras if w in baixo)
+        if pontos >= minimo:
+            saida.append({"texto": texto, "caminho": caminho, "fonte": fonte})
+        if len(saida) >= k:
+            break
+    return saida
+
+
+# ------------------------------------------------------------------ Wikipedia offline (arquivos .zim)
+def _zims() -> list[Path]:
+    d = raiz() / "zim"
+    return sorted(d.glob("*.zim")) if d.is_dir() else []
+
+
+def wikipedia(consulta: str, k: int = 2, max_chars: int = 700) -> list[dict]:
+    """Busca nos arquivos .zim (Wikipedia offline). Precisa do pacote libzim; sem ele, devolve vazio."""
+    zims = _zims()
+    if not zims or not _palavras(consulta):
+        return []
+    try:
+        from libzim.reader import Archive
+        from libzim.search import Query, Searcher
+    except ImportError:
+        return []
+    saida = []
+    for z in zims:
+        try:
+            arq = Archive(str(z))
+            res = Searcher(arq).search(Query().set_query(consulta))
+            for caminho in res.getResults(0, k):
+                e = arq.get_entry_by_path(caminho)
+                item = e.get_item()
+                if "html" not in item.mimetype:
+                    continue
+                t = html.unescape(re.sub(r"<[^>]+>", " ", re.sub(r"(?is)<(script|style).*?</\1>", " ",
+                                                                  bytes(item.content).decode("utf-8", "ignore"))))
+                t = re.sub(r"\s+", " ", t).strip()
+                saida.append({"titulo": e.title, "texto": t[:max_chars], "fonte": z.name})
+        except Exception:
+            continue
+        if len(saida) >= k:
+            break
+    return saida[:k]
+
+
+# ------------------------------------------------------------------ o que entra no contexto da IA
+def contexto_chat(pergunta: str, max_chars: int = 1400) -> str:
+    achados = busca(pergunta, k=3)
+    if not achados:
+        return ""
+    texto, total = [], 0
+    for a in achados:
+        t = a["texto"][:520]
+        total += len(t)
+        if total > max_chars:
+            break
+        texto.append(f"[{a['fonte']}] {t}")
+    return "Da biblioteca local (use se ajudar):\n" + "\n---\n".join(texto)
+
+
+def referencias(descricao: str, max_chars: int = 1800) -> str:
+    """Trechos de exemplos e documentação para ajudar a escrever o código pedido (apps, firmware, web, python)."""
+    achados = busca(descricao, k=4, fontes=("codigo", "docs", "meus"))
+    if not achados:
+        return ""
+    texto, total = [], 0
+    for a in achados:
+        t = a["texto"][:600]
+        total += len(t)
+        if total > max_chars:
+            break
+        texto.append(f"// {a['caminho']}\n{t}")
+    return ("\n\nReferências da biblioteca local (exemplos reais; use os nomes de funções e classes se servirem, "
+            "ignore se não tiverem a ver):\n" + "\n---\n".join(texto))
+
+
+# ------------------------------------------------------------------ painel
+def status() -> dict:
+    r = raiz()
+    info = {"pasta": str(r), "destino": "", "disponivel": disponivel(), "livre_gb": None, "total_gb": None,
+            "fontes": [], "zims": [], "indexando": _estado["rodando"], "ultimo_erro": _estado["erro"],
+            "wikipedia_pronta": False}
+    try:
+        info["destino"] = str(r.resolve())
+        u = shutil.disk_usage(r if r.exists() else r.parent)
+        info["livre_gb"], info["total_gb"] = round(u.free / 1e9), round(u.total / 1e9)
+    except OSError:
+        pass
+    if info["disponivel"]:
+        try:
+            if (r / "indice.db").exists():
+                con = _db()
+                info["fontes"] = [{"nome": f, "trechos": n, "arquivos": a} for f, n, a in con.execute(
+                    "SELECT t.fonte, COUNT(*), COUNT(DISTINCT t.caminho) FROM trechos t GROUP BY t.fonte ORDER BY 2 DESC")]
+                con.close()
+        except sqlite3.Error:
+            pass
+        info["zims"] = [{"nome": z.name, "gb": round(z.stat().st_size / 1e9, 1)} for z in _zims()]
+        try:
+            import libzim  # noqa: F401
+            info["wikipedia_pronta"] = bool(info["zims"])
+        except ImportError:
+            pass
+    return info
+EOF
   cat > "$BASE/diagnostico_fans.sh" <<'EOF'
 #!/usr/bin/env bash
 # Mostra o que dá para controlar nas ventoinhas pelo Linux (GPU e CPU).
@@ -3575,6 +3925,7 @@ EOF
         <button class="item" id="memBtn">🧠 Memória</button>
         <button class="item" id="filesBtn">📁 Arquivos criados</button>
         <button class="item" id="sisBtn">🖥 Sistema e ventoinhas</button>
+        <button class="item" id="libBtn">📚 Biblioteca</button>
         <button class="item" id="pairBtn" hidden>📲 Conectar celular</button>
         <button class="item" id="cfgBtn" hidden>⚙ Servidor do app</button>
         <div class="sec">Aparência</div>
@@ -3667,6 +4018,16 @@ EOF
   <div class="dica">Aplicativos (.apk) e firmwares (.bin). Ficam guardados no PC, na pasta ~/localai/apps.</div>
   <div class="lista" id="fileslist"></div>
   <button class="bt" id="filesClose">Fechar</button>
+</dialog>
+
+<dialog id="libDlg">
+  <h2>Biblioteca</h2>
+  <div class="dica">Documentação e exemplos guardados no disco grande. A IA consulta isto sozinha ao responder e ao criar apps e firmware. Coloque seus próprios arquivos na pasta <b>meus</b>.</div>
+  <table class="sis" id="libTab"></table>
+  <div class="dica" id="libNota"></div>
+  <div style="display:flex;gap:8px;margin-top:10px"><input id="libQ" placeholder="Buscar na biblioteca…" style="flex:1"><button class="bt" id="libBusca">Buscar</button></div>
+  <div class="lista" id="libRes" style="max-height:34vh;overflow:auto"></div>
+  <div style="margin-top:14px;display:flex;gap:8px"><button class="bt" id="libIdx">Atualizar índice</button><button class="bt" id="libClose">Fechar</button></div>
 </dialog>
 
 <dialog id="sisDlg">
@@ -4218,7 +4579,7 @@ async function criarArquivo(tipo, desc, c, usados, base) {
 
 /* ======================= Janelas ======================= */
 const abreDlg = id => { fechaMenus(); document.body.classList.remove('lateral'); $(id).showModal(); };
-for (const [btn, dlg] of [['memClose', 'memDlg'], ['filesClose', 'filesDlg'], ['vozClose', 'vozDlg'], ['pairClose', 'pairDlg'], ['sisClose', 'sisDlg'], ['llmClose', 'llmDlg']]) $(btn).onclick = () => $(dlg).close();
+for (const [btn, dlg] of [['memClose', 'memDlg'], ['filesClose', 'filesDlg'], ['vozClose', 'vozDlg'], ['pairClose', 'pairDlg'], ['sisClose', 'sisDlg'], ['libClose', 'libDlg'], ['llmClose', 'llmDlg']]) $(btn).onclick = () => $(dlg).close();
 
 // --- memória
 async function carregaMem() {
@@ -4325,7 +4686,7 @@ async function lerTele() {
       h += linhaSis('Placa de vídeo', t.gpu.nome) + linhaSis('Temperatura da GPU', t.gpu.temp + ' °C', t.gpu.temp >= 80 ? 'err' : t.gpu.temp >= 70 ? 'warn' : '') + linhaSis('Uso da GPU', t.gpu.uso + ' %') +
            linhaSis('Memória da placa', t.gpu.mem_usada + ' / ' + t.gpu.mem_total + ' MiB') + linhaSis('Ventoinha da GPU', t.gpu.ventoinha + ' %') + linhaSis('Consumo da GPU', t.gpu.watts + ' W');
     }
-    h += linhaSis('Temperatura da CPU', t.cpu.temp != null ? t.cpu.temp.toFixed(0) + ' °C' : 'indisponível', t.cpu.temp >= 85 ? 'err' : t.cpu.temp >= 75 ? 'warn' : '') + linhaSis('Carga da CPU (1 min)', t.cpu.carga + ' (de ' + t.cpu.nucleos + ' threads)');
+    h += linhaSis('Temperatura da CPU', t.cpu.temp != null ? t.cpu.temp.toFixed(0) + ' °C' : 'indisponível', t.cpu.temp >= 85 ? 'err' : t.cpu.temp >= 75 ? 'warn' : '') + linhaSis('Uso da CPU', t.cpu.uso != null ? t.cpu.uso + ' %' : 'indisponível', t.cpu.uso >= 90 ? 'warn' : '') + linhaSis('Carga da CPU (1 min)', t.cpu.carga + ' (de ' + t.cpu.nucleos + ' threads)');
     for (const [k, v] of Object.entries(t.ventoinhas)) h += linhaSis('Ventoinha ' + k, v + ' RPM');
     h += linhaSis('Memória RAM', t.ram.usada + ' / ' + t.ram.total + ' MB');
     $('sisTab').innerHTML = h;
@@ -4334,6 +4695,33 @@ async function lerTele() {
   } catch (e) {}
 }
 $('sisBtn').onclick = () => { abreDlg('sisDlg'); lerTele(); clearInterval(sisTimer); sisTimer = setInterval(() => { if ($('sisDlg').open) lerTele(); else clearInterval(sisTimer); }, 2000); };
+// --- biblioteca local
+let libTimer = null;
+async function lerBib() {
+  try {
+    const b = await (await fetch('/biblioteca')).json(); let h = '';
+    h += linhaSis('Pasta', b.destino || b.pasta) + linhaSis('Disco', b.total_gb != null ? b.livre_gb + ' GB livres de ' + b.total_gb + ' GB' : 'indisponível');
+    for (const f of b.fontes) h += linhaSis(f.nome, f.arquivos + ' arquivos · ' + f.trechos + ' trechos');
+    for (const z of b.zims) h += linhaSis('Wikipedia offline', z.nome.replace(/\.zim$/, '') + ' · ' + z.gb + ' GB');
+    $('libTab').innerHTML = h;
+    $('libNota').textContent = !b.disponivel ? 'A pasta da biblioteca não está acessível. Rode: bash atualizar.sh (ele escolhe o disco grande) ou conecte/monte o disco.'
+      : b.indexando ? '⏳ Indexando em segundo plano… (os números sobem sozinhos)'
+      : b.fontes.length ? '✔ Biblioteca pronta.' : 'Ainda vazia: o download roda em segundo plano depois do atualizar.sh (acompanhe: tail -f ~/localai/biblioteca.log).';
+  } catch (e) { $('libNota').textContent = 'Não consegui ler a biblioteca.'; }
+}
+$('libBtn').onclick = () => { abreDlg('libDlg'); lerBib(); clearInterval(libTimer); libTimer = setInterval(() => { if ($('libDlg').open) lerBib(); else clearInterval(libTimer); }, 4000); };
+$('libIdx').onclick = async () => { await fetch('/biblioteca/indexar', { method: 'POST' }); setTimeout(lerBib, 400); };
+async function buscaBib() {
+  const q = $('libQ').value.trim(); if (!q) return;
+  $('libRes').textContent = 'Buscando…';
+  try {
+    const r = await (await fetch('/biblioteca/buscar?q=' + encodeURIComponent(q))).json(); let h = '';
+    for (const t of r.trechos) h += `<div class="item-l"><div class="t"><small>${esc(t.caminho)}</small>${esc(t.texto)}</div></div>`;
+    for (const w of r.wikipedia) h += `<div class="item-l"><div class="t"><small>Wikipedia · ${esc(w.titulo)}</small>${esc(w.texto)}</div></div>`;
+    $('libRes').innerHTML = h || '<div class="dica">Nada encontrado.</div>';
+  } catch (e) { $('libRes').textContent = 'Falha na busca.'; }
+}
+$('libBusca').onclick = buscaBib; $('libQ').onkeydown = e => { if (e.key === 'Enter') buscaBib(); };
 function montaChips(t) {
   const box = $('chips'); box.textContent = '';
   const add = (txtc, cls) => { const s = document.createElement('span'); s.textContent = txtc; if (cls) s.className = cls; box.appendChild(s); };
@@ -4464,6 +4852,135 @@ instalar_esp32() {
   "$CLI" config init >/dev/null 2>&1 || true
   "$CLI" config add board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
   "$CLI" core update-index && "$CLI" core install esp32:esp32
+}
+
+# ---------------------------------------------------- Biblioteca no disco grande (documentação e exemplos para a IA)
+# Escolhe sozinho o disco grande (>= 100 GB, que não seja o do sistema). Nunca formata nem apaga nada.
+# Para escolher outro lugar:  BIBLIOTECA_DESTINO=/media/$USER/MEUDISCO/biblioteca bash atualizar.sh
+disco_biblioteca() {
+  local alvo tam livre fs src melhor="" melhor_tam=0 dev nome tipo mp mnt
+  if [ -n "${BIBLIOTECA_DESTINO:-}" ]; then echo "$BIBLIOTECA_DESTINO"; return 0; fi
+  if [ -L "$HOME/biblioteca" ] && [ -d "$(readlink -f "$HOME/biblioteca")" ]; then readlink -f "$HOME/biblioteca"; return 0; fi
+  while read -r alvo tam livre fs src; do
+    alvo=$(printf '%b' "$alvo")
+    case "$alvo" in /|/boot*|/snap*|/var*|/run*|/sys*|/proc*|/dev*|/tmp*|/usr*|/home|/home/*) continue;; esac
+    case "$src" in /dev/loop*|/dev/ram*|tmpfs*|overlay*) continue;; esac
+    [ "${tam:-0}" -ge 100000000000 ] && [ "${livre:-0}" -ge 40000000000 ] || continue
+    [ "$tam" -gt "$melhor_tam" ] && { melhor="$alvo"; melhor_tam="$tam"; }
+  done < <(findmnt -brno TARGET,SIZE,AVAIL,FSTYPE,SOURCE 2>/dev/null)
+  if [ -z "$melhor" ]; then   # disco grande ainda não montado: tenta montar (só lê; nunca formata)
+    while read -r nome tam fs mp tipo; do
+      [ "$tipo" = part ] && [ -z "$mp" ] && [ "${tam:-0}" -ge 100000000000 ] || continue
+      case "$fs" in ext4|ntfs|exfat|btrfs|xfs) ;; *) continue;; esac
+      dev="/dev/$nome"
+      mnt=$(udisksctl mount -b "$dev" 2>/dev/null | sed -n 's/.* at \(.*\)\.$/\1/p' | head -1)
+      if [ -n "$mnt" ] && [ -d "$mnt" ]; then melhor="$mnt"; DISCO_DEV="$dev"; DISCO_FS="$fs"; break; fi
+    done < <(lsblk -rnbo NAME,SIZE,FSTYPE,MOUNTPOINT,TYPE 2>/dev/null)
+  fi
+  [ -n "$melhor" ] && echo "$melhor/biblioteca-betina"
+}
+
+# Se o disco foi montado agora, deixa montado em todo boot (entrada com "nofail": se o disco faltar, o PC liga normal).
+persistir_montagem() {
+  local dev="$1" fs="$2" uuid ponto=/mnt/disco-betina opts="defaults,nofail,x-systemd.device-timeout=5"
+  uuid=$(lsblk -no UUID "$dev" 2>/dev/null | head -1); [ -n "$uuid" ] || return 1
+  grep -q "$uuid" /etc/fstab 2>/dev/null && return 0
+  case "$fs" in ntfs) fs=ntfs-3g; opts="$opts,uid=$(id -u),gid=$(id -g),umask=022";; exfat) opts="$opts,uid=$(id -u),gid=$(id -g),umask=022";; esac
+  sudo mkdir -p "$ponto"
+  udisksctl unmount -b "$dev" >/dev/null 2>&1 || true
+  sudo cp /etc/fstab /etc/fstab.betina.bak
+  echo "UUID=$uuid $ponto $fs $opts 0 0" | sudo tee -a /etc/fstab >/dev/null
+  if sudo mount "$ponto" 2>/dev/null; then
+    echo "Disco montado em $ponto e vai montar sozinho em todo boot (cópia do fstab: /etc/fstab.betina.bak)."
+  else
+    sudo cp /etc/fstab.betina.bak /etc/fstab   # não deu: desfaz
+    udisksctl mount -b "$dev" >/dev/null 2>&1 || true
+    echo "AVISO: não consegui deixar o disco montado fixo (se for do Windows, desligue a 'inicialização rápida'). Desfiz a alteração."
+    return 1
+  fi
+}
+
+instalar_biblioteca() {
+  local dest
+  DISCO_DEV=""; DISCO_FS=""
+  local saida; saida=$(mktemp)
+  disco_biblioteca > "$saida" || true   # (sem $(...): precisa gravar DISCO_DEV no shell atual)
+  dest=$(cat "$saida"); rm -f "$saida"
+  if [ -z "$dest" ]; then
+    dest="$HOME/biblioteca-local"
+    echo "AVISO: não achei o disco grande (>= 100 GB livre). Vou usar $dest no disco do sistema por enquanto."
+    echo "       Quando conectar/montar o disco de 500 GB, rode de novo: bash atualizar.sh"
+  elif [ -n "$DISCO_DEV" ]; then
+    persistir_montagem "$DISCO_DEV" "$DISCO_FS" && dest="/mnt/disco-betina/biblioteca-betina"
+  fi
+  mkdir -p "$dest" 2>/dev/null || { sudo mkdir -p "$dest" && sudo chown "$USER": "$dest"; } || return 1
+  mkdir -p "$dest"/docs "$dest"/codigo "$dest"/zim "$dest"/meus
+  # ~/biblioteca vira um link para o disco grande (o servidor sempre olha ~/biblioteca)
+  if [ -d "$HOME/biblioteca" ] && [ ! -L "$HOME/biblioteca" ]; then
+    cp -an "$HOME/biblioteca/." "$dest/" 2>/dev/null && rm -rf "$HOME/biblioteca"
+  fi
+  ln -sfn "$dest" "$HOME/biblioteca"
+  echo "Biblioteca em: $dest   (livre: $(df -h --output=avail "$dest" | tail -1 | tr -d ' '))"
+
+  # leitor de Wikipedia offline (.zim)
+  "$SRV/.venv/bin/pip" install -q libzim >/dev/null 2>&1 || echo "AVISO: não instalei o leitor de Wikipedia offline (libzim); a biblioteca de textos funciona do mesmo jeito."
+
+  # bibliotecas do Arduino que a IA mais usa em firmware ESP32 (assim o código que ela escreve compila de primeira)
+  if [ -x "$HOME/bin/arduino-cli" ]; then
+    "$HOME/bin/arduino-cli" lib install ArduinoJson PubSubClient "Adafruit NeoPixel" "Adafruit GFX Library" "Adafruit SSD1306" \
+      "DHT sensor library" "Adafruit Unified Sensor" FastLED NTPClient WiFiManager OneWire DallasTemperature "LiquidCrystal I2C" \
+      "Adafruit BME280 Library" TFT_eSPI >/dev/null 2>&1 || echo "AVISO: algumas bibliotecas do Arduino não instalaram (ficam para a próxima)."
+  fi
+
+  cat > "$BASE/biblioteca_baixar.sh" <<'BIBEOF'
+#!/usr/bin/env bash
+# Baixa (ou continua baixando) a biblioteca no disco grande. Pode rodar de novo à vontade: o que já veio é pulado.
+# Acompanhe:  tail -f ~/localai/biblioteca.log
+BIB="$HOME/biblioteca"
+[ -d "$BIB" ] || { echo "Não achei ~/biblioteca. Rode: bash atualizar.sh"; exit 1; }
+mkdir -p "$BIB"/docs "$BIB"/codigo "$BIB"/zim "$BIB"/meus
+log() { echo "[$(date +%H:%M:%S)] $*"; }
+git_baixa() { [ -d "$BIB/codigo/$1/.git" ] && return 0; log "baixando $1"; git clone --depth 1 --quiet "$2" "$BIB/codigo/$1" || { rm -rf "$BIB/codigo/$1"; log "AVISO: falhou $1"; }; }
+
+log "== Exemplos e bibliotecas para ESP32/Arduino"
+git_baixa arduino-esp32     https://github.com/espressif/arduino-esp32
+git_baixa ArduinoJson       https://github.com/bblanchon/ArduinoJson
+git_baixa PubSubClient      https://github.com/knolleary/pubsubclient
+git_baixa Adafruit_NeoPixel https://github.com/adafruit/Adafruit_NeoPixel
+git_baixa Adafruit_SSD1306  https://github.com/adafruit/Adafruit_SSD1306
+git_baixa Adafruit_BME280   https://github.com/adafruit/Adafruit_BME280_Library
+git_baixa FastLED           https://github.com/FastLED/FastLED
+git_baixa TFT_eSPI          https://github.com/Bodmer/TFT_eSPI
+git_baixa WiFiManager       https://github.com/tzapu/WiFiManager
+git_baixa ESPAsyncWebServer https://github.com/ESP32Async/ESPAsyncWebServer
+log "== Exemplos de apps Android"
+git_baixa android-architecture-samples    https://github.com/android/architecture-samples
+git_baixa android-user-interface-samples  https://github.com/android/user-interface-samples
+git_baixa android-platform-samples        https://github.com/android/platform-samples
+log "== Documentação: Arduino, Python e Web (MDN)"
+[ -d "$BIB/docs/arduino-reference/.git" ] || git clone --depth 1 --quiet https://github.com/arduino/reference-en "$BIB/docs/arduino-reference" || log "AVISO: falhou arduino-reference"
+if [ ! -f "$BIB/docs/python/.ok" ]; then
+  log "baixando documentação do Python"; mkdir -p "$BIB/docs/python"
+  curl -L --fail -s https://docs.python.org/3/archives/python-3.12-docs-text.tar.bz2 | tar xj -C "$BIB/docs/python" --strip-components=1 && touch "$BIB/docs/python/.ok" || log "AVISO: falhou a documentação do Python"
+fi
+[ -d "$BIB/docs/mdn/.git" ] || { log "baixando MDN (HTML/CSS/JavaScript; ~1 GB)"; git clone --depth 1 --quiet https://github.com/mdn/content "$BIB/docs/mdn" || { rm -rf "$BIB/docs/mdn"; log "AVISO: falhou o MDN"; }; }
+log "== Wikipedia em português (offline)"
+if ! ls "$BIB"/zim/wikipedia_pt*.zim >/dev/null 2>&1; then
+  ARQ=$(curl -s --max-time 30 https://download.kiwix.org/zim/wikipedia/ | grep -o 'wikipedia_pt_all_nopic_[0-9-]*\.zim' | sort -u | tail -1)
+  if [ -n "$ARQ" ]; then
+    log "baixando $ARQ (alguns GB; pode demorar e continua de onde parou se interromper)"
+    curl -L --fail -C - -o "$BIB/zim/$ARQ.part" "https://download.kiwix.org/zim/wikipedia/$ARQ" && mv "$BIB/zim/$ARQ.part" "$BIB/zim/$ARQ" || log "AVISO: a Wikipedia não terminou; rode este script de novo"
+  else
+    log "AVISO: não achei a Wikipedia em português no servidor do Kiwix agora."
+  fi
+fi
+log "FIM. A IA já pode consultar tudo isso (o índice é atualizado sozinho a cada poucos minutos)."
+BIBEOF
+  chmod +x "$BASE/biblioteca_baixar.sh"
+  if [ -z "${SEM_DOWNLOAD_BIBLIOTECA:-}" ]; then
+    nohup nice -n 19 ionice -c3 bash "$BASE/biblioteca_baixar.sh" >> "$BASE/biblioteca.log" 2>&1 &
+    echo "Baixando a biblioteca em segundo plano (vários GB). Acompanhe: tail -f ~/localai/biblioteca.log"
+  fi
 }
 
 # ------------------------------------------------ gerador de imagens (stable-diffusion.cpp)
@@ -4675,6 +5192,7 @@ step "12/15 Tailscale (automático)"  instalar_tailscale
 step "13/15 Serviços automáticos"    instalar_servicos
 step "14/15 Desempenho e ventoinhas" instalar_desempenho
 step "15/15 Atalho na área de trabalho" instalar_atalho
+step "Biblioteca no disco grande"     instalar_biblioteca
 
 echo
 echo "=============================================================="

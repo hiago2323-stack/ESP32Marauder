@@ -41,6 +41,7 @@ from fastapi.responses import FileResponse, RedirectResponse, Response, Streamin
 from pydantic import BaseModel
 
 import androidgen
+import biblioteca
 import codegen
 import config
 import entregas
@@ -57,8 +58,21 @@ async def ciclo_de_vida(_app):
     config.UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
     await asyncio.to_thread(uploads.limpa_antigos)
     vigia = asyncio.create_task(recursos.vigia())   # descarrega da RAM os modelos de voz parados
+    indexador = asyncio.create_task(_indexa_biblioteca())
     yield
     vigia.cancel()
+    indexador.cancel()
+
+
+async def _indexa_biblioteca() -> None:
+    """Mantém o índice da biblioteca em dia (devagar e em segundo plano; os downloads novos entram sozinhos)."""
+    await asyncio.sleep(45)  # deixa o servidor e o modelo subirem primeiro
+    while True:
+        try:
+            await asyncio.to_thread(biblioteca.indexar)
+        except Exception:
+            pass
+        await asyncio.sleep(20 * 60)
 
 
 app = FastAPI(title="Local AI Server", lifespan=ciclo_de_vida)
@@ -215,6 +229,13 @@ async def _build_messages(req: ChatRequest) -> tuple[list[dict], int]:
         if ctx:
             partes.append(ctx[:9000])
 
+    try:  # a biblioteca local vale com ou sem pesquisa na web
+        lib = await asyncio.to_thread(biblioteca.contexto_chat, pergunta)
+    except Exception:
+        lib = ""
+    if lib:
+        partes.append(lib)
+
     n_web = 0
     if req.web:
         try:
@@ -227,6 +248,14 @@ async def _build_messages(req: ChatRequest) -> tuple[list[dict], int]:
             n_web = len(results)
             partes.append("Pesquisa na web:\n" + "\n".join(
                 f"[{i+1}] {r['title']} - {r['url']}\n{(r['snippet'] or '')[:260]}" for i, r in enumerate(results)))
+
+    if req.web and n_web == 0:  # sem internet (ou sem resultados): a Wikipedia offline do disco grande ajuda
+        try:
+            wiki = await asyncio.to_thread(biblioteca.wikipedia, pergunta)
+        except Exception:
+            wiki = []
+        if wiki:
+            partes.append("Wikipedia (offline):\n" + "\n".join(f"- {w['titulo']}: {w['texto']}" for w in wiki))
 
     if partes:
         msgs[ultimo]["content"] = "[CONTEXTO]\n" + "\n\n".join(partes) + "\n[FIM DO CONTEXTO]\n\n" + pergunta
@@ -366,12 +395,44 @@ def _base_de(req: AppRequest) -> dict:
     return base
 
 
+async def _com_referencias(desc: str) -> str:
+    """Junta ao pedido alguns exemplos/documentação da biblioteca local (se houver e se casarem com o pedido)."""
+    if not desc:
+        return desc
+    try:
+        return desc + await asyncio.to_thread(biblioteca.referencias, desc)
+    except Exception:
+        return desc
+
+
+@app.get("/biblioteca", dependencies=[Depends(require_token)])
+async def biblioteca_status():
+    return await asyncio.to_thread(biblioteca.status)
+
+
+@app.post("/biblioteca/indexar", dependencies=[Depends(require_token)])
+async def biblioteca_indexar(forcar: bool = False):
+    if biblioteca._estado["rodando"]:
+        return {"ok": True, "ja_rodando": True}
+    threading.Thread(target=biblioteca.indexar, args=(forcar,), daemon=True).start()
+    return {"ok": True}
+
+
+@app.get("/biblioteca/buscar", dependencies=[Depends(require_token)])
+async def biblioteca_buscar(q: str):
+    achados = await asyncio.to_thread(biblioteca.busca, q, 5)
+    wiki = await asyncio.to_thread(biblioteca.wikipedia, q)
+    return {"trechos": [{"fonte": a["fonte"], "caminho": a["caminho"], "texto": a["texto"][:700]} for a in achados],
+            "wikipedia": wiki}
+
+
 @app.post("/app/generate", dependencies=[Depends(require_token)])
 async def app_generate(req: AppRequest):
     desc = req.description.strip()[:1500]
     base = _base_de(req)
     if not desc:
         raise HTTPException(400, "Descreva o app que você quer.")
+    desc = await _com_referencias(desc)
     if req.avancado or base["modo"] == "avancado":
         return _stream_job(lambda emit: codegen.gera_app_avancado(desc, base["arquivos"], base["nome"], emit))
     return _stream_job(lambda emit: androidgen.gera_app(desc, emit, base["codigo"], base["nome"]))
@@ -383,6 +444,7 @@ async def esp32_generate(req: AppRequest):
     base = _base_de(req)
     if not desc and not base["codigo"]:
         raise HTTPException(400, "Descreva o firmware que você quer, ou anexe um .ino para compilar.")
+    desc = await _com_referencias(desc)
     return _stream_job(lambda emit: esp32gen.gera_firmware(desc, req.board, emit, base["codigo"], base["nome"]))
 
 
@@ -392,6 +454,7 @@ async def codigo_generate(req: AppRequest):
     if not desc:
         raise HTTPException(400, "Descreva o que você quer criar.")
     base = _base_de(req)
+    desc = await _com_referencias(desc)
     return _stream_job(lambda emit: codegen.gera_codigo(req.alvo, desc, base["arquivos"], base["nome"], emit))
 
 

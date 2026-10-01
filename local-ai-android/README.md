@@ -38,6 +38,10 @@ O instalador é gerado a partir de `server/`; mantenha os dois iguais.
 - [ ] Compilar `.bin` de ESP32 (`arduino-cli`)
 - [ ] App Android + acesso remoto (Tailscale)
 
+## Biblioteca no disco grande
+
+O `atualizar.sh` escolhe sozinho o disco grande (>= 100 GB, que não seja o do sistema; se estiver desmontado ele monta, só leitura/escrita, sem formatar, e deixa montado em todo boot com `nofail`), cria `~/biblioteca` apontando para ele e baixa em segundo plano (`tail -f ~/localai/biblioteca.log`): exemplos e bibliotecas ESP32/Arduino, exemplos de apps Android, documentação do Python, Arduino e MDN (web) e a Wikipedia em português offline. O servidor indexa tudo (SQLite FTS5, devagar e em segundo plano) e a IA recebe os trechos relevantes ao responder e ao criar apps/firmware. Joguei seus arquivos em `~/biblioteca/meus` e eles entram na busca também. Tela: engrenagem > Biblioteca. Para escolher outro lugar: `BIBLIOTECA_DESTINO=/caminho bash atualizar.sh`; para pular: `SEM_BIBLIOTECA=1`.
+
 ## App do celular (acesso de qualquer lugar)
 
 O app **Betina & IA** (`dist/Betina-IA.apk`, código em `android-client/`) é a "cara" do PC no celular.

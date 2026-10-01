@@ -81,3 +81,6 @@ OCIOSO_MIN = int(os.environ.get("OCIOSO_MIN", "10"))   # minutos parado até des
 IMG_MODEL = Path(os.environ.get("IMG_MODEL", str(HOME / "models" / "imagens" / "sd_turbo-f16-q8_0.gguf")))
 IMG_URL = "https://huggingface.co/Green-Sky/SD-Turbo-GGUF/resolve/main/sd_turbo-f16-q8_0.gguf"
 IMG_TAM = 2023745376
+
+# ---- Biblioteca local (documentação e código de referência; fica no disco grande via link ~/biblioteca) ----
+BIBLIOTECA_DIR = Path(os.environ.get("BIBLIOTECA_DIR", str(HOME / "biblioteca")))
