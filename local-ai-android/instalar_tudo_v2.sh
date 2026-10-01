@@ -4984,7 +4984,19 @@ BIBEOF
 }
 
 # ------------------------------------------------ gerador de imagens (stable-diffusion.cpp)
+# Modelo de imagens (SD-Turbo, ~2 GB): baixa sozinho em segundo plano, para você não precisar baixar pelo app.
+baixar_modelo_imagem() {
+  local d="$HOME/models/imagens" f=sd_turbo-f16-q8_0.gguf tam=2023745376 atual=0
+  mkdir -p "$d"
+  [ -f "$d/$f" ] && atual=$(stat -c %s "$d/$f")
+  [ "$atual" -ge $((tam * 999 / 1000)) ] && return 0
+  pgrep -f "sd_turbo-f16-q8_0.gguf.part" >/dev/null 2>&1 && return 0   # já está baixando
+  echo "==> Modelo de imagens (~2 GB) baixando em segundo plano (continua de onde parou se interromper)."
+  nohup nice -n 10 bash -c "curl -L --fail -C - -o '$d/$f.part' 'https://huggingface.co/Green-Sky/SD-Turbo-GGUF/resolve/main/$f' && mv '$d/$f.part' '$d/$f'" >> "$BASE/imagens-modelo.log" 2>&1 &
+}
+
 instalar_imagens() {
+  baixar_modelo_imagem || true
   if "$SRV/.venv/bin/python" -c "import stable_diffusion_cpp" 2>/dev/null; then
     echo "Motor de imagens já instalado."; return 0
   fi
