@@ -165,7 +165,12 @@ async function send(text) {
     }
     if ($('speak').checked && answer) await speak(answer);
   } catch (e) {
-    out.classList.add('err'); render(out, 'Erro: ' + e.message);
+    const caiu = e instanceof TypeError || /network|fetch/i.test(e.message);
+    const msg = caiu
+      ? 'A conexão com o servidor caiu no meio da resposta. O modelo pode ter reiniciado (falta de memória da placa?). Espere alguns minutos e tente de novo.'
+      : e.message;
+    out.classList.add('err');
+    render(out, (answer ? answer + '\n\n' : '') + '⚠ ' + msg);
     history.pop();
     setStatus('');
   } finally {

@@ -1,94 +1,24 @@
 #!/usr/bin/env bash
 # =====================================================================
-#  INSTALA TUDO - Linux Mint XFCE (base Ubuntu 24.04) - GTX 960 + Ryzen
-#  Driver NVIDIA 580, CUDA 12.6, telemetria/GPU, IA local (llama.cpp, modelo 3B),
-#  servidor com conversa por TEXTO e VOZ (100% local), pesquisa web, MEMÓRIA que
-#  cresce com o tempo,
-#  compilação Android, serviços no boot. (Tailscale/celular: fica pra depois.)
-#  Uso (SEM sudo):  bash instalar_tudo.sh
-#  Modelo: padrão 7B (mais inteligente, ~5 palavras/s na GTX 960).
-#  Para o 3B (mais leve e rápido):  MODELO=3b bash instalar_tudo_v2.sh
-#  Pode rodar de novo (também por cima de uma instalação anterior: ele aproveita
-#  o que já existe, mantém o token e as memórias). Log: ~/localai-install.log
+#  ATUALIZA o servidor da IA local (tela, memória, correções) SEM reinstalar
+#  nada. Mantém token, memórias e o modelo que já estão em uso.
+#
+#  Uso:   bash atualizar.sh               (camadas na placa: 6)
+#         NGL=4 bash atualizar.sh         (menos memória de vídeo; use se der erro)
+#  Reinicia o modelo: ele leva alguns minutos para carregar de novo.
 # =====================================================================
-set -uo pipefail
-LOG="$HOME/localai-install.log"
-exec > >(tee -a "$LOG") 2>&1
-
+set -euo pipefail
 BASE="$HOME/localai"
 SRV="$BASE/server"
-CUDA_DIR="/usr/local/cuda-12.6"
-MODELO="${MODELO:-7b}"
-case "$MODELO" in
-  3b) MODEL_FILE=Qwen2.5-3B-Instruct-Q4_K_M.gguf
-      MODEL_URL=https://huggingface.co/bartowski/Qwen2.5-3B-Instruct-GGUF/resolve/main/$MODEL_FILE
-      NGL_PADRAO=16; MODEL_TAM="~1,9 GB" ;;
-  *)  MODEL_FILE=Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf
-      MODEL_URL=https://huggingface.co/bartowski/Qwen2.5-Coder-7B-Instruct-GGUF/resolve/main/$MODEL_FILE
-      NGL_PADRAO=6; MODEL_TAM="~4,7 GB" ;;
-esac
-MODEL="$HOME/models/$MODEL_FILE"
-FAILED=()
+[ -d "$SRV" ] || { echo "Não achei $SRV. Rode primeiro o instalador."; exit 1; }
 
-[ "$(id -u)" -ne 0 ] || { echo "Rode SEM sudo: bash instalar_tudo.sh"; exit 1; }
-step() { echo; echo "################ $1"; shift; "$@" || { echo "!!! FALHOU: $1"; FAILED+=("$1"); }; }
+# descobre qual modelo já está configurado (mantém o mesmo)
+MODEL_FILE=$(grep -o 'models/[^}"]*\.gguf' "$BASE/start_llm.sh" 2>/dev/null | head -1 | cut -d/ -f2 || true)
+[ -n "$MODEL_FILE" ] || MODEL_FILE=Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf
+NGL_PADRAO="${NGL:-6}"
+echo "==> Modelo: $MODEL_FILE | camadas na placa (NGL): $NGL_PADRAO"
 
-echo "==> Digite a senha uma vez; ela fica ativa durante a instalação"
-sudo -v || exit 1
-( while true; do sudo -n true; sleep 50; kill -0 "$$" 2>/dev/null || exit; done ) >/dev/null 2>&1 &
-
-FREE_GB=$(df -BG --output=avail "$HOME" | tail -1 | tr -dc '0-9')
-[ "$FREE_GB" -ge 40 ] || { echo "Só há ${FREE_GB} GB livres; preciso de 40 GB."; exit 1; }
-
-# ------------------------------------------------------------ 1. Pacotes
-instalar_pacotes() {
-  sudo apt update
-  sudo apt install -y python3-venv python3-pip git cmake build-essential curl unzip \
-    openjdk-17-jdk pipx flatpak lm-sensors psensor xfce4-sensors-plugin libcurl4-openssl-dev
-}
-
-# ------------------------------------------------------------- 2. Driver
-instalar_driver() {
-  # 580 é o ÚLTIMO driver com suporte à GTX 960 (Maxwell). 590+ não reconhece a placa.
-  if dpkg -l | grep -qE '^ii\s+nvidia-driver-(59|6)[0-9]'; then
-    echo "Removendo driver 590+ (não suporta a GTX 960)"
-    sudo apt purge -y '^nvidia-driver-59.*' '^nvidia-driver-6.*' '^libnvidia-.*-59.*' '^nvidia-dkms-59.*' || true
-    sudo apt autoremove -y || true
-  fi
-  sudo apt install -y nvidia-driver-580 nvidia-settings
-}
-
-# --------------------------------------------------------------- 3. CUDA
-instalar_cuda() {
-  if [ ! -x "$CUDA_DIR/bin/nvcc" ]; then
-    curl -L --fail -o /tmp/cuda-keyring.deb \
-      https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb &&
-    sudo dpkg -i /tmp/cuda-keyring.deb &&
-    sudo apt update &&
-    sudo apt install -y cuda-toolkit-12-6   # não traz driver, então não briga com o 580
-  fi
-}
-
-# ------------------------------------------- 4. Telemetria e controle GPU
-instalar_telemetria() {
-  sudo sensors-detect --auto || true
-  flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
-  flatpak install -y flathub io.missioncenter.MissionCenter com.leinardi.gwe
-  pipx install 'glances[web,gpu]' || true
-  pipx ensurepath || true
-  # Coolbits 28 = controle de ventoinha + offset de clock
-  sudo mkdir -p /etc/X11/xorg.conf.d
-  sudo tee /etc/X11/xorg.conf.d/20-nvidia-coolbits.conf >/dev/null <<'XCONF'
-Section "Device"
-    Identifier "NVIDIA GPU"
-    Driver "nvidia"
-    Option "Coolbits" "28"
-EndSection
-XCONF
-}
-
-# ---------------------------------------------------- 5. Servidor (Python)
-instalar_servidor() {
+escrever_arquivos() {
   mkdir -p "$SRV" && cd "$SRV" || return 1
   cat > requirements.txt <<'EOF'
 fastapi==0.115.*
@@ -840,137 +770,18 @@ exec "$HOME/llama.cpp/build/bin/llama-server" -m "$MODEL" -ngl "$NGL" -c 4096 -t
 EOF
   sed -i "s/__NGL__/$NGL_PADRAO/; s/__MODEL__/$MODEL_FILE/" "$BASE/start_llm.sh"
   chmod +x run.sh "$BASE/start_llm.sh"
-  python3 -m venv .venv && .venv/bin/pip install --upgrade pip &&
-  .venv/bin/pip install -r requirements.txt || return 1
-  if [ ! -f .env ]; then
-    TOKEN=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
-    printf 'LOCALAI_TOKEN=%s\nLLAMA_URL=http://127.0.0.1:8081\nSEARXNG_URL=\n' "$TOKEN" > .env
-    chmod 600 .env
-  fi
 }
 
-# ----------------------------------------------------------- 6. Android SDK
-instalar_android_sdk() {
-  local SDK="$HOME/Android/Sdk" JH=/usr/lib/jvm/java-17-openjdk-amd64
-  if [ -x "$SDK/build-tools/34.0.0/aapt2" ]; then
-    echo "Android SDK já instalado, pulando"
-    grep -q '^ANDROID_HOME=' "$SRV/.env" || printf 'ANDROID_HOME=%s\nJAVA_HOME=%s\n' "$SDK" "$JH" >> "$SRV/.env"
-    return 0
-  fi
-  mkdir -p "$SDK/cmdline-tools"
-  curl -L --fail -o /tmp/cmdtools.zip \
-    https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip || return 1
-  unzip -q -o /tmp/cmdtools.zip -d "$SDK/cmdline-tools"
-  rm -rf "$SDK/cmdline-tools/latest"
-  mv "$SDK/cmdline-tools/cmdline-tools" "$SDK/cmdline-tools/latest"
-  export JAVA_HOME="$JH"
-  yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
-  "$SDK/cmdline-tools/latest/bin/sdkmanager" "platform-tools" "platforms;android-34" "build-tools;34.0.0" || return 1
-  grep -q '^ANDROID_HOME=' "$SRV/.env" || printf 'ANDROID_HOME=%s\nJAVA_HOME=%s\n' "$SDK" "$JH" >> "$SRV/.env"
-}
+escrever_arquivos
+cd "$SRV"
+.venv/bin/pip install -q -r requirements.txt
 
-# -------------------------------------------------- 7. llama.cpp + modelo
-instalar_llama() {
-  [ -x "$CUDA_DIR/bin/nvcc" ] || { echo "CUDA ausente"; return 1; }
-  export PATH="$CUDA_DIR/bin:$PATH"
-  cd "$HOME"
-  [ -d llama.cpp ] || git clone https://github.com/ggml-org/llama.cpp || return 1
-  cd llama.cpp && (git pull --ff-only || true)
-  echo "==> Compilando (15 a 40 minutos; é normal)"
-  cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=52 \
-    -DCMAKE_CUDA_COMPILER="$CUDA_DIR/bin/nvcc" &&
-  cmake --build build --config Release -j 4 --target llama-server || return 1
-  mkdir -p "$HOME/models"
-  if [ ! -f "$MODEL" ]; then
-    echo "==> Baixando o modelo $MODELO ($MODEL_TAM; retoma se cair)"
-    curl -L --fail -C - -o "$MODEL" "$MODEL_URL"
-  fi
-}
-
-# ------------------------------------------------- 8. Voz (ouvir e falar)
-instalar_voz() {
-  mkdir -p "$HOME/models"
-  local U=https://huggingface.co/rhasspy/piper-voices/resolve/main/pt/pt_BR/faber/medium
-  curl -L --fail -C - -o "$HOME/models/pt_BR-faber-medium.onnx" "$U/pt_BR-faber-medium.onnx" &&
-  curl -L --fail -C - -o "$HOME/models/pt_BR-faber-medium.onnx.json" "$U/pt_BR-faber-medium.onnx.json" || return 1
-  echo "==> Baixando o modelo que entende sua voz (~460 MB)"
-  "$SRV/.venv/bin/python" -c "from faster_whisper import WhisperModel; WhisperModel('small', device='cpu', compute_type='int8')"
-}
-
-instalar_atalho() {
-  mkdir -p "$HOME/.local/share/applications" "$HOME/Desktop"
-  cat > "$HOME/.local/share/applications/ia-local.desktop" <<DESK
-[Desktop Entry]
-Type=Application
-Name=IA Local
-Comment=Conversar com a IA local por texto e voz
-Exec=xdg-open http://localhost:8080
-Icon=utilities-terminal
-Terminal=false
-Categories=Utility;
-DESK
-  cp "$HOME/.local/share/applications/ia-local.desktop" "$HOME/Desktop/" && chmod +x "$HOME/Desktop/ia-local.desktop"
-}
-
-# ---------------------------------------------------- 9. Serviços no boot
-instalar_servicos() {
-  sudo tee /etc/systemd/system/localai-llm.service >/dev/null <<UNIT
-[Unit]
-Description=Local AI - llama-server
-After=network.target
-
-[Service]
-User=$USER
-Environment=NGL=$NGL_PADRAO
-ExecStart=/usr/bin/env bash $BASE/start_llm.sh
-Restart=on-failure
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-  sudo tee /etc/systemd/system/localai-server.service >/dev/null <<UNIT
-[Unit]
-Description=Local AI - servidor (chat, busca, build)
-After=network.target localai-llm.service
-
-[Service]
-User=$USER
-ExecStart=/usr/bin/env bash $SRV/run.sh
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-  sudo systemctl daemon-reload
-  sudo systemctl enable localai-llm.service localai-server.service  # sobem no próximo boot
-  sudo systemctl try-restart localai-llm.service localai-server.service || true  # só se já estiverem ativos
-}
-
-step "1/9 Pacotes"                  instalar_pacotes
-step "2/9 Driver NVIDIA 580"        instalar_driver
-step "3/9 CUDA 12.6"                instalar_cuda
-step "4/9 Telemetria e GPU"         instalar_telemetria
-step "5/9 Servidor"                 instalar_servidor
-step "6/9 Android SDK"              instalar_android_sdk
-step "7/9 llama.cpp + modelo"       instalar_llama
-step "8/9 Voz (ouvir e falar)"       instalar_voz
-step "9/9 Serviços automáticos"     instalar_servicos
-step "9/9 Atalho na área de trabalho" instalar_atalho
+echo "==> Reiniciando os serviços"
+sudo sed -i "s/^Environment=NGL=.*/Environment=NGL=$NGL_PADRAO/" /etc/systemd/system/localai-llm.service
+sudo systemctl daemon-reload
+sudo systemctl restart localai-server.service localai-llm.service
 
 echo
-echo "=============================================================="
-if [ ${#FAILED[@]} -eq 0 ]; then echo " TUDO INSTALADO."
-else echo " Falharam (veja $LOG):"; printf '   - %s\n' "${FAILED[@]}"; fi
-echo
-echo " SEU TOKEN (vai no app do celular):"
-grep '^LOCALAI_TOKEN=' "$SRV/.env" 2>/dev/null | cut -d= -f2
-echo
-echo " Agora: 1) REINICIE o PC"
-echo "        2) nvidia-smi             (deve listar a GTX 960)"
-echo "        3) espere ~1 minuto e abra o atalho 'IA Local' na área de trabalho"
-echo "        (Modelos antigos que não usar mais podem ser apagados de ~/models)"
-echo "           (ou o navegador em http://localhost:8080)"
-echo "        Se não abrir:  systemctl status localai-llm localai-server"
-echo "=============================================================="
+echo "Pronto. O modelo está recarregando (pode levar alguns minutos)."
+echo "Acompanhe com:   journalctl -fu localai-llm      (Ctrl+C para sair)"
+echo "Está pronto quando isto responder {\"status\":\"ok\"}:   curl -s localhost:8081/health"

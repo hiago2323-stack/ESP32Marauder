@@ -16,6 +16,7 @@ Conexões vindas do próprio PC (127.0.0.1) não precisam de token; as de fora p
 import asyncio
 import hmac
 import io
+import json
 import re
 import shutil
 import subprocess
@@ -93,6 +94,10 @@ class ChatRequest(BaseModel):
     web: bool = False
 
 
+def _sse_error(msg: str) -> bytes:
+    return f"data: {json.dumps({'error': msg})}\n\n".encode()
+
+
 async def _build_messages(req: ChatRequest) -> tuple[list[dict], int]:
     system = f"{config.SYSTEM_PROMPT}\nData de hoje: {date.today().isoformat()}."
     msgs = [{"role": "system", "content": system}]
@@ -130,13 +135,21 @@ async def chat(req: ChatRequest):
                 async with client.stream(
                     "POST", f"{config.LLAMA_URL}/v1/chat/completions", json=payload
                 ) as r:
+                    if r.status_code == 503:
+                        yield _sse_error("O modelo ainda está carregando na memória. Espere um pouco e tente de novo.")
+                        return
                     if r.status_code != 200:
-                        yield f'data: {{"error": "llama-server respondeu {r.status_code}"}}\n\n'.encode()
+                        yield _sse_error(f"O modelo respondeu com erro {r.status_code}.")
                         return
                     async for chunk in r.aiter_raw():
                         yield chunk
             except httpx.ConnectError:
-                yield b'data: {"error": "O modelo (llama-server) esta desligado"}\n\n'
+                yield _sse_error("O modelo (llama-server) está desligado ou reiniciando. Espere carregar e tente de novo.")
+            except (httpx.ReadError, httpx.RemoteProtocolError, httpx.ReadTimeout):
+                yield _sse_error(
+                    "O modelo parou no meio da resposta (provável falta de memória da placa de vídeo). "
+                    "Ele reinicia sozinho; espere carregar e tente de novo."
+                )
 
     # X-Web-Results: quantos resultados da web foram usados (0 = a pesquisa falhou ou não foi pedida)
     return StreamingResponse(stream(), media_type="text/event-stream", headers={"X-Web-Results": str(n_web)})

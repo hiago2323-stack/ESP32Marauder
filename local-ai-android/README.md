@@ -38,6 +38,13 @@ O instalador é gerado a partir de `server/`; mantenha os dois iguais.
 - [ ] Compilar `.bin` de ESP32 (`arduino-cli`)
 - [ ] App Android + acesso remoto (Tailscale)
 
+## Atualizar sem reinstalar
+
+```
+bash atualizar.sh          # troca o código e reinicia os serviços (mantém token, memória e modelo)
+NGL=4 bash atualizar.sh    # menos camadas na placa = menos memória de vídeo (se der "network error")
+```
+
 ## Como a IA "aprende com o tempo"
 
 O modelo não muda; a **memória** cresce. A cada pergunta, o servidor busca na memória o que é
