@@ -6,6 +6,8 @@
 #  cresce com o tempo,
 #  compilação Android, serviços no boot. (Tailscale/celular: fica pra depois.)
 #  Uso (SEM sudo):  bash instalar_tudo.sh
+#  Modelo: padrão 7B (mais inteligente, ~5 palavras/s na GTX 960).
+#  Para o 3B (mais leve e rápido):  MODELO=3b bash instalar_tudo_v2.sh
 #  Pode rodar de novo (também por cima de uma instalação anterior: ele aproveita
 #  o que já existe, mantém o token e as memórias). Log: ~/localai-install.log
 # =====================================================================
@@ -16,7 +18,16 @@ exec > >(tee -a "$LOG") 2>&1
 BASE="$HOME/localai"
 SRV="$BASE/server"
 CUDA_DIR="/usr/local/cuda-12.6"
-MODEL="$HOME/models/Qwen2.5-3B-Instruct-Q4_K_M.gguf"
+MODELO="${MODELO:-7b}"
+case "$MODELO" in
+  3b) MODEL_FILE=Qwen2.5-3B-Instruct-Q4_K_M.gguf
+      MODEL_URL=https://huggingface.co/bartowski/Qwen2.5-3B-Instruct-GGUF/resolve/main/$MODEL_FILE
+      NGL_PADRAO=16; MODEL_TAM="~1,9 GB" ;;
+  *)  MODEL_FILE=Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf
+      MODEL_URL=https://huggingface.co/bartowski/Qwen2.5-Coder-7B-Instruct-GGUF/resolve/main/$MODEL_FILE
+      NGL_PADRAO=8; MODEL_TAM="~4,7 GB" ;;
+esac
+MODEL="$HOME/models/$MODEL_FILE"
 FAILED=()
 
 [ "$(id -u)" -ne 0 ] || { echo "Rode SEM sudo: bash instalar_tudo.sh"; exit 1; }
@@ -24,7 +35,7 @@ step() { echo; echo "################ $1"; shift; "$@" || { echo "!!! FALHOU: $1
 
 echo "==> Digite a senha uma vez; ela fica ativa durante a instalação"
 sudo -v || exit 1
-( while true; do sudo -n true; sleep 50; kill -0 "$$" 2>/dev/null || exit; done ) 2>/dev/null &
+( while true; do sudo -n true; sleep 50; kill -0 "$$" 2>/dev/null || exit; done ) >/dev/null 2>&1 &
 
 FREE_GB=$(df -BG --output=avail "$HOME" | tail -1 | tr -dc '0-9')
 [ "$FREE_GB" -ge 40 ] || { echo "Só há ${FREE_GB} GB livres; preciso de 40 GB."; exit 1; }
@@ -800,14 +811,15 @@ exec .venv/bin/uvicorn main:app --host 127.0.0.1 --port 8080
 EOF
   cat > "$BASE/start_llm.sh" <<'EOF'
 #!/usr/bin/env bash
-# NGL = camadas na GPU (o modelo 3B tem 36). Com 2 GB de VRAM comece em 16 e
-# ajuste de 2 em 2 olhando o nvidia-smi: perto de 1800 MiB é o limite.
+# NGL = camadas na GPU. Com 2 GB de VRAM ajuste de 2 em 2 olhando o nvidia-smi:
+# perto de 1800 MiB é o limite (7B: comece em 8; 3B: em 16).
 # Para trocar de modelo, mude MODEL (qualquer arquivo .gguf em ~/models).
-NGL="${NGL:-16}"
-MODEL="${MODEL:-$HOME/models/Qwen2.5-3B-Instruct-Q4_K_M.gguf}"
+NGL="${NGL:-__NGL__}"
+MODEL="${MODEL:-$HOME/models/__MODEL__}"
 exec "$HOME/llama.cpp/build/bin/llama-server" -m "$MODEL" -ngl "$NGL" -c 4096 -t 6 \
   --host 127.0.0.1 --port 8081
 EOF
+  sed -i "s/__NGL__/$NGL_PADRAO/; s/__MODEL__/$MODEL_FILE/" "$BASE/start_llm.sh"
   chmod +x run.sh "$BASE/start_llm.sh"
   python3 -m venv .venv && .venv/bin/pip install --upgrade pip &&
   .venv/bin/pip install -r requirements.txt || return 1
@@ -851,9 +863,8 @@ instalar_llama() {
   cmake --build build --config Release -j 4 --target llama-server || return 1
   mkdir -p "$HOME/models"
   if [ ! -f "$MODEL" ]; then
-    echo "==> Baixando o modelo (~1,9 GB; retoma se cair)"
-    curl -L --fail -C - -o "$MODEL" \
-      https://huggingface.co/bartowski/Qwen2.5-3B-Instruct-GGUF/resolve/main/Qwen2.5-3B-Instruct-Q4_K_M.gguf
+    echo "==> Baixando o modelo $MODELO ($MODEL_TAM; retoma se cair)"
+    curl -L --fail -C - -o "$MODEL" "$MODEL_URL"
   fi
 }
 
@@ -891,7 +902,7 @@ After=network.target
 
 [Service]
 User=$USER
-Environment=NGL=16
+Environment=NGL=$NGL_PADRAO
 ExecStart=/usr/bin/env bash $BASE/start_llm.sh
 Restart=on-failure
 RestartSec=10
@@ -940,7 +951,7 @@ echo
 echo " Agora: 1) REINICIE o PC"
 echo "        2) nvidia-smi             (deve listar a GTX 960)"
 echo "        3) espere ~1 minuto e abra o atalho 'IA Local' na área de trabalho"
-echo "        (Se sobrou o modelo antigo de 7B em ~/models, pode apagar para liberar 4,7 GB)"
+echo "        (Modelos antigos que não usar mais podem ser apagados de ~/models)"
 echo "           (ou o navegador em http://localhost:8080)"
 echo "        Se não abrir:  systemctl status localai-llm localai-server"
 echo "=============================================================="
