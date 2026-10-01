@@ -40,6 +40,24 @@
          align-items:flex-start; font-size:14px; white-space:pre-wrap; }
   .mem span { flex:1; word-break:break-word; }
   .mem small { color:var(--mut); display:block; }
+  #optBtn { display:none; }
+  #opts { display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin-left:auto; }
+  #modeRow { display:flex; gap:8px; padding:6px 16px; background:var(--panel); border-top:1px solid var(--line); }
+  #modeRow select { width:auto; flex:0 1 auto; }
+  a.btn.bloco { display:block; width:fit-content; margin-top:6px; }
+  .copia { font-family:ui-monospace,monospace; font-size:13px; word-break:break-all; background:var(--bg);
+           border:1px solid var(--line); border-radius:8px; padding:6px 8px; margin:4px 0; }
+  @media (max-width: 760px) {
+    #optBtn { display:inline-block; }
+    #opts { display:none; width:100%; margin-left:0; }
+    body.opts #opts { display:flex; }
+    header { gap:8px; padding:8px 12px; }
+    #bar { flex-wrap:wrap; padding:8px 12px; }
+    #bar textarea { flex:1 1 100%; order:-1; }
+    #bar button { flex:1; padding:10px 8px; }
+    #log { padding:12px; }
+    .msg { max-width:100%; }
+  }
   #stop:not(:disabled) { border-color:#c0392b; color:#e57368; font-weight:600; }
   a.btn { display:inline-block; padding:8px 14px; border:1px solid var(--acc); border-radius:8px;
           color:var(--acc); text-decoration:none; margin-top:8px; }
@@ -54,14 +72,18 @@
 <body>
 <header>
   <h1>IA Local</h1>
-  <label><input type="checkbox" id="web"> Pesquisar na web</label>
-  <label title="Guarda na memória o que descobrir pesquisando"><input type="checkbox" id="learn" checked> Aprender com pesquisas</label>
-  <label><input type="checkbox" id="speak"> Falar as respostas</label>
-  <label title="A IA escreve, compila e entrega o APK de um app Android"><input type="checkbox" id="appmode"> 📱 Criar app Android</label>
-  <button id="voiceBtn">🔊 Voz</button>
-  <button id="appsBtn">📱 Meus apps</button>
-  <button id="memBtn">🧠 Memória</button>
-  <button id="new">Nova conversa</button>
+  <button id="optBtn">☰ Opções</button>
+  <div id="opts">
+    <label><input type="checkbox" id="web"> Pesquisar na web</label>
+    <label title="Guarda na memória o que descobrir pesquisando"><input type="checkbox" id="learn" checked> Aprender com pesquisas</label>
+    <label><input type="checkbox" id="speak"> Falar as respostas</label>
+    <button id="voiceBtn">🔊 Voz</button>
+    <button id="filesBtn">📁 Arquivos</button>
+    <button id="memBtn">🧠 Memória</button>
+    <button id="pairBtn" hidden>📲 Conectar celular</button>
+    <button id="cfgBtn" hidden>⚙ Servidor</button>
+    <button id="new">Nova conversa</button>
+  </div>
 </header>
 <dialog id="memDlg">
   <strong>Memória de longo prazo</strong>
@@ -81,14 +103,32 @@
   <input type="range" id="vel" min="0.7" max="1.4" step="0.05" value="1">
   <div style="display:flex;gap:8px;margin-top:14px"><button id="vozTest">▶ Testar</button><button id="vozClose">Fechar</button></div>
 </dialog>
-<dialog id="appsDlg">
-  <strong>Apps que a IA criou</strong>
-  <div class="dica">Ficam guardados no PC em ~/localai/apps. Passe o arquivo .apk para o celular (cabo USB, Bluetooth ou nuvem) e abra-o para instalar.</div>
-  <div id="appslist" style="margin:10px 0;display:flex;flex-direction:column;gap:8px"></div>
-  <button id="appsClose">Fechar</button>
+<dialog id="filesDlg">
+  <strong>Arquivos que a IA criou</strong>
+  <div class="dica">Aplicativos (.apk) e firmwares (.bin). Ficam guardados no PC, na pasta ~/localai/apps.</div>
+  <div id="fileslist" style="margin:10px 0;display:flex;flex-direction:column;gap:8px;max-height:55vh;overflow-y:auto"></div>
+  <button id="filesClose">Fechar</button>
+</dialog>
+<dialog id="pairDlg">
+  <strong>Conectar o celular</strong>
+  <div class="dica">No celular: instale o Tailscale, entre com a mesma conta do PC e abra o app IA Local. Na primeira vez ele pede estes dois dados.</div>
+  <div style="margin-top:10px"><b>Endereço do servidor</b> (use o do Tailscale para funcionar de qualquer lugar)</div>
+  <div id="pairUrls"></div>
+  <div style="margin-top:10px"><b>Token (senha)</b></div>
+  <div id="pairToken" class="copia"></div>
+  <div class="dica">Não mostre o token para ninguém. Ele dá acesso total à sua IA.</div>
+  <div style="margin-top:12px"><button id="pairClose">Fechar</button></div>
 </dialog>
 <div id="log"></div>
 <div id="status"></div>
+<div id="modeRow">
+  <select id="modo" title="O que você quer fazer">
+    <option value="chat">💬 Conversa</option>
+    <option value="app">📱 Criar app Android (.apk)</option>
+    <option value="esp32">🔌 Criar firmware ESP32 (.bin)</option>
+  </select>
+  <select id="placa" hidden></select>
+</div>
 <div id="bar">
   <button id="mic" title="Clique para gravar, clique de novo para enviar">🎤 Falar</button>
   <textarea id="txt" placeholder="Escreva aqui (Enter envia, Shift+Enter quebra linha)"></textarea>
@@ -98,7 +138,9 @@
 <script>
 const $ = id => document.getElementById(id);
 const log = $('log'), txt = $('txt'), statusEl = $('status');
+const NATIVO = typeof window.AndroidBridge !== 'undefined';  // dentro do app Android
 let history = [];
+let gravandoNativo = false;
 let busy = false, ctrl = null, falando = false, descartar = false;
 const setStatus = t => statusEl.textContent = t || '';
 
@@ -149,8 +191,8 @@ async function send(text) {
   busy = true; $('send').disabled = true;
   txt.value = '';
   addMsg('user', text);
-  if ($('appmode').checked) {
-    try { await criarApp(text); }
+  if ($('modo').value !== 'chat') {
+    try { await criarArquivo($('modo').value, text); }
     finally { busy = false; ctrl = null; $('send').disabled = false; txt.focus(); }
     return;
   }
@@ -270,7 +312,27 @@ async function speak(text) {
 }
 
 let rec = null, chunks = [];
+function micNativo() {
+  pararVoz();
+  if (!gravandoNativo) {
+    if (window.AndroidBridge.startRec()) {
+      gravandoNativo = true; $('mic').classList.add('rec'); $('mic').textContent = '⏹ Enviar';
+      setStatus('Gravando… toque em "Enviar" quando terminar de falar.');
+    } else setStatus('Libere o microfone para o app (o Android mostra um aviso) e toque de novo.');
+  } else {
+    gravandoNativo = false; $('mic').classList.remove('rec'); $('mic').textContent = '🎤 Falar';
+    setStatus('Entendendo o que você disse…'); window.AndroidBridge.stopRec();
+  }
+}
+// o app Android chama isto quando o servidor devolve o texto da gravação
+window.onNativeStt = (text, erro) => {
+  setStatus('');
+  if (erro) { setStatus('Erro na voz: ' + erro); return; }
+  if (text) { $('speak').checked = true; send(text); }
+  else setStatus('Não consegui ouvir nada. Tente de novo.');
+};
 $('mic').onclick = async () => {
+  if (NATIVO) { micNativo(); return; }
   pararVoz();
   if (rec) { rec.stop(); return; }
   try {
@@ -325,11 +387,12 @@ function parar() {
   if (ctrl) ctrl.abort();
   pararVoz();
   if (rec) { descartar = true; rec.stop(); }
+  if (gravandoNativo) { gravandoNativo = false; window.AndroidBridge.cancelRec(); $('mic').classList.remove('rec'); $('mic').textContent = '🎤 Falar'; }
   setStatus('');
 }
 $('stop').onclick = parar;
 document.addEventListener('keydown', e => { if (e.key === 'Escape') parar(); });
-setInterval(() => { $('stop').disabled = !(busy || falando || rec); }, 150);
+setInterval(() => { $('stop').disabled = !(busy || falando || rec || gravandoNativo); }, 150);
 
 // ---------------- escolha da voz
 let vozesCarregadas = false;
@@ -367,19 +430,26 @@ $('vozTest').onclick = async () => {
 };
 $('vozClose').onclick = () => $('vozDlg').close();
 
-// ---------------- criar app Android
-async function criarApp(desc) {
+// ---------------- criar app Android / firmware ESP32
+const fmtTam = n => n >= 1048576 ? (n / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(n / 1024)) + ' KB';
+function botaoArquivo(f) {
+  const a = document.createElement('a'); a.className = 'btn bloco'; a.href = f.url; a.download = f.name;
+  a.textContent = `⬇ ${f.label} · ${fmtTam(f.size)}`; return a;
+}
+async function criarArquivo(tipo, desc) {
+  const rotulo = tipo === 'app' ? 'app' : 'firmware';
   const card = addMsg('assistant', '');
   const st = document.createElement('div'); const extra = document.createElement('div');
   card.append(st, extra);
   const rola = () => { log.scrollTop = log.scrollHeight; };
   st.textContent = '⏳ Enviando o pedido…';
-  setStatus('Criando o app… (clique em ⏹ Parar para cancelar)');
+  setStatus(`Criando o ${rotulo}… (clique em ⏹ Parar para cancelar)`);
   let terminou = false;
   try {
     ctrl = new AbortController();
-    const r = await fetch('/app/generate', {method: 'POST', headers: {'Content-Type': 'application/json'},
-                                            body: JSON.stringify({description: desc}), signal: ctrl.signal});
+    const r = await fetch(tipo === 'app' ? '/app/generate' : '/esp32/generate', {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, signal: ctrl.signal,
+      body: JSON.stringify({description: desc, board: $('placa').value || 'esp32'})});
     if (!r.ok) throw new Error('Servidor respondeu ' + r.status);
     const reader = r.body.getReader(), dec = new TextDecoder(); let buf = '';
     for (;;) {
@@ -398,11 +468,9 @@ async function criarApp(desc) {
           sm.textContent = 'Ver o código que a IA escreveu'; pre.textContent = ev.text; d.append(sm, pre); extra.appendChild(d);
         } else if (ev.type === 'done') {
           terminou = true;
-          st.textContent = `✅ App "${ev.name}" pronto! (${Math.max(1, Math.round(ev.size / 1024))} KB)`;
-          const a = document.createElement('a'); a.className = 'btn'; a.href = ev.apk; a.download = ''; a.textContent = '⬇ Baixar o APK';
-          const dica = document.createElement('div'); dica.className = 'dica';
-          dica.textContent = 'Passe o arquivo para o celular (cabo USB, Bluetooth ou nuvem) e abra-o para instalar. Se o Android pedir, permita instalar de fontes desconhecidas.';
-          extra.append(a, dica);
+          st.textContent = `✅ "${ev.name}" pronto!`;
+          for (const f of ev.files) extra.appendChild(botaoArquivo(f));
+          if (ev.note) { const dica = document.createElement('div'); dica.className = 'dica'; dica.textContent = ev.note; extra.appendChild(dica); }
         } else if (ev.type === 'error') {
           terminou = true; card.classList.add('err'); st.textContent = '⚠ ' + ev.msg;
           if (ev.log) { const d = document.createElement('details'), sm = document.createElement('summary'), pre = document.createElement('pre');
@@ -411,32 +479,57 @@ async function criarApp(desc) {
         rola();
       }
     }
-    if (!terminou) { card.classList.add('err'); st.textContent = '⚠ A conexão terminou antes do app ficar pronto.'; }
+    if (!terminou) { card.classList.add('err'); st.textContent = `⚠ A conexão terminou antes do ${rotulo} ficar pronto.`; }
   } catch (e) {
-    if (e.name === 'AbortError') st.textContent = '⏹ Criação do app cancelada por você.';
+    if (e.name === 'AbortError') st.textContent = `⏹ Criação do ${rotulo} cancelada por você.`;
     else { card.classList.add('err'); st.textContent = '⚠ ' + (e instanceof TypeError ? 'A conexão com o servidor caiu. O modelo pode ter reiniciado; espere e tente de novo.' : e.message); }
   } finally { setStatus(''); }
 }
-$('appmode').onchange = () => {
-  txt.placeholder = $('appmode').checked ? 'Descreva o app que você quer criar (ex.: um app de lista de compras)…'
-                                          : 'Escreva aqui (Enter envia, Shift+Enter quebra linha)';
+const PLACEHOLDERS = {
+  chat: 'Escreva aqui (Enter envia)',
+  app: 'Descreva o app que você quer criar (ex.: um app de lista de compras)…',
+  esp32: 'Descreva o firmware (ex.: ligar um LED por uma página web no Wi-Fi)…',
 };
-async function listaApps() {
-  const box = $('appslist'); box.textContent = 'Carregando…';
-  const apps = await (await fetch('/apps')).json();
-  box.textContent = apps.length ? '' : 'Ainda não há nenhum app criado.';
-  for (const a of apps) {
-    const row = document.createElement('div'); row.className = 'mem';
-    const sp = document.createElement('span'); sp.textContent = a.name;
-    const sm = document.createElement('small');
-    sm.textContent = a.description + ' · ' + new Date(a.created * 1000).toLocaleDateString('pt-BR');
-    sp.appendChild(sm);
-    const dl = document.createElement('a'); dl.className = 'btn'; dl.style.marginTop = '0'; dl.href = '/apk/' + a.id; dl.download = ''; dl.textContent = '⬇ APK';
-    row.append(sp, dl); box.appendChild(row);
+$('modo').onchange = async () => {
+  const m = $('modo').value;
+  txt.placeholder = PLACEHOLDERS[m];
+  $('placa').hidden = m !== 'esp32';
+  if (m === 'esp32' && !$('placa').options.length) {
+    try {
+      for (const b of await (await fetch('/boards')).json()) { const o = document.createElement('option'); o.value = b.id; o.textContent = b.label; $('placa').appendChild(o); }
+    } catch (e) {}
+  }
+};
+async function listaArquivos() {
+  const box = $('fileslist'); box.textContent = 'Carregando…';
+  const itens = await (await fetch('/files')).json();
+  box.textContent = itens.length ? '' : 'Ainda não há nenhum arquivo criado.';
+  for (const it of itens) {
+    const row = document.createElement('div'); row.className = 'mem'; row.style.flexDirection = 'column';
+    const t = document.createElement('div'); t.textContent = (it.kind === 'apk' ? '📱 ' : '🔌 ') + it.name;
+    const sm = document.createElement('small'); sm.style.color = 'var(--mut)';
+    sm.textContent = it.description + ' · ' + new Date(it.created * 1000).toLocaleDateString('pt-BR');
+    row.append(t, sm); for (const f of it.files) row.appendChild(botaoArquivo(f));
+    box.appendChild(row);
   }
 }
-$('appsBtn').onclick = () => { $('appsDlg').showModal(); listaApps(); };
-$('appsClose').onclick = () => $('appsDlg').close();
+$('filesBtn').onclick = () => { $('filesDlg').showModal(); listaArquivos(); };
+$('filesClose').onclick = () => $('filesDlg').close();
+
+// ---------------- conectar o celular (só aparece no próprio PC) e opções no celular
+$('optBtn').onclick = () => document.body.classList.toggle('opts');
+if (NATIVO) { $('cfgBtn').hidden = false; $('cfgBtn').onclick = () => window.AndroidBridge.openSettings(); }
+else fetch('/pair').then(r => r.ok ? r.json() : null).then(d => {
+  if (!d) return;
+  $('pairBtn').hidden = false;
+  $('pairBtn').onclick = () => {
+    const box = $('pairUrls'); box.textContent = '';
+    for (const u of d.urls) { const c = document.createElement('div'); c.className = 'copia'; c.textContent = u; box.appendChild(c); }
+    if (!d.urls.length) box.textContent = 'Não achei o endereço. Rode "sudo tailscale up" no PC.';
+    $('pairToken').textContent = d.token; $('pairDlg').showModal();
+  };
+}).catch(() => {});
+$('pairClose').onclick = () => $('pairDlg').close();
 
 $('send').onclick = () => send(txt.value);
 txt.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(txt.value); } });

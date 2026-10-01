@@ -21,6 +21,7 @@ import io
 import json
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
 import threading
@@ -33,11 +34,13 @@ from pathlib import Path
 
 import httpx
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, RedirectResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 import androidgen
 import config
+import entregas
+import esp32gen
 import memory
 
 app = FastAPI(title="Local AI Server")
@@ -49,19 +52,57 @@ STATIC = Path(__file__).parent / "static"
 LOCAL_HOSTS = {"127.0.0.1", "::1", "localhost"}
 
 
+def _token_ok(candidato: str) -> bool:
+    return bool(candidato) and bool(config.API_TOKEN) and hmac.compare_digest(candidato, config.API_TOKEN)
+
+
 def require_token(request: Request, authorization: str = Header(default="")) -> None:
+    """O próprio PC (127.0.0.1) entra sem senha; qualquer outro precisa do token,
+    no cabeçalho Authorization (Bearer) ou no cookie 'localai_token'."""
     if request.client and request.client.host in LOCAL_HOSTS:
         return
     if not config.API_TOKEN:
         raise HTTPException(500, "LOCALAI_TOKEN não configurado no servidor")
-    expected = f"Bearer {config.API_TOKEN}"
-    if not hmac.compare_digest(authorization, expected):
-        raise HTTPException(401, "Token inválido")
+    bearer = authorization[7:].strip() if authorization.startswith("Bearer ") else ""
+    if _token_ok(bearer) or _token_ok(request.cookies.get("localai_token", "")):
+        return
+    raise HTTPException(401, "Token inválido")
 
 
 @app.get("/")
-def index():
-    return FileResponse(STATIC / "index.html")
+def index(request: Request, token: str = ""):
+    # Abrir /?token=XXXX (o app do celular faz isso) grava o token num cookie e limpa o endereço
+    if token:
+        if _token_ok(token):
+            resp = RedirectResponse("/", status_code=303)
+            resp.set_cookie("localai_token", token, max_age=60 * 60 * 24 * 365, httponly=True, samesite="strict")
+            return resp
+    return FileResponse(STATIC / "index.html", headers={"Cache-Control": "no-cache"})
+
+
+def _ips_do_pc() -> list[str]:
+    ips = []
+    try:  # IP do Tailscale (acesso de qualquer lugar)
+        r = subprocess.run(["tailscale", "ip", "-4"], capture_output=True, text=True, timeout=4)
+        ips += [f"http://{x.strip()}:8080" for x in r.stdout.split() if x.strip()]
+    except Exception:
+        pass
+    try:  # IP na rede de casa (Wi-Fi)
+        sk = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sk.connect(("10.255.255.255", 1))
+        ips.append(f"http://{sk.getsockname()[0]}:8080")
+        sk.close()
+    except Exception:
+        pass
+    return list(dict.fromkeys(ips))
+
+
+@app.get("/pair")
+def pair(request: Request):
+    """Dados para conectar o app do celular. SÓ responde para quem está no próprio PC."""
+    if not (request.client and request.client.host in LOCAL_HOSTS):
+        raise HTTPException(403, "Só disponível no próprio PC")
+    return {"urls": _ips_do_pc(), "token": config.API_TOKEN}
 
 
 @app.get("/health")
@@ -159,17 +200,10 @@ async def chat(req: ChatRequest):
     return StreamingResponse(stream(), media_type="text/event-stream", headers={"X-Web-Results": str(n_web)})
 
 
-# ----------------------------------------------------------- apps Android pela IA
-class AppRequest(BaseModel):
-    description: str
-
-
-@app.post("/app/generate", dependencies=[Depends(require_token)])
-async def app_generate(req: AppRequest):
-    desc = req.description.strip()[:1500]
-    if not desc:
-        raise HTTPException(400, "Descreva o app que você quer.")
-
+# ------------------------------------------- criar apps / firmware / arquivos
+def _stream_job(rodar):
+    """Roda uma criação (apps, firmware) e manda o progresso como eventos SSE.
+    Se o cliente desconectar (botão Parar), cancela a IA e a compilação."""
     async def stream():
         fila: asyncio.Queue = asyncio.Queue()
 
@@ -178,7 +212,7 @@ async def app_generate(req: AppRequest):
 
         async def roda():
             try:
-                await androidgen.gera_app(desc, emit)
+                await rodar(emit)
             except Exception as e:  # nada deve derrubar a conexão sem avisar
                 await fila.put({"type": "error", "msg": f"Erro inesperado: {type(e).__name__}: {e}"})
             finally:
@@ -189,28 +223,48 @@ async def app_generate(req: AppRequest):
             while (ev := await fila.get()) is not None:
                 yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n".encode()
         finally:
-            tarefa.cancel()  # cliente desconectou (botão Parar): cancela a IA e o Gradle
+            tarefa.cancel()
 
     return StreamingResponse(stream(), media_type="text/event-stream")
 
 
-@app.get("/apps", dependencies=[Depends(require_token)])
-async def apps_list():
-    return await asyncio.to_thread(androidgen.lista_apps)
+class AppRequest(BaseModel):
+    description: str
+    board: str = "esp32"
 
 
-@app.get("/apk/{app_id}", dependencies=[Depends(require_token)])
-async def apk_download(app_id: str):
-    if not re.fullmatch(r"[0-9a-f]{10}", app_id):
-        raise HTTPException(400, "Id inválido")
-    f = config.APPS_DIR / f"{app_id}.apk"
-    if not f.exists():
-        raise HTTPException(404, "App não encontrado")
-    nome = "app"
-    meta = config.APPS_DIR / f"{app_id}.json"
-    if meta.exists():
-        nome = androidgen.slugify(json.loads(meta.read_text()).get("name", "app")) or "app"
-    return FileResponse(f, media_type="application/vnd.android.package-archive", filename=f"{nome}.apk")
+@app.post("/app/generate", dependencies=[Depends(require_token)])
+async def app_generate(req: AppRequest):
+    desc = req.description.strip()[:1500]
+    if not desc:
+        raise HTTPException(400, "Descreva o app que você quer.")
+    return _stream_job(lambda emit: androidgen.gera_app(desc, emit))
+
+
+@app.post("/esp32/generate", dependencies=[Depends(require_token)])
+async def esp32_generate(req: AppRequest):
+    desc = req.description.strip()[:1500]
+    if not desc:
+        raise HTTPException(400, "Descreva o firmware que você quer.")
+    return _stream_job(lambda emit: esp32gen.gera_firmware(desc, req.board, emit))
+
+
+@app.get("/boards", dependencies=[Depends(require_token)])
+async def boards():
+    return [{"id": k, "label": v[0]} for k, v in esp32gen.PLACAS.items()]
+
+
+@app.get("/files", dependencies=[Depends(require_token)])
+async def files_list():
+    return await asyncio.to_thread(entregas.lista)
+
+
+@app.get("/files/{item_id}/{nome}", dependencies=[Depends(require_token)])
+async def files_download(item_id: str, nome: str):
+    f = entregas.caminho(item_id, nome)
+    if f is None:
+        raise HTTPException(404, "Arquivo não encontrado")
+    return FileResponse(f, media_type=entregas.tipo_mime(nome), filename=nome)
 
 
 # ------------------------------------------------------------------- memória

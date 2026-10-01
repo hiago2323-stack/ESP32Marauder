@@ -53,3 +53,6 @@ GRADLE_BIN = os.environ.get("GRADLE_BIN", str(HOME / "gradle" / "gradle-8.7" / "
 MAX_FIX_ATTEMPTS = int(os.environ.get("MAX_FIX_ATTEMPTS", "2"))
 # Limite de palavras (tokens) que a IA pode escrever por tentativa
 GEN_MAX_TOKENS = int(os.environ.get("GEN_MAX_TOKENS", "2500"))
+
+# arduino-cli (compila firmware ESP32)
+ARDUINO_CLI = os.environ.get("ARDUINO_CLI", str(HOME / "bin" / "arduino-cli"))

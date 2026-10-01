@@ -38,11 +38,29 @@ O instalador é gerado a partir de `server/`; mantenha os dois iguais.
 - [ ] Compilar `.bin` de ESP32 (`arduino-cli`)
 - [ ] App Android + acesso remoto (Tailscale)
 
-## Criar apps Android
+## App do celular (acesso de qualquer lugar)
+
+O app **IA Local** (`dist/IA-Local.apk`, código em `android-client/`) é a "cara" do PC no celular.
+Ele tem todas as funções da tela (conversa, voz, pesquisa, memória, criar apps/firmware, Parar) e o
+processamento continua no PC. A conexão é pelo **Tailscale** (VPN privada).
+
+1. No PC: `sudo tailscale up` (entre na sua conta). No celular: instale o Tailscale e entre na mesma conta.
+2. Instale `IA-Local.apk` no celular (permita instalar de fontes desconhecidas).
+3. No PC, abra o IA Local e clique em **📲 Conectar celular**: mostra o endereço e o token.
+4. No app, digite o endereço e o token. Pronto.
+
+O servidor aceita conexões de fora do PC **somente com o token**. Nunca abra a porta 8080 no roteador.
+Para recompilar o app: `cd android-client && gradle assembleDebug` (a chave de assinatura fica no
+repositório, para as atualizações instalarem por cima).
+
+## Criar apps Android e firmware ESP32
 
 Marque **📱 Criar app Android** na tela e descreva o app. A IA escreve um único arquivo Java
 (sem bibliotecas externas), o servidor monta o projeto Gradle, compila e, se der erro, devolve o
 erro à IA para corrigir (até 2 vezes). O APK fica em `~/localai/apps` e na janela **📱 Meus apps**.
+Para **firmware ESP32**, escolha o modo 🔌 e a placa: a IA escreve um sketch Arduino, o `arduino-cli`
+compila e a conversa mostra os `.bin` para baixar (o `-completo.bin` é gravado no endereço 0x0).
+Todos os arquivos ficam também em **📁 Arquivos**.
 O botão **⏹ Parar** (ou Esc) cancela a escrita e a compilação. A primeira compilação baixa as
 ferramentas do Android (algumas centenas de MB) e demora mais.
 

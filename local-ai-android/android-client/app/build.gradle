@@ -1,0 +1,43 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.localai.client'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.localai.client"
+        minSdk 24
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+    }
+
+    // Chave fixa de uso pessoal (não é segredo): mantém a mesma assinatura em qualquer
+    // PC que compile o app, assim uma versão nova atualiza a anterior sem desinstalar.
+    signingConfigs {
+        localai {
+            storeFile file('localai.keystore')
+            storePassword 'localai'
+            keyAlias 'localai'
+            keyPassword 'localai'
+        }
+    }
+
+    buildTypes {
+        debug {
+            signingConfig signingConfigs.localai
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    lint {
+        abortOnError false
+        checkReleaseBuilds false
+    }
+}

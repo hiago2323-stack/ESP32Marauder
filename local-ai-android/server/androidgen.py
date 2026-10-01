@@ -20,6 +20,7 @@ from pathlib import Path
 import httpx
 
 import config
+import entregas
 
 PACKAGE = "com.localai.app"
 
@@ -324,7 +325,7 @@ async def gera_app(descricao: str, emit) -> None:
             {"role": "user", "content": f"Crie: {descricao}"},
         ]
         id_ = uuid.uuid4().hex[:10]
-        pasta = config.APPS_DIR / id_
+        pasta = config.WORK_DIR / f"app-{id_}"
         try:
             for tentativa in range(config.MAX_FIX_ATTEMPTS + 1):
                 if tentativa == 0:
@@ -347,14 +348,13 @@ async def gera_app(descricao: str, emit) -> None:
                 await emit({"type": "status", "msg": "Compilando o app… (a primeira vez baixa as ferramentas e demora mais)"})
                 ok, log, apk = await compila(pasta)
                 if ok:
-                    destino = config.APPS_DIR / f"{id_}.apk"
-                    shutil.copy(apk, destino)
-                    meta = {"id": id_, "name": nome, "description": descricao, "created": time.time(),
-                            "code": codigo, "app_id": app_id}
-                    (config.APPS_DIR / f"{id_}.json").write_text(json.dumps(meta, ensure_ascii=False))
+                    meta = entregas.salva(
+                        id_, nome, descricao, "apk",
+                        [(apk, f"{slugify(nome)}.apk", "App Android (.apk)")],
+                        {"code": codigo, "app_id": app_id})
                     shutil.rmtree(pasta, ignore_errors=True)
-                    await emit({"type": "done", "id": id_, "name": nome, "apk": f"/apk/{id_}",
-                                "size": destino.stat().st_size})
+                    await emit({"type": "done", "id": id_, "name": nome, "kind": "apk", "files": meta["files"],
+                                "note": "Passe o arquivo para o celular e abra-o para instalar. Se o Android pedir, permita instalar de fontes desconhecidas."})
                     return
                 erros = resumo_erros(log)
                 if tentativa >= config.MAX_FIX_ATTEMPTS:
@@ -370,15 +370,3 @@ async def gera_app(descricao: str, emit) -> None:
             await emit({"type": "error", "msg": str(e)})
         finally:
             shutil.rmtree(pasta, ignore_errors=True)
-
-
-def lista_apps() -> list[dict]:
-    apps = []
-    for f in config.APPS_DIR.glob("*.json"):
-        try:
-            m = json.loads(f.read_text())
-        except Exception:
-            continue
-        if (config.APPS_DIR / f"{m['id']}.apk").exists():
-            apps.append({k: m[k] for k in ("id", "name", "description", "created")})
-    return sorted(apps, key=lambda a: a["created"], reverse=True)

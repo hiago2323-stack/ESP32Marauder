@@ -88,6 +88,9 @@ GRADLE_BIN = os.environ.get("GRADLE_BIN", str(HOME / "gradle" / "gradle-8.7" / "
 MAX_FIX_ATTEMPTS = int(os.environ.get("MAX_FIX_ATTEMPTS", "2"))
 # Limite de palavras (tokens) que a IA pode escrever por tentativa
 GEN_MAX_TOKENS = int(os.environ.get("GEN_MAX_TOKENS", "2500"))
+
+# arduino-cli (compila firmware ESP32)
+ARDUINO_CLI = os.environ.get("ARDUINO_CLI", str(HOME / "bin" / "arduino-cli"))
 EOF
   cat > main.py <<'EOF'
 """Servidor do PC: conversa com o modelo, pesquisa na web e compila projetos Android.
@@ -113,6 +116,7 @@ import io
 import json
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
 import threading
@@ -125,11 +129,13 @@ from pathlib import Path
 
 import httpx
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, RedirectResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 import androidgen
 import config
+import entregas
+import esp32gen
 import memory
 
 app = FastAPI(title="Local AI Server")
@@ -141,19 +147,57 @@ STATIC = Path(__file__).parent / "static"
 LOCAL_HOSTS = {"127.0.0.1", "::1", "localhost"}
 
 
+def _token_ok(candidato: str) -> bool:
+    return bool(candidato) and bool(config.API_TOKEN) and hmac.compare_digest(candidato, config.API_TOKEN)
+
+
 def require_token(request: Request, authorization: str = Header(default="")) -> None:
+    """O próprio PC (127.0.0.1) entra sem senha; qualquer outro precisa do token,
+    no cabeçalho Authorization (Bearer) ou no cookie 'localai_token'."""
     if request.client and request.client.host in LOCAL_HOSTS:
         return
     if not config.API_TOKEN:
         raise HTTPException(500, "LOCALAI_TOKEN não configurado no servidor")
-    expected = f"Bearer {config.API_TOKEN}"
-    if not hmac.compare_digest(authorization, expected):
-        raise HTTPException(401, "Token inválido")
+    bearer = authorization[7:].strip() if authorization.startswith("Bearer ") else ""
+    if _token_ok(bearer) or _token_ok(request.cookies.get("localai_token", "")):
+        return
+    raise HTTPException(401, "Token inválido")
 
 
 @app.get("/")
-def index():
-    return FileResponse(STATIC / "index.html")
+def index(request: Request, token: str = ""):
+    # Abrir /?token=XXXX (o app do celular faz isso) grava o token num cookie e limpa o endereço
+    if token:
+        if _token_ok(token):
+            resp = RedirectResponse("/", status_code=303)
+            resp.set_cookie("localai_token", token, max_age=60 * 60 * 24 * 365, httponly=True, samesite="strict")
+            return resp
+    return FileResponse(STATIC / "index.html", headers={"Cache-Control": "no-cache"})
+
+
+def _ips_do_pc() -> list[str]:
+    ips = []
+    try:  # IP do Tailscale (acesso de qualquer lugar)
+        r = subprocess.run(["tailscale", "ip", "-4"], capture_output=True, text=True, timeout=4)
+        ips += [f"http://{x.strip()}:8080" for x in r.stdout.split() if x.strip()]
+    except Exception:
+        pass
+    try:  # IP na rede de casa (Wi-Fi)
+        sk = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sk.connect(("10.255.255.255", 1))
+        ips.append(f"http://{sk.getsockname()[0]}:8080")
+        sk.close()
+    except Exception:
+        pass
+    return list(dict.fromkeys(ips))
+
+
+@app.get("/pair")
+def pair(request: Request):
+    """Dados para conectar o app do celular. SÓ responde para quem está no próprio PC."""
+    if not (request.client and request.client.host in LOCAL_HOSTS):
+        raise HTTPException(403, "Só disponível no próprio PC")
+    return {"urls": _ips_do_pc(), "token": config.API_TOKEN}
 
 
 @app.get("/health")
@@ -251,17 +295,10 @@ async def chat(req: ChatRequest):
     return StreamingResponse(stream(), media_type="text/event-stream", headers={"X-Web-Results": str(n_web)})
 
 
-# ----------------------------------------------------------- apps Android pela IA
-class AppRequest(BaseModel):
-    description: str
-
-
-@app.post("/app/generate", dependencies=[Depends(require_token)])
-async def app_generate(req: AppRequest):
-    desc = req.description.strip()[:1500]
-    if not desc:
-        raise HTTPException(400, "Descreva o app que você quer.")
-
+# ------------------------------------------- criar apps / firmware / arquivos
+def _stream_job(rodar):
+    """Roda uma criação (apps, firmware) e manda o progresso como eventos SSE.
+    Se o cliente desconectar (botão Parar), cancela a IA e a compilação."""
     async def stream():
         fila: asyncio.Queue = asyncio.Queue()
 
@@ -270,7 +307,7 @@ async def app_generate(req: AppRequest):
 
         async def roda():
             try:
-                await androidgen.gera_app(desc, emit)
+                await rodar(emit)
             except Exception as e:  # nada deve derrubar a conexão sem avisar
                 await fila.put({"type": "error", "msg": f"Erro inesperado: {type(e).__name__}: {e}"})
             finally:
@@ -281,28 +318,48 @@ async def app_generate(req: AppRequest):
             while (ev := await fila.get()) is not None:
                 yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n".encode()
         finally:
-            tarefa.cancel()  # cliente desconectou (botão Parar): cancela a IA e o Gradle
+            tarefa.cancel()
 
     return StreamingResponse(stream(), media_type="text/event-stream")
 
 
-@app.get("/apps", dependencies=[Depends(require_token)])
-async def apps_list():
-    return await asyncio.to_thread(androidgen.lista_apps)
+class AppRequest(BaseModel):
+    description: str
+    board: str = "esp32"
 
 
-@app.get("/apk/{app_id}", dependencies=[Depends(require_token)])
-async def apk_download(app_id: str):
-    if not re.fullmatch(r"[0-9a-f]{10}", app_id):
-        raise HTTPException(400, "Id inválido")
-    f = config.APPS_DIR / f"{app_id}.apk"
-    if not f.exists():
-        raise HTTPException(404, "App não encontrado")
-    nome = "app"
-    meta = config.APPS_DIR / f"{app_id}.json"
-    if meta.exists():
-        nome = androidgen.slugify(json.loads(meta.read_text()).get("name", "app")) or "app"
-    return FileResponse(f, media_type="application/vnd.android.package-archive", filename=f"{nome}.apk")
+@app.post("/app/generate", dependencies=[Depends(require_token)])
+async def app_generate(req: AppRequest):
+    desc = req.description.strip()[:1500]
+    if not desc:
+        raise HTTPException(400, "Descreva o app que você quer.")
+    return _stream_job(lambda emit: androidgen.gera_app(desc, emit))
+
+
+@app.post("/esp32/generate", dependencies=[Depends(require_token)])
+async def esp32_generate(req: AppRequest):
+    desc = req.description.strip()[:1500]
+    if not desc:
+        raise HTTPException(400, "Descreva o firmware que você quer.")
+    return _stream_job(lambda emit: esp32gen.gera_firmware(desc, req.board, emit))
+
+
+@app.get("/boards", dependencies=[Depends(require_token)])
+async def boards():
+    return [{"id": k, "label": v[0]} for k, v in esp32gen.PLACAS.items()]
+
+
+@app.get("/files", dependencies=[Depends(require_token)])
+async def files_list():
+    return await asyncio.to_thread(entregas.lista)
+
+
+@app.get("/files/{item_id}/{nome}", dependencies=[Depends(require_token)])
+async def files_download(item_id: str, nome: str):
+    f = entregas.caminho(item_id, nome)
+    if f is None:
+        raise HTTPException(404, "Arquivo não encontrado")
+    return FileResponse(f, media_type=entregas.tipo_mime(nome), filename=nome)
 
 
 # ------------------------------------------------------------------- memória
@@ -665,6 +722,7 @@ from pathlib import Path
 import httpx
 
 import config
+import entregas
 
 PACKAGE = "com.localai.app"
 
@@ -969,7 +1027,7 @@ async def gera_app(descricao: str, emit) -> None:
             {"role": "user", "content": f"Crie: {descricao}"},
         ]
         id_ = uuid.uuid4().hex[:10]
-        pasta = config.APPS_DIR / id_
+        pasta = config.WORK_DIR / f"app-{id_}"
         try:
             for tentativa in range(config.MAX_FIX_ATTEMPTS + 1):
                 if tentativa == 0:
@@ -992,14 +1050,13 @@ async def gera_app(descricao: str, emit) -> None:
                 await emit({"type": "status", "msg": "Compilando o app… (a primeira vez baixa as ferramentas e demora mais)"})
                 ok, log, apk = await compila(pasta)
                 if ok:
-                    destino = config.APPS_DIR / f"{id_}.apk"
-                    shutil.copy(apk, destino)
-                    meta = {"id": id_, "name": nome, "description": descricao, "created": time.time(),
-                            "code": codigo, "app_id": app_id}
-                    (config.APPS_DIR / f"{id_}.json").write_text(json.dumps(meta, ensure_ascii=False))
+                    meta = entregas.salva(
+                        id_, nome, descricao, "apk",
+                        [(apk, f"{slugify(nome)}.apk", "App Android (.apk)")],
+                        {"code": codigo, "app_id": app_id})
                     shutil.rmtree(pasta, ignore_errors=True)
-                    await emit({"type": "done", "id": id_, "name": nome, "apk": f"/apk/{id_}",
-                                "size": destino.stat().st_size})
+                    await emit({"type": "done", "id": id_, "name": nome, "kind": "apk", "files": meta["files"],
+                                "note": "Passe o arquivo para o celular e abra-o para instalar. Se o Android pedir, permita instalar de fontes desconhecidas."})
                     return
                 erros = resumo_erros(log)
                 if tentativa >= config.MAX_FIX_ATTEMPTS:
@@ -1015,18 +1072,249 @@ async def gera_app(descricao: str, emit) -> None:
             await emit({"type": "error", "msg": str(e)})
         finally:
             shutil.rmtree(pasta, ignore_errors=True)
+EOF
+  cat > entregas.py <<'EOF'
+"""Arquivos entregues ao usuário (.apk, .bin...): guarda no disco e lista para download.
+
+Cada entrega vira uma pasta em APPS_DIR/<id>/ com os arquivos e um meta.json.
+"""
+import json
+import re
+import shutil
+import time
+from pathlib import Path
+
+import config
+
+ID_RE = re.compile(r"[0-9a-f]{10}")
+TIPOS = {".apk": "application/vnd.android.package-archive", ".bin": "application/octet-stream"}
 
 
-def lista_apps() -> list[dict]:
-    apps = []
-    for f in config.APPS_DIR.glob("*.json"):
+def salva(id_: str, nome: str, descricao: str, tipo: str, arquivos: list, extra: dict | None = None) -> dict:
+    """arquivos: lista de (caminho_de_origem, nome_final, rotulo)."""
+    pasta = config.APPS_DIR / id_
+    pasta.mkdir(parents=True, exist_ok=True)
+    itens = []
+    for origem, nome_final, rotulo in arquivos:
+        destino = pasta / nome_final
+        shutil.copy(origem, destino)
+        itens.append({"name": nome_final, "label": rotulo, "size": destino.stat().st_size,
+                      "url": f"/files/{id_}/{nome_final}"})
+    meta = {"id": id_, "name": nome, "description": descricao, "kind": tipo,
+            "created": time.time(), "files": itens}
+    if extra:
+        meta.update(extra)
+    (pasta / "meta.json").write_text(json.dumps(meta, ensure_ascii=False))
+    return meta
+
+
+def lista() -> list[dict]:
+    out = []
+    for f in config.APPS_DIR.glob("*/meta.json"):
         try:
             m = json.loads(f.read_text())
         except Exception:
             continue
-        if (config.APPS_DIR / f"{m['id']}.apk").exists():
-            apps.append({k: m[k] for k in ("id", "name", "description", "created")})
-    return sorted(apps, key=lambda a: a["created"], reverse=True)
+        out.append({k: m.get(k) for k in ("id", "name", "description", "kind", "created", "files")})
+    return sorted(out, key=lambda m: m["created"] or 0, reverse=True)
+
+
+def caminho(id_: str, nome: str) -> Path | None:
+    """Caminho de um arquivo entregue, ou None. Só devolve o que está no meta.json (sem '..')."""
+    if not ID_RE.fullmatch(id_):
+        return None
+    meta = config.APPS_DIR / id_ / "meta.json"
+    if not meta.exists():
+        return None
+    try:
+        nomes = {f["name"] for f in json.loads(meta.read_text())["files"]}
+    except Exception:
+        return None
+    if nome not in nomes:
+        return None
+    p = config.APPS_DIR / id_ / nome
+    return p if p.exists() else None
+
+
+def tipo_mime(nome: str) -> str:
+    return TIPOS.get(Path(nome).suffix.lower(), "application/octet-stream")
+EOF
+  cat > esp32gen.py <<'EOF'
+"""Cria firmware (.bin) para ESP32 a partir de uma descrição.
+
+Fluxo igual ao dos apps Android: a IA escreve UM sketch Arduino (.ino) -> o arduino-cli
+compila -> se der erro, o erro volta à IA para corrigir -> o .bin é entregue para download.
+Só usa as bibliotecas que já vêm no núcleo ESP32 do Arduino (WiFi, WebServer, Wire...).
+"""
+import asyncio
+import os
+import re
+import shutil
+import signal
+import uuid
+from pathlib import Path
+
+import androidgen
+import config
+import entregas
+
+# id da tela -> (nome para o usuário, FQBN do arduino-cli)
+PLACAS = {
+    "esp32": ("ESP32 (DevKit comum)", "esp32:esp32:esp32"),
+    "esp32s3": ("ESP32-S3", "esp32:esp32:esp32s3"),
+    "esp32c3": ("ESP32-C3", "esp32:esp32:esp32c3"),
+    "esp32s2": ("ESP32-S2", "esp32:esp32:esp32s2"),
+    "esp32c6": ("ESP32-C6", "esp32:esp32:esp32c6"),
+}
+
+SYSTEM_PROMPT = """Você é um programador de firmware experiente em Arduino para ESP32. Escreva UM sketch Arduino completo em UM único arquivo .ino.
+
+REGRAS OBRIGATÓRIAS:
+1. Use SOMENTE bibliotecas que já vêm no núcleo ESP32 do Arduino (WiFi.h, WebServer.h, HTTPClient.h, Wire.h, SPI.h, Preferences.h, BluetoothSerial.h etc.). NENHUMA biblioteca externa (nada de Adafruit, FastLED, PubSubClient...).
+2. Defina setup() e loop(). Inicie a serial com Serial.begin(115200).
+3. Inclua TODOS os #include necessários. O código precisa compilar na primeira tentativa.
+4. Para o LED da placa use o pino 2 (const int LED = 2;), a menos que o usuário peça outro.
+5. Comentários e textos da serial em português do Brasil.
+6. Não use delay() longos que travem o programa quando houver servidor web; prefira millis().
+
+FORMATO DA RESPOSTA (siga exatamente, sem explicações):
+NOME: <nome curto do firmware>
+```cpp
+<código completo>
+```"""
+
+EXEMPLO_PEDIDO = "piscar o LED a cada segundo e escrever na serial"
+EXEMPLO_RESPOSTA = """NOME: Pisca LED
+```cpp
+// Pisca o LED a cada segundo e informa na serial
+const int LED = 2;
+bool ligado = false;
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(LED, OUTPUT);
+  Serial.println("Pisca LED iniciado");
+}
+
+void loop() {
+  ligado = !ligado;
+  digitalWrite(LED, ligado ? HIGH : LOW);
+  Serial.println(ligado ? "LED ligado" : "LED desligado");
+  delay(1000);
+}
+```"""
+
+
+def extrai_resposta(texto: str) -> tuple[str, str]:
+    m = re.search(r"```(?:cpp|c\+\+|arduino|ino|c)?\s*\n(.*?)(?:```|$)", texto, re.S)
+    if not m:
+        raise ValueError("A IA não devolveu um bloco de código.")
+    codigo = m.group(1).strip()
+    if "void setup" not in codigo or "void loop" not in codigo:
+        raise ValueError("O código não tem as funções setup() e loop().")
+    n = re.search(r"NOME:\s*(.+)", texto)
+    nome = (n.group(1).strip() if n else "Firmware IA")[:40] or "Firmware IA"
+    return nome, codigo + "\n"
+
+
+async def compila(pasta: Path, fqbn: str) -> tuple[bool, str, Path]:
+    saida_dir = pasta / "out"
+    cli = config.ARDUINO_CLI
+    env = dict(os.environ)
+    proc = await asyncio.create_subprocess_exec(
+        cli, "compile", "--fqbn", fqbn, "--output-dir", str(saida_dir), str(pasta / "sketch"),
+        cwd=pasta, env=env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        start_new_session=True,
+    )
+
+    def mata_tudo():
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    try:
+        saida, _ = await asyncio.wait_for(proc.communicate(), timeout=config.BUILD_TIMEOUT)
+    except asyncio.TimeoutError:
+        mata_tudo()
+        return False, "A compilação passou do tempo limite.", saida_dir
+    except asyncio.CancelledError:
+        mata_tudo()
+        raise
+    return proc.returncode == 0, saida.decode(errors="replace"), saida_dir
+
+
+async def gera_firmware(descricao: str, placa: str, emit) -> None:
+    if placa not in PLACAS:
+        await emit({"type": "error", "msg": "Placa desconhecida."})
+        return
+    nome_placa, fqbn = PLACAS[placa]
+    if not Path(config.ARDUINO_CLI).exists():
+        await emit({"type": "error", "msg": "O arduino-cli não está instalado. Rode: bash atualizar.sh"})
+        return
+    if androidgen._trava.locked():
+        await emit({"type": "error", "msg": "Ainda estou criando outra coisa. Espere terminar ou clique em Parar."})
+        return
+    async with androidgen._trava:
+        mensagens = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": f"Crie: {EXEMPLO_PEDIDO}"},
+            {"role": "assistant", "content": EXEMPLO_RESPOSTA},
+            {"role": "user", "content": f"Placa: {nome_placa}. Crie: {descricao}"},
+        ]
+        id_ = uuid.uuid4().hex[:10]
+        pasta = config.WORK_DIR / f"esp-{id_}"
+        try:
+            for tentativa in range(config.MAX_FIX_ATTEMPTS + 1):
+                if tentativa == 0:
+                    await emit({"type": "status", "msg": "A IA está escrevendo o código do firmware… (pode levar alguns minutos)"})
+                else:
+                    await emit({"type": "status",
+                                "msg": f"Deu erro ao compilar. A IA está corrigindo (tentativa {tentativa} de {config.MAX_FIX_ATTEMPTS})…"})
+                texto = await androidgen.pede_codigo(mensagens, emit)
+                try:
+                    nome, codigo = extrai_resposta(texto)
+                except ValueError as e:
+                    await emit({"type": "error", "msg": str(e), "log": texto[-1500:]})
+                    return
+                await emit({"type": "code", "text": codigo})
+
+                if pasta.exists():
+                    shutil.rmtree(pasta)
+                (pasta / "sketch").mkdir(parents=True)
+                (pasta / "sketch" / "sketch.ino").write_text(codigo)
+                await emit({"type": "status", "msg": f"Compilando para {nome_placa}… (a primeira vez é mais lenta)"})
+                ok, log, saida = await compila(pasta, fqbn)
+                if ok:
+                    slug = androidgen.slugify(nome)
+                    arquivos = []
+                    merged = next(iter(sorted(saida.glob("*.merged.bin"))), None)
+                    app = next((p for p in sorted(saida.glob("*.ino.bin"))), None)
+                    if merged:
+                        arquivos.append((merged, f"{slug}-completo.bin", "Firmware completo (.bin): gravar no endereço 0x0"))
+                    if app:
+                        arquivos.append((app, f"{slug}-app.bin", "Só o aplicativo (.bin): para atualização OTA / endereço 0x10000"))
+                    if not arquivos:
+                        await emit({"type": "error", "msg": "Compilou, mas não encontrei o arquivo .bin.", "log": log[-1500:]})
+                        return
+                    meta = entregas.salva(id_, nome, descricao, "bin", arquivos, {"board": nome_placa, "code": codigo})
+                    await emit({"type": "done", "id": id_, "name": nome, "kind": "bin", "files": meta["files"],
+                                "note": f"Placa: {nome_placa}. Grave o '-completo.bin' no endereço 0x0 com o esptool ou com um gravador web (ex.: espressif.github.io/esptool-js)."})
+                    return
+                erros = androidgen.resumo_erros(log)
+                if tentativa >= config.MAX_FIX_ATTEMPTS:
+                    await emit({"type": "error", "msg": "Não consegui compilar o firmware depois das correções.", "log": erros})
+                    return
+                mensagens += [
+                    {"role": "assistant", "content": texto},
+                    {"role": "user", "content": (
+                        "O código NÃO compilou. ERROS DE COMPILAÇÃO:\n" + erros +
+                        "\n\nCorrija e devolva o arquivo COMPLETO no mesmo formato (NOME: e bloco ```cpp).")},
+                ]
+        except RuntimeError as e:
+            await emit({"type": "error", "msg": str(e)})
+        finally:
+            shutil.rmtree(pasta, ignore_errors=True)
 EOF
   mkdir -p static
   cat > static/index.html <<'EOF'
@@ -1072,6 +1360,24 @@ EOF
          align-items:flex-start; font-size:14px; white-space:pre-wrap; }
   .mem span { flex:1; word-break:break-word; }
   .mem small { color:var(--mut); display:block; }
+  #optBtn { display:none; }
+  #opts { display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin-left:auto; }
+  #modeRow { display:flex; gap:8px; padding:6px 16px; background:var(--panel); border-top:1px solid var(--line); }
+  #modeRow select { width:auto; flex:0 1 auto; }
+  a.btn.bloco { display:block; width:fit-content; margin-top:6px; }
+  .copia { font-family:ui-monospace,monospace; font-size:13px; word-break:break-all; background:var(--bg);
+           border:1px solid var(--line); border-radius:8px; padding:6px 8px; margin:4px 0; }
+  @media (max-width: 760px) {
+    #optBtn { display:inline-block; }
+    #opts { display:none; width:100%; margin-left:0; }
+    body.opts #opts { display:flex; }
+    header { gap:8px; padding:8px 12px; }
+    #bar { flex-wrap:wrap; padding:8px 12px; }
+    #bar textarea { flex:1 1 100%; order:-1; }
+    #bar button { flex:1; padding:10px 8px; }
+    #log { padding:12px; }
+    .msg { max-width:100%; }
+  }
   #stop:not(:disabled) { border-color:#c0392b; color:#e57368; font-weight:600; }
   a.btn { display:inline-block; padding:8px 14px; border:1px solid var(--acc); border-radius:8px;
           color:var(--acc); text-decoration:none; margin-top:8px; }
@@ -1086,14 +1392,18 @@ EOF
 <body>
 <header>
   <h1>IA Local</h1>
-  <label><input type="checkbox" id="web"> Pesquisar na web</label>
-  <label title="Guarda na memória o que descobrir pesquisando"><input type="checkbox" id="learn" checked> Aprender com pesquisas</label>
-  <label><input type="checkbox" id="speak"> Falar as respostas</label>
-  <label title="A IA escreve, compila e entrega o APK de um app Android"><input type="checkbox" id="appmode"> 📱 Criar app Android</label>
-  <button id="voiceBtn">🔊 Voz</button>
-  <button id="appsBtn">📱 Meus apps</button>
-  <button id="memBtn">🧠 Memória</button>
-  <button id="new">Nova conversa</button>
+  <button id="optBtn">☰ Opções</button>
+  <div id="opts">
+    <label><input type="checkbox" id="web"> Pesquisar na web</label>
+    <label title="Guarda na memória o que descobrir pesquisando"><input type="checkbox" id="learn" checked> Aprender com pesquisas</label>
+    <label><input type="checkbox" id="speak"> Falar as respostas</label>
+    <button id="voiceBtn">🔊 Voz</button>
+    <button id="filesBtn">📁 Arquivos</button>
+    <button id="memBtn">🧠 Memória</button>
+    <button id="pairBtn" hidden>📲 Conectar celular</button>
+    <button id="cfgBtn" hidden>⚙ Servidor</button>
+    <button id="new">Nova conversa</button>
+  </div>
 </header>
 <dialog id="memDlg">
   <strong>Memória de longo prazo</strong>
@@ -1113,14 +1423,32 @@ EOF
   <input type="range" id="vel" min="0.7" max="1.4" step="0.05" value="1">
   <div style="display:flex;gap:8px;margin-top:14px"><button id="vozTest">▶ Testar</button><button id="vozClose">Fechar</button></div>
 </dialog>
-<dialog id="appsDlg">
-  <strong>Apps que a IA criou</strong>
-  <div class="dica">Ficam guardados no PC em ~/localai/apps. Passe o arquivo .apk para o celular (cabo USB, Bluetooth ou nuvem) e abra-o para instalar.</div>
-  <div id="appslist" style="margin:10px 0;display:flex;flex-direction:column;gap:8px"></div>
-  <button id="appsClose">Fechar</button>
+<dialog id="filesDlg">
+  <strong>Arquivos que a IA criou</strong>
+  <div class="dica">Aplicativos (.apk) e firmwares (.bin). Ficam guardados no PC, na pasta ~/localai/apps.</div>
+  <div id="fileslist" style="margin:10px 0;display:flex;flex-direction:column;gap:8px;max-height:55vh;overflow-y:auto"></div>
+  <button id="filesClose">Fechar</button>
+</dialog>
+<dialog id="pairDlg">
+  <strong>Conectar o celular</strong>
+  <div class="dica">No celular: instale o Tailscale, entre com a mesma conta do PC e abra o app IA Local. Na primeira vez ele pede estes dois dados.</div>
+  <div style="margin-top:10px"><b>Endereço do servidor</b> (use o do Tailscale para funcionar de qualquer lugar)</div>
+  <div id="pairUrls"></div>
+  <div style="margin-top:10px"><b>Token (senha)</b></div>
+  <div id="pairToken" class="copia"></div>
+  <div class="dica">Não mostre o token para ninguém. Ele dá acesso total à sua IA.</div>
+  <div style="margin-top:12px"><button id="pairClose">Fechar</button></div>
 </dialog>
 <div id="log"></div>
 <div id="status"></div>
+<div id="modeRow">
+  <select id="modo" title="O que você quer fazer">
+    <option value="chat">💬 Conversa</option>
+    <option value="app">📱 Criar app Android (.apk)</option>
+    <option value="esp32">🔌 Criar firmware ESP32 (.bin)</option>
+  </select>
+  <select id="placa" hidden></select>
+</div>
 <div id="bar">
   <button id="mic" title="Clique para gravar, clique de novo para enviar">🎤 Falar</button>
   <textarea id="txt" placeholder="Escreva aqui (Enter envia, Shift+Enter quebra linha)"></textarea>
@@ -1130,7 +1458,9 @@ EOF
 <script>
 const $ = id => document.getElementById(id);
 const log = $('log'), txt = $('txt'), statusEl = $('status');
+const NATIVO = typeof window.AndroidBridge !== 'undefined';  // dentro do app Android
 let history = [];
+let gravandoNativo = false;
 let busy = false, ctrl = null, falando = false, descartar = false;
 const setStatus = t => statusEl.textContent = t || '';
 
@@ -1181,8 +1511,8 @@ async function send(text) {
   busy = true; $('send').disabled = true;
   txt.value = '';
   addMsg('user', text);
-  if ($('appmode').checked) {
-    try { await criarApp(text); }
+  if ($('modo').value !== 'chat') {
+    try { await criarArquivo($('modo').value, text); }
     finally { busy = false; ctrl = null; $('send').disabled = false; txt.focus(); }
     return;
   }
@@ -1302,7 +1632,27 @@ async function speak(text) {
 }
 
 let rec = null, chunks = [];
+function micNativo() {
+  pararVoz();
+  if (!gravandoNativo) {
+    if (window.AndroidBridge.startRec()) {
+      gravandoNativo = true; $('mic').classList.add('rec'); $('mic').textContent = '⏹ Enviar';
+      setStatus('Gravando… toque em "Enviar" quando terminar de falar.');
+    } else setStatus('Libere o microfone para o app (o Android mostra um aviso) e toque de novo.');
+  } else {
+    gravandoNativo = false; $('mic').classList.remove('rec'); $('mic').textContent = '🎤 Falar';
+    setStatus('Entendendo o que você disse…'); window.AndroidBridge.stopRec();
+  }
+}
+// o app Android chama isto quando o servidor devolve o texto da gravação
+window.onNativeStt = (text, erro) => {
+  setStatus('');
+  if (erro) { setStatus('Erro na voz: ' + erro); return; }
+  if (text) { $('speak').checked = true; send(text); }
+  else setStatus('Não consegui ouvir nada. Tente de novo.');
+};
 $('mic').onclick = async () => {
+  if (NATIVO) { micNativo(); return; }
   pararVoz();
   if (rec) { rec.stop(); return; }
   try {
@@ -1357,11 +1707,12 @@ function parar() {
   if (ctrl) ctrl.abort();
   pararVoz();
   if (rec) { descartar = true; rec.stop(); }
+  if (gravandoNativo) { gravandoNativo = false; window.AndroidBridge.cancelRec(); $('mic').classList.remove('rec'); $('mic').textContent = '🎤 Falar'; }
   setStatus('');
 }
 $('stop').onclick = parar;
 document.addEventListener('keydown', e => { if (e.key === 'Escape') parar(); });
-setInterval(() => { $('stop').disabled = !(busy || falando || rec); }, 150);
+setInterval(() => { $('stop').disabled = !(busy || falando || rec || gravandoNativo); }, 150);
 
 // ---------------- escolha da voz
 let vozesCarregadas = false;
@@ -1399,19 +1750,26 @@ $('vozTest').onclick = async () => {
 };
 $('vozClose').onclick = () => $('vozDlg').close();
 
-// ---------------- criar app Android
-async function criarApp(desc) {
+// ---------------- criar app Android / firmware ESP32
+const fmtTam = n => n >= 1048576 ? (n / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(n / 1024)) + ' KB';
+function botaoArquivo(f) {
+  const a = document.createElement('a'); a.className = 'btn bloco'; a.href = f.url; a.download = f.name;
+  a.textContent = `⬇ ${f.label} · ${fmtTam(f.size)}`; return a;
+}
+async function criarArquivo(tipo, desc) {
+  const rotulo = tipo === 'app' ? 'app' : 'firmware';
   const card = addMsg('assistant', '');
   const st = document.createElement('div'); const extra = document.createElement('div');
   card.append(st, extra);
   const rola = () => { log.scrollTop = log.scrollHeight; };
   st.textContent = '⏳ Enviando o pedido…';
-  setStatus('Criando o app… (clique em ⏹ Parar para cancelar)');
+  setStatus(`Criando o ${rotulo}… (clique em ⏹ Parar para cancelar)`);
   let terminou = false;
   try {
     ctrl = new AbortController();
-    const r = await fetch('/app/generate', {method: 'POST', headers: {'Content-Type': 'application/json'},
-                                            body: JSON.stringify({description: desc}), signal: ctrl.signal});
+    const r = await fetch(tipo === 'app' ? '/app/generate' : '/esp32/generate', {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, signal: ctrl.signal,
+      body: JSON.stringify({description: desc, board: $('placa').value || 'esp32'})});
     if (!r.ok) throw new Error('Servidor respondeu ' + r.status);
     const reader = r.body.getReader(), dec = new TextDecoder(); let buf = '';
     for (;;) {
@@ -1430,11 +1788,9 @@ async function criarApp(desc) {
           sm.textContent = 'Ver o código que a IA escreveu'; pre.textContent = ev.text; d.append(sm, pre); extra.appendChild(d);
         } else if (ev.type === 'done') {
           terminou = true;
-          st.textContent = `✅ App "${ev.name}" pronto! (${Math.max(1, Math.round(ev.size / 1024))} KB)`;
-          const a = document.createElement('a'); a.className = 'btn'; a.href = ev.apk; a.download = ''; a.textContent = '⬇ Baixar o APK';
-          const dica = document.createElement('div'); dica.className = 'dica';
-          dica.textContent = 'Passe o arquivo para o celular (cabo USB, Bluetooth ou nuvem) e abra-o para instalar. Se o Android pedir, permita instalar de fontes desconhecidas.';
-          extra.append(a, dica);
+          st.textContent = `✅ "${ev.name}" pronto!`;
+          for (const f of ev.files) extra.appendChild(botaoArquivo(f));
+          if (ev.note) { const dica = document.createElement('div'); dica.className = 'dica'; dica.textContent = ev.note; extra.appendChild(dica); }
         } else if (ev.type === 'error') {
           terminou = true; card.classList.add('err'); st.textContent = '⚠ ' + ev.msg;
           if (ev.log) { const d = document.createElement('details'), sm = document.createElement('summary'), pre = document.createElement('pre');
@@ -1443,32 +1799,57 @@ async function criarApp(desc) {
         rola();
       }
     }
-    if (!terminou) { card.classList.add('err'); st.textContent = '⚠ A conexão terminou antes do app ficar pronto.'; }
+    if (!terminou) { card.classList.add('err'); st.textContent = `⚠ A conexão terminou antes do ${rotulo} ficar pronto.`; }
   } catch (e) {
-    if (e.name === 'AbortError') st.textContent = '⏹ Criação do app cancelada por você.';
+    if (e.name === 'AbortError') st.textContent = `⏹ Criação do ${rotulo} cancelada por você.`;
     else { card.classList.add('err'); st.textContent = '⚠ ' + (e instanceof TypeError ? 'A conexão com o servidor caiu. O modelo pode ter reiniciado; espere e tente de novo.' : e.message); }
   } finally { setStatus(''); }
 }
-$('appmode').onchange = () => {
-  txt.placeholder = $('appmode').checked ? 'Descreva o app que você quer criar (ex.: um app de lista de compras)…'
-                                          : 'Escreva aqui (Enter envia, Shift+Enter quebra linha)';
+const PLACEHOLDERS = {
+  chat: 'Escreva aqui (Enter envia)',
+  app: 'Descreva o app que você quer criar (ex.: um app de lista de compras)…',
+  esp32: 'Descreva o firmware (ex.: ligar um LED por uma página web no Wi-Fi)…',
 };
-async function listaApps() {
-  const box = $('appslist'); box.textContent = 'Carregando…';
-  const apps = await (await fetch('/apps')).json();
-  box.textContent = apps.length ? '' : 'Ainda não há nenhum app criado.';
-  for (const a of apps) {
-    const row = document.createElement('div'); row.className = 'mem';
-    const sp = document.createElement('span'); sp.textContent = a.name;
-    const sm = document.createElement('small');
-    sm.textContent = a.description + ' · ' + new Date(a.created * 1000).toLocaleDateString('pt-BR');
-    sp.appendChild(sm);
-    const dl = document.createElement('a'); dl.className = 'btn'; dl.style.marginTop = '0'; dl.href = '/apk/' + a.id; dl.download = ''; dl.textContent = '⬇ APK';
-    row.append(sp, dl); box.appendChild(row);
+$('modo').onchange = async () => {
+  const m = $('modo').value;
+  txt.placeholder = PLACEHOLDERS[m];
+  $('placa').hidden = m !== 'esp32';
+  if (m === 'esp32' && !$('placa').options.length) {
+    try {
+      for (const b of await (await fetch('/boards')).json()) { const o = document.createElement('option'); o.value = b.id; o.textContent = b.label; $('placa').appendChild(o); }
+    } catch (e) {}
+  }
+};
+async function listaArquivos() {
+  const box = $('fileslist'); box.textContent = 'Carregando…';
+  const itens = await (await fetch('/files')).json();
+  box.textContent = itens.length ? '' : 'Ainda não há nenhum arquivo criado.';
+  for (const it of itens) {
+    const row = document.createElement('div'); row.className = 'mem'; row.style.flexDirection = 'column';
+    const t = document.createElement('div'); t.textContent = (it.kind === 'apk' ? '📱 ' : '🔌 ') + it.name;
+    const sm = document.createElement('small'); sm.style.color = 'var(--mut)';
+    sm.textContent = it.description + ' · ' + new Date(it.created * 1000).toLocaleDateString('pt-BR');
+    row.append(t, sm); for (const f of it.files) row.appendChild(botaoArquivo(f));
+    box.appendChild(row);
   }
 }
-$('appsBtn').onclick = () => { $('appsDlg').showModal(); listaApps(); };
-$('appsClose').onclick = () => $('appsDlg').close();
+$('filesBtn').onclick = () => { $('filesDlg').showModal(); listaArquivos(); };
+$('filesClose').onclick = () => $('filesDlg').close();
+
+// ---------------- conectar o celular (só aparece no próprio PC) e opções no celular
+$('optBtn').onclick = () => document.body.classList.toggle('opts');
+if (NATIVO) { $('cfgBtn').hidden = false; $('cfgBtn').onclick = () => window.AndroidBridge.openSettings(); }
+else fetch('/pair').then(r => r.ok ? r.json() : null).then(d => {
+  if (!d) return;
+  $('pairBtn').hidden = false;
+  $('pairBtn').onclick = () => {
+    const box = $('pairUrls'); box.textContent = '';
+    for (const u of d.urls) { const c = document.createElement('div'); c.className = 'copia'; c.textContent = u; box.appendChild(c); }
+    if (!d.urls.length) box.textContent = 'Não achei o endereço. Rode "sudo tailscale up" no PC.';
+    $('pairToken').textContent = d.token; $('pairDlg').showModal();
+  };
+}).catch(() => {});
+$('pairClose').onclick = () => $('pairDlg').close();
 
 $('send').onclick = () => send(txt.value);
 txt.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(txt.value); } });
@@ -1482,7 +1863,9 @@ EOF
 #!/usr/bin/env bash
 cd "$(dirname "$0")"
 set -a; source .env; set +a
-exec .venv/bin/uvicorn main:app --host 127.0.0.1 --port 8080
+# 0.0.0.0 = aceita o celular (Tailscale) e a rede de casa; quem não está no PC precisa do token.
+# Para aceitar só o próprio PC: LISTEN_HOST=127.0.0.1 no arquivo .env
+exec .venv/bin/uvicorn main:app --host "${LISTEN_HOST:-0.0.0.0}" --port 8080
 EOF
   cat > "$BASE/start_llm.sh" <<'EOF'
 #!/usr/bin/env bash
@@ -1511,13 +1894,37 @@ echo "==> Voz feminina (~350 MB na primeira vez)"
 baixar "$K/kokoro-v1.0.onnx" "$HOME/models/kokoro-v1.0.onnx"
 baixar "$K/voices-v1.0.bin" "$HOME/models/voices-v1.0.bin"
 
-# Gradle: compila os apps Android que a IA cria
-if [ ! -x "$HOME/gradle/gradle-8.7/bin/gradle" ]; then
-  echo "==> Gradle (~130 MB, só na primeira vez)"
+instalar_gradle() {
+  local G="$HOME/gradle/gradle-8.7"
+  [ -x "$G/bin/gradle" ] && return 0
   mkdir -p "$HOME/gradle"
-  baixar https://services.gradle.org/distributions/gradle-8.7-bin.zip /tmp/gradle-8.7-bin.zip
+  baixar https://services.gradle.org/distributions/gradle-8.7-bin.zip /tmp/gradle-8.7-bin.zip &&
   unzip -q -o /tmp/gradle-8.7-bin.zip -d "$HOME/gradle"
-fi
+}
+
+instalar_esp32() {
+  local CLI="$HOME/bin/arduino-cli"
+  mkdir -p "$HOME/bin"
+  if [ ! -x "$CLI" ]; then
+    baixar https://downloads.arduino.cc/arduino-cli/arduino-cli_latest_Linux_64bit.tar.gz /tmp/arduino-cli.tgz &&
+    tar xzf /tmp/arduino-cli.tgz -C "$HOME/bin" arduino-cli || return 1
+  fi
+  "$CLI" core list 2>/dev/null | grep -q '^esp32:esp32' && return 0
+  echo "==> Núcleo ESP32 (~700 MB, só na primeira vez; demora)"
+  "$CLI" config init >/dev/null 2>&1 || true
+  "$CLI" config add board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+  "$CLI" core update-index && "$CLI" core install esp32:esp32
+}
+
+instalar_tailscale() {
+  command -v tailscale >/dev/null || curl -fsSL https://tailscale.com/install.sh | sh
+}
+
+
+# Gradle (compila apps), ESP32 (compila firmware) e Tailscale (acesso de qualquer lugar)
+instalar_gradle || echo "AVISO: não consegui instalar o Gradle."
+[ -n "${SEM_ESP32:-}" ] || instalar_esp32 || echo "AVISO: o núcleo ESP32 não instalou; rode de novo mais tarde. (SEM_ESP32=1 pula esta etapa)"
+instalar_tailscale || echo "AVISO: não consegui instalar o Tailscale."
 if [ -x "$HOME/Android/Sdk/build-tools/34.0.0/aapt2" ]; then
   grep -q '^ANDROID_HOME=' "$SRV/.env" || printf 'ANDROID_HOME=%s
 JAVA_HOME=%s
@@ -1539,4 +1946,7 @@ else
   sudo systemctl restart localai-server.service
   echo
   echo "Pronto. O modelo NÃO foi reiniciado (o NGL não mudou); só o servidor, que leva segundos."
+  echo
+  echo "Celular: 1) sudo tailscale up   (se ainda não fez; faça o mesmo no celular)"
+  echo "         2) no PC, abra o IA Local e clique em 'Conectar celular'"
 fi
