@@ -4907,7 +4907,11 @@ ssd_rapido() {
   [ -w "$dest" ] || sudo chown "$USER": "$dest" || return 1
   echo "SSD: usando $dest para modelos, Gradle, Android SDK e núcleo ESP32."
   SSD_MOVEU=0
-  for item in models .gradle gradle Android .arduino15 .cache/huggingface; do
+  # tudo da IA vai para o SSD: modelos, o servidor (~/localai: programa, memória, apps e arquivos gerados) e as ferramentas de compilar
+  if [ -d "$HOME/localai" ] && [ ! -L "$HOME/localai" ]; then
+    sudo systemctl stop localai-server.service localai-llm.service >/dev/null 2>&1 || true   # (o atualizador religa no fim)
+  fi
+  for item in models localai .gradle gradle Android .arduino15 .cache/huggingface; do
     mover_para "$HOME/$item" "$dest/$(echo "$item" | tr '/' '_')" || true
   done
   if [ "${SSD_MOVEU:-0}" = 1 ]; then
