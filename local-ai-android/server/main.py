@@ -283,7 +283,14 @@ async def llm_download(req: PerfilReq):
 
 @app.get("/telemetry", dependencies=[Depends(require_token)])
 async def telemetry():
-    return await asyncio.to_thread(telemetria.ler)
+    dado = dict(await asyncio.to_thread(telemetria.ler))
+    try:  # estado do modelo de linguagem (para o painel em tempo real do app)
+        async with httpx.AsyncClient(timeout=0.8) as c:
+            r = await c.get(f"{config.LLAMA_URL}/health")
+        dado["llm"] = "ok" if r.status_code == 200 else "carregando"
+    except Exception:
+        dado["llm"] = "off"
+    return dado
 
 
 # ------------------------------------------- criar apps / firmware / arquivos

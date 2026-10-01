@@ -57,6 +57,30 @@ def _hwmon() -> tuple[float | None, dict]:
     return temp, fans
 
 
+_ult_cpu: tuple[int, int] | None = None
+
+
+def _uso_cpu() -> float | None:
+    """Uso total da CPU em % desde a leitura anterior (a primeira leitura compara com 0,3 s antes)."""
+    global _ult_cpu
+
+    def ler():
+        v = [int(x) for x in Path("/proc/stat").read_text().splitlines()[0].split()[1:]]
+        return sum(v), v[3] + (v[4] if len(v) > 4 else 0)  # total, parado (idle+iowait)
+
+    try:
+        t, ocioso = ler()
+        if _ult_cpu is None:
+            time.sleep(0.3)
+            _ult_cpu = (t, ocioso)
+            t, ocioso = ler()
+        dt, di = t - _ult_cpu[0], ocioso - _ult_cpu[1]
+        _ult_cpu = (t, ocioso)
+        return round(max(0.0, min(100.0, 100.0 * (dt - di) / dt)), 1) if dt > 0 else None
+    except (OSError, ValueError, IndexError):
+        return None
+
+
 def _ram() -> dict:
     m = {}
     try:
@@ -84,7 +108,7 @@ def ler() -> dict:
     if _cache[1] is not None and agora - _cache[0] < 2:
         return _cache[1]
     temp, fans = _hwmon()
-    dado = {"gpu": _gpu(), "cpu": {"temp": temp, "carga": round(os.getloadavg()[0], 2), "nucleos": os.cpu_count()},
+    dado = {"gpu": _gpu(), "cpu": {"temp": temp, "uso": _uso_cpu(), "carga": round(os.getloadavg()[0], 2), "nucleos": os.cpu_count()},
             "ventoinhas": fans, "ram": _ram(), "controle_ventoinha": _controle_ventoinha(),
             "modelos_na_ram": sorted(recursos._modelos)}
     _cache = (agora, dado)

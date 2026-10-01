@@ -406,7 +406,14 @@ async def llm_download(req: PerfilReq):
 
 @app.get("/telemetry", dependencies=[Depends(require_token)])
 async def telemetry():
-    return await asyncio.to_thread(telemetria.ler)
+    dado = dict(await asyncio.to_thread(telemetria.ler))
+    try:  # estado do modelo de linguagem (para o painel em tempo real do app)
+        async with httpx.AsyncClient(timeout=0.8) as c:
+            r = await c.get(f"{config.LLAMA_URL}/health")
+        dado["llm"] = "ok" if r.status_code == 200 else "carregando"
+    except Exception:
+        dado["llm"] = "off"
+    return dado
 
 
 # ------------------------------------------- criar apps / firmware / arquivos
@@ -1807,6 +1814,30 @@ def _hwmon() -> tuple[float | None, dict]:
     return temp, fans
 
 
+_ult_cpu: tuple[int, int] | None = None
+
+
+def _uso_cpu() -> float | None:
+    """Uso total da CPU em % desde a leitura anterior (a primeira leitura compara com 0,3 s antes)."""
+    global _ult_cpu
+
+    def ler():
+        v = [int(x) for x in Path("/proc/stat").read_text().splitlines()[0].split()[1:]]
+        return sum(v), v[3] + (v[4] if len(v) > 4 else 0)  # total, parado (idle+iowait)
+
+    try:
+        t, ocioso = ler()
+        if _ult_cpu is None:
+            time.sleep(0.3)
+            _ult_cpu = (t, ocioso)
+            t, ocioso = ler()
+        dt, di = t - _ult_cpu[0], ocioso - _ult_cpu[1]
+        _ult_cpu = (t, ocioso)
+        return round(max(0.0, min(100.0, 100.0 * (dt - di) / dt)), 1) if dt > 0 else None
+    except (OSError, ValueError, IndexError):
+        return None
+
+
 def _ram() -> dict:
     m = {}
     try:
@@ -1834,7 +1865,7 @@ def ler() -> dict:
     if _cache[1] is not None and agora - _cache[0] < 2:
         return _cache[1]
     temp, fans = _hwmon()
-    dado = {"gpu": _gpu(), "cpu": {"temp": temp, "carga": round(os.getloadavg()[0], 2), "nucleos": os.cpu_count()},
+    dado = {"gpu": _gpu(), "cpu": {"temp": temp, "uso": _uso_cpu(), "carga": round(os.getloadavg()[0], 2), "nucleos": os.cpu_count()},
             "ventoinhas": fans, "ram": _ram(), "controle_ventoinha": _controle_ventoinha(),
             "modelos_na_ram": sorted(recursos._modelos)}
     _cache = (agora, dado)
@@ -3242,27 +3273,23 @@ EOF
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>IA Local</title>
+<title>Betina &amp; IA</title>
 <style>
+  /* Visual "terminal de segurança" (mesma família do app da bomba da piscina): fundo escuro, verde neon e ciano */
   :root {
-    --bg:#FAF9F5; --side:#F3F1EA; --card:#FFFFFF; --txt:#1F1E1D; --mut:#6F6D66; --line:#E6E3D8;
-    --acc:#C6613F; --acc-h:#B3532F; --acc-soft:#F6E7DF; --user:#EDEAE0; --code:#F1EFE7; --ok:#3F7D4E; --warn:#B7791F; --err:#B3412F;
-    --sombra:0 2px 14px rgba(40,30,20,.07);
+    --bg:#05090D; --side:#080F15; --card:#0C161E; --txt:#D7F5E6; --mut:#6F9A8C; --line:#16313A;
+    --acc:#00E58F; --acc-h:#33FFAA; --acc-soft:#073326; --ciano:#22D3EE; --user:#0F2330; --code:#030608;
+    --ok:#00E58F; --warn:#FFB020; --err:#FF4D5E;
+    --sombra:0 0 0 1px #16313A, 0 4px 22px rgba(0,229,143,.07);
     --sans:-apple-system,"Segoe UI",system-ui,"Noto Sans",Roboto,sans-serif;
-    --serif:ui-serif,"Iowan Old Style","Palatino Linotype",Georgia,"Noto Serif",serif;
+    --serif:ui-monospace,"SF Mono",Menlo,Consolas,"DejaVu Sans Mono",monospace;
     --mono:ui-monospace,"SF Mono",Menlo,Consolas,"DejaVu Sans Mono",monospace;
   }
-  :root[data-tema="escuro"] {
-    --bg:#262624; --side:#1F1E1D; --card:#30302E; --txt:#F0EEE6; --mut:#A3A199; --line:#3D3C39;
-    --acc:#D97757; --acc-h:#E58867; --acc-soft:#3B2E28; --user:#3A3936; --code:#1D1C1B; --ok:#7CC38C; --warn:#E0B25A; --err:#E57368;
-    --sombra:0 2px 14px rgba(0,0,0,.35);
-  }
-  @media (prefers-color-scheme: dark) {
-    :root:not([data-tema="claro"]) {
-      --bg:#262624; --side:#1F1E1D; --card:#30302E; --txt:#F0EEE6; --mut:#A3A199; --line:#3D3C39;
-      --acc:#D97757; --acc-h:#E58867; --acc-soft:#3B2E28; --user:#3A3936; --code:#1D1C1B; --ok:#7CC38C; --warn:#E0B25A; --err:#E57368;
-      --sombra:0 2px 14px rgba(0,0,0,.35);
-    }
+  :root[data-tema="claro"] {
+    --bg:#F2F7F5; --side:#E6EFEB; --card:#FFFFFF; --txt:#0D2A22; --mut:#4E6F65; --line:#C9DAD3;
+    --acc:#00855A; --acc-h:#006B49; --acc-soft:#D8F1E7; --ciano:#0A7C93; --user:#DDEBE6; --code:#E9F1EE;
+    --ok:#00855A; --warn:#B26A00; --err:#C0283A;
+    --sombra:0 2px 14px rgba(0,60,40,.08);
   }
   * { box-sizing:border-box; }
   html, body { height:100%; }
@@ -3276,7 +3303,8 @@ EOF
 
   /* ---------- barra lateral ---------- */
   #side { width:272px; flex:none; background:var(--side); border-right:1px solid var(--line); display:flex; flex-direction:column; padding:14px 10px 10px; gap:10px; z-index:30; }
-  .marca { display:flex; align-items:center; gap:8px; padding:4px 8px; font:600 19px var(--serif); letter-spacing:.2px; }
+  .marca { display:flex; align-items:center; gap:8px; padding:4px 8px; font:700 18px var(--mono); letter-spacing:.5px; color:var(--acc); text-shadow:0 0 12px rgba(0,229,143,.45); }
+  .marca i { color:var(--ciano); font-style:normal; }
   .marca i { font-style:normal; color:var(--acc); font-size:22px; }
   .btn-nova { display:flex; align-items:center; gap:8px; width:100%; padding:9px 12px; border:1px solid var(--line); background:var(--card); border-radius:12px; font-weight:500; }
   .btn-nova:hover { border-color:var(--acc); }
@@ -3308,7 +3336,7 @@ EOF
   #log { flex:1; overflow-y:auto; scroll-behavior:smooth; }
   .coluna { max-width:760px; margin:0 auto; padding:8px 20px 24px; display:flex; flex-direction:column; gap:22px; min-height:100%; }
   .vazio { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; text-align:center; padding:24px 0 60px; gap:22px; }
-  .vazio h1 { font:400 clamp(26px,5vw,36px)/1.2 var(--serif); margin:0; }
+  .vazio h1 { font:700 clamp(26px,5vw,36px)/1.2 var(--serif); margin:0; }
   .vazio h1 i { font-style:normal; color:var(--acc); margin-right:8px; }
   .sugestoes { display:flex; flex-wrap:wrap; gap:8px; justify-content:center; max-width:640px; }
   .sugestoes button { border:1px solid var(--line); background:var(--card); border-radius:999px; padding:8px 14px; font-size:14px; }
@@ -3317,7 +3345,7 @@ EOF
   .msg { display:flex; flex-direction:column; gap:6px; }
   .msg.user { align-items:flex-end; }
   .msg.user .corpo { background:var(--user); padding:10px 16px; border-radius:18px; max-width:85%; white-space:pre-wrap; word-wrap:break-word; }
-  .msg.assistant .corpo { font:16.5px/1.7 var(--serif); word-wrap:break-word; overflow-wrap:anywhere; }
+  .msg.assistant .corpo { font:16px/1.65 var(--sans); word-wrap:break-word; overflow-wrap:anywhere; }
   .corpo p { margin:0 0 .85em; } .corpo p:last-child { margin-bottom:0; }
   .corpo h2, .corpo h3, .corpo h4 { font-family:var(--serif); margin:1.1em 0 .4em; line-height:1.3; }
   .corpo ul, .corpo ol { margin:.2em 0 .9em; padding-left:1.4em; } .corpo li { margin:.2em 0; }
@@ -3342,7 +3370,7 @@ EOF
   .cartao .st { font-weight:500; }
   .cartao details { margin-top:10px; } .cartao summary { cursor:pointer; color:var(--mut); font-size:13.5px; }
   .cartao pre { background:var(--code); padding:10px 12px; border-radius:10px; overflow-x:auto; font:12.5px var(--mono); margin:8px 0 0; }
-  a.dl { display:flex; align-items:center; gap:8px; width:fit-content; max-width:100%; margin-top:10px; padding:9px 14px; border-radius:12px; background:var(--acc); color:#fff; text-decoration:none; font-weight:500; }
+  a.dl { display:flex; align-items:center; gap:8px; width:fit-content; max-width:100%; margin-top:10px; padding:9px 14px; border-radius:12px; background:var(--acc); color:#03140D; text-decoration:none; font-weight:500; }
   a.dl:hover { background:var(--acc-h); } a.dl small { opacity:.85; font-weight:400; }
   .dica { color:var(--mut); font-size:13.5px; margin-top:8px; }
 
@@ -3362,7 +3390,8 @@ EOF
   .ic.gravando { background:var(--err); color:#fff; animation:pulsa 1.3s infinite; }
   @keyframes pulsa { 50% { box-shadow:0 0 0 6px rgba(179,65,47,.2); } }
   #send, #stop { width:36px; height:36px; border-radius:50%; border:0; display:inline-flex; align-items:center; justify-content:center; font-size:18px; }
-  #send { background:var(--acc); color:#fff; } #send:hover:not(:disabled) { background:var(--acc-h); }
+  #send { background:var(--acc); color:#03140D; } #send:hover:not(:disabled) { background:var(--acc-h); }
+  :root[data-tema="claro"] a.dl, :root[data-tema="claro"] #send, :root[data-tema="claro"] .bt.pri { color:#fff; }
   #stop { background:var(--txt); color:var(--bg); }
   .rodape { text-align:center; font-size:12px; color:var(--mut); padding-top:8px; }
 
@@ -3380,9 +3409,10 @@ EOF
   /* janelas */
   dialog { background:var(--card); color:var(--txt); border:1px solid var(--line); border-radius:18px; width:min(640px,94vw); max-height:86vh; max-height:86dvh; padding:20px; box-shadow:0 20px 60px rgba(0,0,0,.3); }
   dialog::backdrop { background:rgba(0,0,0,.45); }
-  dialog h2 { font:600 20px var(--serif); margin:0 0 4px; }
+  dialog h2 { font:700 16px var(--mono); margin:0 0 4px; color:var(--acc); letter-spacing:.4px; }
+  dialog h2::before { content:"// "; color:var(--ciano); }
   .bt { border:1px solid var(--line); background:var(--card); border-radius:10px; padding:7px 14px; } .bt:hover:not(:disabled) { border-color:var(--acc); }
-  .bt.pri { background:var(--acc); border-color:var(--acc); color:#fff; } .bt.pri:hover:not(:disabled) { background:var(--acc-h); }
+  .bt.pri { background:var(--acc); border-color:var(--acc); color:#03140D; } .bt.pri:hover:not(:disabled) { background:var(--acc-h); }
   .lista { display:flex; flex-direction:column; gap:8px; margin:12px 0; max-height:52vh; max-height:52dvh; overflow-y:auto; }
   .item-l { border:1px solid var(--line); border-radius:12px; padding:10px 12px; display:flex; gap:10px; align-items:flex-start; font-size:14px; }
   .item-l .t { flex:1; word-break:break-word; white-space:pre-wrap; } .item-l small { display:block; color:var(--mut); }
@@ -3426,7 +3456,7 @@ EOF
 <body>
 <div id="app">
   <aside id="side">
-    <div class="marca"><i>✦</i> IA Local</div>
+    <div class="marca"><i>✦</i> Betina &amp; IA</div>
     <button class="btn-nova" id="new">＋ Nova conversa</button>
     <div id="convs"></div>
     <div class="side-foot">
@@ -3546,7 +3576,7 @@ EOF
   <div id="pairUrls"></div>
   <div style="margin-top:12px"><b>Token (senha)</b></div>
   <div id="pairToken" class="copia"></div>
-  <div class="dica">No celular: instale o Tailscale, entre com a mesma conta e abra o app IA Local. Não mostre o token a ninguém.</div>
+  <div class="dica">No celular: instale o Tailscale, entre com a mesma conta e abra o app Betina &amp; IA. Não mostre o token a ninguém.</div>
   <div style="margin-top:14px"><button class="bt" id="pairClose">Fechar</button></div>
 </dialog>
 
@@ -3706,7 +3736,7 @@ function desenha() {
   if (!c || !c.msgs.length) { coluna.appendChild(boasVindas()); }
   else for (const m of c.msgs) coluna.appendChild(criaMsg(m));
   $('titulo').textContent = (c && c.titulo) || 'Nova conversa';
-  document.title = (c && c.titulo) ? c.titulo + ' · IA Local' : 'IA Local';
+  document.title = (c && c.titulo) ? c.titulo + ' · Betina & IA' : 'Betina & IA';
   listaLateral(); desceFim(true);
 }
 function desceFim(forca) {
@@ -4251,7 +4281,7 @@ EOF
   cat > "$BASE/start_llm.sh" <<'EOF'
 #!/usr/bin/env bash
 # Inicia o modelo de IA. O perfil (arquivo do modelo e camadas na placa) pode ser trocado pela
-# tela do IA Local (Configurações > Modelo de IA); a escolha fica em ~/localai/modelo.env.
+# tela do Betina & IA (Configurações > Modelo de IA); a escolha fica em ~/localai/modelo.env.
 # NGL = camadas na GPU: "auto" (padrão) calcula pela VRAM livre; ou um número fixo (ex.: NGL=4).
 NGL="${NGL:-auto}"
 MODEL="${MODEL:-$HOME/models/__MODEL__}"

@@ -20,7 +20,7 @@ instalar_atalho() {
   cat > "$HOME/.local/share/applications/ia-local.desktop" <<DESK
 [Desktop Entry]
 Type=Application
-Name=IA Local
+Name=Betina & IA
 Comment=Conversar com a IA local por texto e voz
 Exec=xdg-open http://localhost:8080
 Icon=utilities-terminal
@@ -34,7 +34,7 @@ DESK
 rep('step "8/9 Tailscale"                instalar_tailscale','step "8/9 Voz (ouvir e falar)"       instalar_voz')
 rep('step "9/9 Serviços automáticos"     instalar_servicos','step "9/9 Serviços automáticos"     instalar_servicos\nstep "9/9 Atalho na área de trabalho" instalar_atalho')
 rep('''echo "        3) sudo tailscale up      (abra o link e faça login)"
-echo "        4) curl http://localhost:8080/health"''','''echo "        3) espere ~1 minuto e abra o atalho 'IA Local' na área de trabalho"
+echo "        4) curl http://localhost:8080/health"''','''echo "        3) espere ~1 minuto e abra o atalho 'Betina & IA' na área de trabalho"
 echo "           (ou o navegador em http://localhost:8080)"
 echo "        Se não abrir:  systemctl status localai-llm localai-server"''')
 open('/tmp/claude-0/tpl.sh','w').write(t)

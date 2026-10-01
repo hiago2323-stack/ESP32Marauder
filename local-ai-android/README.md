@@ -19,9 +19,9 @@ anterior terminar e dispara este sozinho. Não salve um instalador novo com o no
 Instala: driver NVIDIA 580 (a GTX 960 não é suportada pelo 590+), CUDA 12.6,
 telemetria/controle da GPU, llama.cpp + modelo Qwen2.5-Coder 7B (ou 3B), servidor, memória, voz
 (Whisper para ouvir, Kokoro 'pf_dora' feminina para falar, Piper masculina como reserva), Android SDK, serviços no boot e atalho
-"IA Local" na área de trabalho. Log em `~/localai-install.log`.
+"Betina & IA" na área de trabalho. Log em `~/localai-install.log`.
 
-Depois de reiniciar, abra o atalho **IA Local** (ou `http://localhost:8080`).
+Depois de reiniciar, abra o atalho **Betina & IA** (ou `http://localhost:8080`).
 
 ## Estrutura
 
@@ -40,13 +40,17 @@ O instalador é gerado a partir de `server/`; mantenha os dois iguais.
 
 ## App do celular (acesso de qualquer lugar)
 
-O app **IA Local** (`dist/IA-Local.apk`, código em `android-client/`) é a "cara" do PC no celular.
+O app **Betina & IA** (`dist/Betina-IA.apk`, código em `android-client/`) é a "cara" do PC no celular.
+Ele tem uma **faixa de telemetria em tempo real** no topo (atualiza a cada ~1,5 s): uso e temperatura da
+GPU e da CPU, VRAM, RAM e estado da IA. Tocando na faixa abre o painel com gráficos estilo osciloscópio.
+O visual segue o app "Decker Cyber Segurança" (terminal escuro, verde neon e ciano), e o ícone é um
+escudo duplo com a letra B. Mesma assinatura das versões antigas: instalar por cima atualiza sem perder nada.
 Ele tem todas as funções da tela (conversa, voz, pesquisa, memória, criar apps/firmware, Parar) e o
 processamento continua no PC. A conexão é pelo **Tailscale** (VPN privada).
 
 1. No PC: `sudo tailscale up` (entre na sua conta). No celular: instale o Tailscale e entre na mesma conta.
-2. Instale `IA-Local.apk` no celular (permita instalar de fontes desconhecidas).
-3. No PC, abra o IA Local e clique em **📲 Conectar celular**: mostra o endereço e o token.
+2. Instale `Betina-IA.apk` no celular (permita instalar de fontes desconhecidas).
+3. No PC, abra o Betina & IA e clique em **📲 Conectar celular**: mostra o endereço e o token.
 4. No app, digite o endereço e o token. Pronto.
 
 O servidor aceita conexões de fora do PC **somente com o token**. Nunca abra a porta 8080 no roteador.

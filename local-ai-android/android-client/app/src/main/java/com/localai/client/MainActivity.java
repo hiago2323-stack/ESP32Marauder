@@ -44,7 +44,7 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 
 /**
- * IA Local: o celular só mostra a tela e grava a voz. Todo o processamento
+ * Betina & IA: o celular só mostra a tela e grava a voz. Todo o processamento
  * (modelo de IA, voz, pesquisa, compilação) acontece no PC, que o app acessa pela rede
  * (de qualquer lugar, usando o Tailscale).
  */
@@ -57,6 +57,9 @@ public class MainActivity extends Activity {
     private MediaRecorder gravador;
     private File arquivoVoz;
     private ValueCallback<Uri[]> seletorArquivos;   // resposta pendente do botão 📎 da página
+    private PainelTele tele;                        // faixa de telemetria em tempo real
+    private volatile boolean visivel = false;
+    private Thread leitor;
 
     // ------------------------------------------------------------------ ciclo de vida
     @Override
@@ -64,7 +67,18 @@ public class MainActivity extends Activity {
         super.onCreate(savedInstanceState);
         prefs = getSharedPreferences("config", MODE_PRIVATE);
         web = new WebView(this);
-        setContentView(web);
+        tele = new PainelTele(this);
+        LinearLayout raiz = new LinearLayout(this);
+        raiz.setOrientation(LinearLayout.VERTICAL);
+        raiz.setBackgroundColor(PainelTele.FUNDO);
+        raiz.addView(tele, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT));
+        raiz.addView(web, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+        setContentView(raiz);
+        if (Build.VERSION.SDK_INT >= 21) {
+            getWindow().setStatusBarColor(PainelTele.FUNDO);
+            getWindow().setNavigationBarColor(PainelTele.FUNDO);
+        }
         configuraWeb();
 
         IntentFilter filtro = new IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE);
@@ -78,6 +92,63 @@ public class MainActivity extends Activity {
             mostraConfig();
         } else {
             carrega();
+        }
+    }
+
+    // ------------------------------------------------------------------ telemetria em tempo real
+    @Override
+    protected void onResume() {
+        super.onResume();
+        visivel = true;
+        if (leitor == null || !leitor.isAlive()) {
+            leitor = new Thread(this::laco, "telemetria");
+            leitor.setDaemon(true);
+            leitor.start();
+        }
+    }
+
+    @Override
+    protected void onPause() {
+        visivel = false;
+        super.onPause();
+    }
+
+    /** Lê /telemetry do PC a cada ~1,5 s enquanto o app está na tela. */
+    private void laco() {
+        while (visivel) {
+            String base = servidor();
+            if (base.isEmpty()) {
+                runOnUiThread(() -> tele.falhou("sem servidor configurado"));
+            } else {
+                try {
+                    HttpURLConnection c = (HttpURLConnection) new URL(base + "/telemetry").openConnection();
+                    c.setConnectTimeout(3000);
+                    c.setReadTimeout(4000);
+                    c.setRequestProperty("Authorization", "Bearer " + token());
+                    int codigo = c.getResponseCode();
+                    if (codigo != 200) {
+                        throw new java.io.IOException("HTTP " + codigo);
+                    }
+                    ByteArrayOutputStream corpo = new ByteArrayOutputStream();
+                    try (InputStream in = c.getInputStream()) {
+                        byte[] buf = new byte[4096];
+                        int n;
+                        while ((n = in.read(buf)) > 0) {
+                            corpo.write(buf, 0, n);
+                        }
+                    }
+                    final JSONObject j = new JSONObject(corpo.toString("UTF-8"));
+                    runOnUiThread(() -> tele.atualiza(j));
+                } catch (Exception e) {
+                    final String m = e.getClass().getSimpleName();
+                    runOnUiThread(() -> tele.falhou(m));
+                }
+            }
+            try {
+                Thread.sleep(1500);
+            } catch (InterruptedException e) {
+                return;
+            }
         }
     }
 
@@ -134,7 +205,7 @@ public class MainActivity extends Activity {
         caixa.setPadding(dp(20), dp(12), dp(20), 0);
 
         TextView ajuda = new TextView(this);
-        ajuda.setText("No PC, abra o IA Local no navegador e clique em \"Conectar celular\" "
+        ajuda.setText("No PC, abra o Betina & IA no navegador e clique em \"Conectar celular\" "
                 + "para ver estes dois dados. O Tailscale precisa estar ligado no celular e no PC.");
         caixa.addView(ajuda);
 
@@ -289,7 +360,7 @@ public class MainActivity extends Activity {
 
     private void instala(Uri uri) {
         if (Build.VERSION.SDK_INT >= 26 && !getPackageManager().canRequestPackageInstalls()) {
-            Toast.makeText(this, "Permita que o IA Local instale apps e baixe o arquivo de novo.",
+            Toast.makeText(this, "Permita que o Betina & IA instale apps e baixe o arquivo de novo.",
                     Toast.LENGTH_LONG).show();
             startActivity(new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
                     Uri.parse("package:" + getPackageName())));
@@ -381,7 +452,7 @@ public class MainActivity extends Activity {
     }
 
     // ------------------------------------------------------------------ ponte com a página
-    /** Funções que a página (IA Local) chama de dentro do WebView. */
+    /** Funções que a página (Betina & IA) chama de dentro do WebView. */
     private class Ponte {
         @JavascriptInterface
         public boolean isApp() {
