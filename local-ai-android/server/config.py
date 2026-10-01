@@ -44,3 +44,12 @@ SYSTEM_PROMPT = os.environ.get(
 
 # Banco da memória de longo prazo (o que o usuário ensina e o que a IA aprende)
 MEMORY_DB = Path(os.environ.get("MEMORY_DB", str(HOME / "localai" / "memory.db")))
+
+# ---- Criação de apps Android pela IA ----
+# Onde ficam os apps criados (APK + código) e o Gradle usado para compilar
+APPS_DIR = Path(os.environ.get("APPS_DIR", str(HOME / "localai" / "apps")))
+GRADLE_BIN = os.environ.get("GRADLE_BIN", str(HOME / "gradle" / "gradle-8.7" / "bin" / "gradle"))
+# Quantas vezes a IA tenta corrigir o código quando a compilação falha
+MAX_FIX_ATTEMPTS = int(os.environ.get("MAX_FIX_ATTEMPTS", "2"))
+# Limite de palavras (tokens) que a IA pode escrever por tentativa
+GEN_MAX_TOKENS = int(os.environ.get("GEN_MAX_TOKENS", "2500"))

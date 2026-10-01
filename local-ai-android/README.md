@@ -38,6 +38,14 @@ O instalador é gerado a partir de `server/`; mantenha os dois iguais.
 - [ ] Compilar `.bin` de ESP32 (`arduino-cli`)
 - [ ] App Android + acesso remoto (Tailscale)
 
+## Criar apps Android
+
+Marque **📱 Criar app Android** na tela e descreva o app. A IA escreve um único arquivo Java
+(sem bibliotecas externas), o servidor monta o projeto Gradle, compila e, se der erro, devolve o
+erro à IA para corrigir (até 2 vezes). O APK fica em `~/localai/apps` e na janela **📱 Meus apps**.
+O botão **⏹ Parar** (ou Esc) cancela a escrita e a compilação. A primeira compilação baixa as
+ferramentas do Android (algumas centenas de MB) e demora mais.
+
 ## Atualizar sem reinstalar
 
 ```

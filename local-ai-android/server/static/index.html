@@ -40,6 +40,14 @@
          align-items:flex-start; font-size:14px; white-space:pre-wrap; }
   .mem span { flex:1; word-break:break-word; }
   .mem small { color:var(--mut); display:block; }
+  #stop:not(:disabled) { border-color:#c0392b; color:#e57368; font-weight:600; }
+  a.btn { display:inline-block; padding:8px 14px; border:1px solid var(--acc); border-radius:8px;
+          color:var(--acc); text-decoration:none; margin-top:8px; }
+  .msg details { margin-top:8px; }
+  .msg summary { cursor:pointer; color:var(--mut); font-size:14px; }
+  .dica { color:var(--mut); font-size:14px; margin-top:6px; }
+  select, input[type=range] { width:100%; font:inherit; padding:6px; border-radius:8px; color:var(--txt);
+          background:var(--bg); border:1px solid var(--line); }
   #status { color:var(--mut); font-size:13px; padding:0 16px 8px; min-height:22px; background:var(--panel); }
 </style>
 </head>
@@ -49,6 +57,9 @@
   <label><input type="checkbox" id="web"> Pesquisar na web</label>
   <label title="Guarda na memória o que descobrir pesquisando"><input type="checkbox" id="learn" checked> Aprender com pesquisas</label>
   <label><input type="checkbox" id="speak"> Falar as respostas</label>
+  <label title="A IA escreve, compila e entrega o APK de um app Android"><input type="checkbox" id="appmode"> 📱 Criar app Android</label>
+  <button id="voiceBtn">🔊 Voz</button>
+  <button id="appsBtn">📱 Meus apps</button>
   <button id="memBtn">🧠 Memória</button>
   <button id="new">Nova conversa</button>
 </header>
@@ -61,18 +72,34 @@
     <button id="memAdd">Ensinar</button><button id="memClose">Fechar</button>
   </div>
 </dialog>
+<dialog id="vozDlg">
+  <strong>Voz da IA</strong>
+  <div class="dica">Escolha uma voz e clique em Testar. As vozes de outros países leem o português com sotaque.</div>
+  <label style="display:block;margin:12px 0 4px">Voz</label>
+  <select id="vozSel"></select>
+  <label style="display:block;margin:12px 0 4px">Velocidade: <span id="velVal">1.00</span>×</label>
+  <input type="range" id="vel" min="0.7" max="1.4" step="0.05" value="1">
+  <div style="display:flex;gap:8px;margin-top:14px"><button id="vozTest">▶ Testar</button><button id="vozClose">Fechar</button></div>
+</dialog>
+<dialog id="appsDlg">
+  <strong>Apps que a IA criou</strong>
+  <div class="dica">Ficam guardados no PC em ~/localai/apps. Passe o arquivo .apk para o celular (cabo USB, Bluetooth ou nuvem) e abra-o para instalar.</div>
+  <div id="appslist" style="margin:10px 0;display:flex;flex-direction:column;gap:8px"></div>
+  <button id="appsClose">Fechar</button>
+</dialog>
 <div id="log"></div>
 <div id="status"></div>
 <div id="bar">
   <button id="mic" title="Clique para gravar, clique de novo para enviar">🎤 Falar</button>
   <textarea id="txt" placeholder="Escreva aqui (Enter envia, Shift+Enter quebra linha)"></textarea>
+  <button id="stop" disabled title="Para a resposta, a voz ou a gravação (atalho: Esc)">⏹ Parar</button>
   <button id="send">Enviar</button>
 </div>
 <script>
 const $ = id => document.getElementById(id);
 const log = $('log'), txt = $('txt'), statusEl = $('status');
 let history = [];
-let busy = false;
+let busy = false, ctrl = null, falando = false, descartar = false;
 const setStatus = t => statusEl.textContent = t || '';
 
 function render(el, text) {
@@ -121,8 +148,13 @@ async function send(text) {
   pararVoz();
   busy = true; $('send').disabled = true;
   txt.value = '';
-  history.push({role: 'user', content: text});
   addMsg('user', text);
+  if ($('appmode').checked) {
+    try { await criarApp(text); }
+    finally { busy = false; ctrl = null; $('send').disabled = false; txt.focus(); }
+    return;
+  }
+  history.push({role: 'user', content: text});
   const teach = text.match(TEACH);
   if (teach) { try { await saveMemory(teach[3].trim(), 'usuario'); } catch (e) {} }
   const wantWeb = $('web').checked;
@@ -131,8 +163,9 @@ async function send(text) {
   setStatus($('web').checked ? 'Pesquisando na web e pensando…' : 'Pensando…');
   let answer = '';
   try {
+    ctrl = new AbortController();
     const r = await fetch('/chat', {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
+      method: 'POST', headers: {'Content-Type': 'application/json'}, signal: ctrl.signal,
       body: JSON.stringify({messages: history.slice(-12), web: $('web').checked})
     });
     if (!r.ok) throw new Error('Servidor respondeu ' + r.status);
@@ -164,8 +197,14 @@ async function send(text) {
     if (webResults > 0 && $('learn').checked && answer && !teach) {
       try { await saveMemory(`Pergunta: ${text}\nResposta (pesquisa na web em ${new Date().toLocaleDateString('pt-BR')}): ${answer}`, 'web'); } catch (e) {}
     }
-    if ($('speak').checked && answer) await speak(answer);
+    if ($('speak').checked && answer) speak(answer);  // sem await: já dá para escrever outra coisa
   } catch (e) {
+    if (e.name === 'AbortError') {  // o usuário clicou em Parar
+      render(out, (answer ? answer + '\n\n' : '') + '⏹ (interrompido por você)');
+      if (answer) history.push({role: 'assistant', content: answer}); else history.pop();
+      setStatus('');
+      return;
+    }
     const caiu = e instanceof TypeError || /network|fetch/i.test(e.message);
     const msg = caiu
       ? 'A conexão com o servidor caiu no meio da resposta. O modelo pode ter reiniciado (falta de memória da placa?). Espere alguns minutos e tente de novo.'
@@ -175,7 +214,7 @@ async function send(text) {
     history.pop();
     setStatus('');
   } finally {
-    busy = false; $('send').disabled = false; txt.focus();
+    busy = false; ctrl = null; $('send').disabled = false; txt.focus();
   }
 }
 
@@ -190,14 +229,18 @@ function pedacos(text, max = 220) {
   if (cur) out.push(cur);
   return out;
 }
+let vozPref = {voice: '', speed: 1.0};
+try { vozPref = Object.assign(vozPref, JSON.parse(localStorage.getItem('vozPref') || '{}')); } catch (e) {}
+const salvaVoz = () => { try { localStorage.setItem('vozPref', JSON.stringify(vozPref)); } catch (e) {} };
+
 async function audioDe(texto) {
   const r = await fetch('/tts', {method: 'POST', headers: {'Content-Type': 'application/json'},
-                                 body: JSON.stringify({text: texto})});
+                                 body: JSON.stringify({text: texto, voice: vozPref.voice || null, speed: vozPref.speed})});
   if (!r.ok) throw new Error((await r.json()).detail || r.status);
   return URL.createObjectURL(await r.blob());
 }
 let falaId = 0, falaAtual = null;
-function pararVoz() { falaId++; if (falaAtual) falaAtual.pause(); }
+function pararVoz() { falaId++; falando = false; if (falaAtual) falaAtual.pause(); }
 
 async function speak(text) {
   // Não lê blocos de código nem símbolos de formatação
@@ -206,6 +249,7 @@ async function speak(text) {
   const partes = pedacos(clean).slice(0, 40);
   if (!partes.length) return;
   const id = ++falaId;
+  falando = true;
   setStatus('Gerando voz…');
   try {
     let proximo = audioDe(partes[0]);
@@ -214,13 +258,14 @@ async function speak(text) {
       if (id !== falaId) return;
       if (i + 1 < partes.length) proximo = audioDe(partes[i + 1]);  // prepara a próxima enquanto esta toca
       const a = new Audio(url); falaAtual = a;
-      setStatus('Falando… (clique em 🎤 ou envie algo para interromper)');
+      setStatus('Falando… (clique em ⏹ Parar ou aperte Esc para interromper)');
       await a.play();
       await new Promise(res => { a.onended = res; a.onpause = res; });
       URL.revokeObjectURL(url);
       if (id !== falaId) return;
     }
   } catch (e) { setStatus('Voz indisponível: ' + e.message); return; }
+  finally { if (id === falaId) falando = false; }
   setStatus('');
 }
 
@@ -236,6 +281,7 @@ $('mic').onclick = async () => {
       stream.getTracks().forEach(t => t.stop());
       $('mic').classList.remove('rec'); $('mic').textContent = '🎤 Falar';
       const blob = new Blob(chunks, {type: rec.mimeType}); rec = null;
+      if (descartar) { descartar = false; setStatus(''); return; }  // clicou em Parar: joga fora a gravação
       setStatus('Entendendo o que você disse…');
       try {
         const fd = new FormData(); fd.append('audio', blob, 'voz.webm');
@@ -274,9 +320,127 @@ $('memAdd').onclick = async () => {
   const v = $('memNew').value.trim(); if (!v) return;
   await saveMemory(v, 'usuario'); $('memNew').value = ''; loadMem();
 };
+// ---------------- botão Parar: interrompe resposta, criação de app, voz e gravação
+function parar() {
+  if (ctrl) ctrl.abort();
+  pararVoz();
+  if (rec) { descartar = true; rec.stop(); }
+  setStatus('');
+}
+$('stop').onclick = parar;
+document.addEventListener('keydown', e => { if (e.key === 'Escape') parar(); });
+setInterval(() => { $('stop').disabled = !(busy || falando || rec); }, 150);
+
+// ---------------- escolha da voz
+let vozesCarregadas = false;
+async function carregaVozes() {
+  if (vozesCarregadas) return;
+  const sel = $('vozSel');
+  try {
+    const lista = await (await fetch('/voices')).json();
+    const grupos = {};
+    for (const v of lista) {
+      if (!grupos[v.group]) { grupos[v.group] = document.createElement('optgroup'); grupos[v.group].label = v.group; sel.appendChild(grupos[v.group]); }
+      const o = document.createElement('option'); o.value = v.id; o.textContent = v.label; grupos[v.group].appendChild(o);
+    }
+    sel.value = vozPref.voice || (lista[0] ? lista[0].id : '');
+    vozesCarregadas = true;
+  } catch (e) { sel.textContent = ''; }
+}
+$('voiceBtn').onclick = async () => {
+  $('vozDlg').showModal(); await carregaVozes();
+  $('vel').value = vozPref.speed; $('velVal').textContent = Number(vozPref.speed).toFixed(2);
+};
+$('vozSel').onchange = () => { vozPref.voice = $('vozSel').value; salvaVoz(); };
+$('vel').oninput = () => { vozPref.speed = parseFloat($('vel').value); $('velVal').textContent = vozPref.speed.toFixed(2); salvaVoz(); };
+$('vozTest').onclick = async () => {
+  pararVoz();
+  const id = ++falaId; falando = true; setStatus('Gerando amostra da voz…');
+  try {
+    const url = await audioDe('Olá! Eu sou a sua assistente. Esta é a minha voz. Gostou?');
+    if (id !== falaId) return;
+    const a = new Audio(url); falaAtual = a; await a.play();
+    await new Promise(res => { a.onended = res; a.onpause = res; });
+  } catch (e) { setStatus('Voz indisponível: ' + e.message); return; }
+  finally { if (id === falaId) falando = false; }
+  setStatus('');
+};
+$('vozClose').onclick = () => $('vozDlg').close();
+
+// ---------------- criar app Android
+async function criarApp(desc) {
+  const card = addMsg('assistant', '');
+  const st = document.createElement('div'); const extra = document.createElement('div');
+  card.append(st, extra);
+  const rola = () => { log.scrollTop = log.scrollHeight; };
+  st.textContent = '⏳ Enviando o pedido…';
+  setStatus('Criando o app… (clique em ⏹ Parar para cancelar)');
+  let terminou = false;
+  try {
+    ctrl = new AbortController();
+    const r = await fetch('/app/generate', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                            body: JSON.stringify({description: desc}), signal: ctrl.signal});
+    if (!r.ok) throw new Error('Servidor respondeu ' + r.status);
+    const reader = r.body.getReader(), dec = new TextDecoder(); let buf = '';
+    for (;;) {
+      const {value, done} = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, {stream: true});
+      const linhas = buf.split('\n'); buf = linhas.pop();
+      for (const linha of linhas) {
+        if (!linha.startsWith('data:')) continue;
+        const ev = JSON.parse(linha.slice(5).trim());
+        if (ev.type === 'status') st.textContent = '⏳ ' + ev.msg;
+        else if (ev.type === 'progress') setStatus(`A IA já escreveu ${ev.tokens} pedaços de código… (⏹ Parar cancela)`);
+        else if (ev.type === 'code') {
+          extra.textContent = '';
+          const d = document.createElement('details'), sm = document.createElement('summary'), pre = document.createElement('pre');
+          sm.textContent = 'Ver o código que a IA escreveu'; pre.textContent = ev.text; d.append(sm, pre); extra.appendChild(d);
+        } else if (ev.type === 'done') {
+          terminou = true;
+          st.textContent = `✅ App "${ev.name}" pronto! (${Math.max(1, Math.round(ev.size / 1024))} KB)`;
+          const a = document.createElement('a'); a.className = 'btn'; a.href = ev.apk; a.download = ''; a.textContent = '⬇ Baixar o APK';
+          const dica = document.createElement('div'); dica.className = 'dica';
+          dica.textContent = 'Passe o arquivo para o celular (cabo USB, Bluetooth ou nuvem) e abra-o para instalar. Se o Android pedir, permita instalar de fontes desconhecidas.';
+          extra.append(a, dica);
+        } else if (ev.type === 'error') {
+          terminou = true; card.classList.add('err'); st.textContent = '⚠ ' + ev.msg;
+          if (ev.log) { const d = document.createElement('details'), sm = document.createElement('summary'), pre = document.createElement('pre');
+            sm.textContent = 'Ver os erros'; pre.textContent = ev.log; d.append(sm, pre); extra.appendChild(d); }
+        }
+        rola();
+      }
+    }
+    if (!terminou) { card.classList.add('err'); st.textContent = '⚠ A conexão terminou antes do app ficar pronto.'; }
+  } catch (e) {
+    if (e.name === 'AbortError') st.textContent = '⏹ Criação do app cancelada por você.';
+    else { card.classList.add('err'); st.textContent = '⚠ ' + (e instanceof TypeError ? 'A conexão com o servidor caiu. O modelo pode ter reiniciado; espere e tente de novo.' : e.message); }
+  } finally { setStatus(''); }
+}
+$('appmode').onchange = () => {
+  txt.placeholder = $('appmode').checked ? 'Descreva o app que você quer criar (ex.: um app de lista de compras)…'
+                                          : 'Escreva aqui (Enter envia, Shift+Enter quebra linha)';
+};
+async function listaApps() {
+  const box = $('appslist'); box.textContent = 'Carregando…';
+  const apps = await (await fetch('/apps')).json();
+  box.textContent = apps.length ? '' : 'Ainda não há nenhum app criado.';
+  for (const a of apps) {
+    const row = document.createElement('div'); row.className = 'mem';
+    const sp = document.createElement('span'); sp.textContent = a.name;
+    const sm = document.createElement('small');
+    sm.textContent = a.description + ' · ' + new Date(a.created * 1000).toLocaleDateString('pt-BR');
+    sp.appendChild(sm);
+    const dl = document.createElement('a'); dl.className = 'btn'; dl.style.marginTop = '0'; dl.href = '/apk/' + a.id; dl.download = ''; dl.textContent = '⬇ APK';
+    row.append(sp, dl); box.appendChild(row);
+  }
+}
+$('appsBtn').onclick = () => { $('appsDlg').showModal(); listaApps(); };
+$('appsClose').onclick = () => $('appsDlg').close();
+
 $('send').onclick = () => send(txt.value);
 txt.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(txt.value); } });
-$('new').onclick = () => { pararVoz(); history = []; log.textContent = ''; setStatus(''); };
+$('new').onclick = () => { parar(); history = []; log.textContent = ''; setStatus(''); };
 txt.focus();
 </script>
 </body>

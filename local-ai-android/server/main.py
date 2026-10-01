@@ -9,6 +9,8 @@ Rotas:
   GET/POST /memory, DELETE /memory/{id} -> memória de longo prazo (o que a IA aprendeu)
   POST /search   -> pesquisa na web (SearXNG ou DuckDuckGo)
   POST /fetch    -> baixa uma página e devolve o texto
+  POST /app/generate -> a IA cria um app Android a partir de uma descrição (streaming de progresso)
+  GET  /apps, GET /apk/{id} -> lista e baixa os apps criados
   POST /build    -> recebe um .zip de projeto Gradle e devolve o APK debug
 
 Conexões vindas do próprio PC (127.0.0.1) não precisam de token; as de fora precisam.
@@ -34,11 +36,13 @@ from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, Uplo
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
+import androidgen
 import config
 import memory
 
 app = FastAPI(title="Local AI Server")
 config.WORK_DIR.mkdir(parents=True, exist_ok=True)
+config.APPS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 STATIC = Path(__file__).parent / "static"
@@ -155,6 +159,60 @@ async def chat(req: ChatRequest):
     return StreamingResponse(stream(), media_type="text/event-stream", headers={"X-Web-Results": str(n_web)})
 
 
+# ----------------------------------------------------------- apps Android pela IA
+class AppRequest(BaseModel):
+    description: str
+
+
+@app.post("/app/generate", dependencies=[Depends(require_token)])
+async def app_generate(req: AppRequest):
+    desc = req.description.strip()[:1500]
+    if not desc:
+        raise HTTPException(400, "Descreva o app que você quer.")
+
+    async def stream():
+        fila: asyncio.Queue = asyncio.Queue()
+
+        async def emit(ev: dict):
+            await fila.put(ev)
+
+        async def roda():
+            try:
+                await androidgen.gera_app(desc, emit)
+            except Exception as e:  # nada deve derrubar a conexão sem avisar
+                await fila.put({"type": "error", "msg": f"Erro inesperado: {type(e).__name__}: {e}"})
+            finally:
+                await fila.put(None)
+
+        tarefa = asyncio.create_task(roda())
+        try:
+            while (ev := await fila.get()) is not None:
+                yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n".encode()
+        finally:
+            tarefa.cancel()  # cliente desconectou (botão Parar): cancela a IA e o Gradle
+
+    return StreamingResponse(stream(), media_type="text/event-stream")
+
+
+@app.get("/apps", dependencies=[Depends(require_token)])
+async def apps_list():
+    return await asyncio.to_thread(androidgen.lista_apps)
+
+
+@app.get("/apk/{app_id}", dependencies=[Depends(require_token)])
+async def apk_download(app_id: str):
+    if not re.fullmatch(r"[0-9a-f]{10}", app_id):
+        raise HTTPException(400, "Id inválido")
+    f = config.APPS_DIR / f"{app_id}.apk"
+    if not f.exists():
+        raise HTTPException(404, "App não encontrado")
+    nome = "app"
+    meta = config.APPS_DIR / f"{app_id}.json"
+    if meta.exists():
+        nome = androidgen.slugify(json.loads(meta.read_text()).get("name", "app")) or "app"
+    return FileResponse(f, media_type="application/vnd.android.package-archive", filename=f"{nome}.apk")
+
+
 # ------------------------------------------------------------------- memória
 class MemoryIn(BaseModel):
     text: str
@@ -197,13 +255,21 @@ def _stt_sync(path: str) -> str:
         return " ".join(s.text.strip() for s in segments).strip()
 
 
-def _tts_kokoro_sync(text: str) -> bytes:
+def _get_kokoro():
     global _kokoro
-    import numpy as np
     if _kokoro is None:
         from kokoro_onnx import Kokoro
         _kokoro = Kokoro(str(config.KOKORO_MODEL), str(config.KOKORO_VOICES))
-    samples, rate = _kokoro.create(text, voice=config.KOKORO_VOICE, speed=config.TTS_SPEED, lang="pt-br")
+    return _kokoro
+
+
+def _tts_kokoro_sync(text: str, voice: str | None = None, speed: float | None = None) -> bytes:
+    import numpy as np
+    k = _get_kokoro()
+    if voice not in k.get_voices():
+        voice = config.KOKORO_VOICE
+    speed = min(max(speed or config.TTS_SPEED, 0.6), 1.5)
+    samples, rate = k.create(text, voice=voice, speed=speed, lang="pt-br")
     pcm = (np.clip(samples, -1, 1) * 32767).astype(np.int16)
     buf = io.BytesIO()
     with wave.open(buf, "wb") as w:
@@ -214,12 +280,12 @@ def _tts_kokoro_sync(text: str) -> bytes:
     return buf.getvalue()
 
 
-def _tts_sync(text: str) -> bytes:
+def _tts_sync(text: str, voice: str | None = None, speed: float | None = None) -> bytes:
     global _piper
     with _voice_lock:
         if config.KOKORO_MODEL.exists() and config.KOKORO_VOICES.exists():
             try:
-                return _tts_kokoro_sync(text)
+                return _tts_kokoro_sync(text, voice, speed)
             except Exception:  # se o Kokoro falhar, usa a voz reserva em vez de ficar mudo
                 pass
         if _piper is None:
@@ -247,6 +313,39 @@ async def stt(audio: UploadFile = File(...)):
 
 class TtsRequest(BaseModel):
     text: str
+    voice: str | None = None
+    speed: float | None = None
+
+
+# Vozes oferecidas na tela. As de outros idiomas leem português com sotaque.
+VOZES_PT = {
+    "pf_dora": "Dora: feminina, português do Brasil (recomendada)",
+    "pm_alex": "Alex: masculina, português do Brasil",
+    "pm_santa": "Santa: masculina, português do Brasil",
+}
+VOZES_FEMININAS_OUTRAS = {
+    "af_heart": "Heart (americana)", "af_bella": "Bella (americana)", "af_nicole": "Nicole (americana, suave)",
+    "af_sarah": "Sarah (americana)", "af_sky": "Sky (americana)", "af_alloy": "Alloy (americana)",
+    "af_nova": "Nova (americana)", "af_kore": "Kore (americana)", "bf_emma": "Emma (britânica)",
+    "bf_isabella": "Isabella (britânica)", "bf_alice": "Alice (britânica)", "ef_dora": "Dora (espanhola)",
+    "ff_siwis": "Siwis (francesa)", "if_sara": "Sara (italiana)",
+}
+
+
+def _voices_sync() -> list[dict]:
+    if not (config.KOKORO_MODEL.exists() and config.KOKORO_VOICES.exists()):
+        return [{"id": "", "label": "Faber: masculina (voz reserva)", "group": "Reserva"}]
+    with _voice_lock:
+        disponiveis = set(_get_kokoro().get_voices())
+    out = [{"id": v, "label": n, "group": "Português do Brasil"} for v, n in VOZES_PT.items() if v in disponiveis]
+    out += [{"id": v, "label": n, "group": "Femininas de outros idiomas (leem com sotaque)"}
+            for v, n in VOZES_FEMININAS_OUTRAS.items() if v in disponiveis]
+    return out
+
+
+@app.get("/voices", dependencies=[Depends(require_token)])
+async def voices():
+    return await asyncio.to_thread(_voices_sync)
 
 
 @app.post("/tts", dependencies=[Depends(require_token)])
@@ -255,7 +354,7 @@ async def tts(req: TtsRequest):
     if not text:
         raise HTTPException(400, "Texto vazio")
     try:
-        wav = await asyncio.to_thread(_tts_sync, text)
+        wav = await asyncio.to_thread(_tts_sync, text, req.voice, req.speed)
     except FileNotFoundError as e:
         raise HTTPException(503, str(e))
     return Response(wav, media_type="audio/wav")
@@ -325,15 +424,21 @@ async def build(project: UploadFile = File(...)):
 
     # O projeto pode vir dentro de uma subpasta única; procura o gradlew
     roots = [p.parent for p in src.rglob("gradlew")]
-    if not roots:
-        shutil.rmtree(job, ignore_errors=True)
-        raise HTTPException(400, "gradlew não encontrado no projeto")
-    root = min(roots, key=lambda p: len(p.parts))
-    (root / "gradlew").chmod(0o755)
+    if roots:
+        root = min(roots, key=lambda p: len(p.parts))
+        (root / "gradlew").chmod(0o755)
+        cmd = ["./gradlew"]
+    else:  # sem wrapper: usa o Gradle instalado no servidor
+        sets = [p.parent for p in src.rglob("settings.gradle*")]
+        if not sets:
+            shutil.rmtree(job, ignore_errors=True)
+            raise HTTPException(400, "Não achei gradlew nem settings.gradle no projeto")
+        root = min(sets, key=lambda p: len(p.parts))
+        cmd = [config.GRADLE_BIN]
 
     try:
         proc = subprocess.run(
-            ["./gradlew", "assembleDebug", "--no-daemon", "--console=plain"],
+            cmd + ["assembleDebug", "--no-daemon", "--console=plain"],
             cwd=root, capture_output=True, text=True, timeout=config.BUILD_TIMEOUT,
         )
     except subprocess.TimeoutExpired:
