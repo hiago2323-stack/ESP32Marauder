@@ -48,12 +48,12 @@ escudo duplo com a letra B. Mesma assinatura das versões antigas: instalar por 
 Ele tem todas as funções da tela (conversa, voz, pesquisa, memória, criar apps/firmware, Parar) e o
 processamento continua no PC. A conexão é pelo **Tailscale** (VPN privada).
 
-1. No PC: `sudo tailscale up` (entre na sua conta). No celular: instale o Tailscale e entre na mesma conta.
-2. Instale `Betina-IA.apk` no celular (permita instalar de fontes desconhecidas).
-3. No PC, abra o Betina & IA e clique em **📲 Conectar celular**: mostra o endereço e o token.
-4. No app, digite o endereço e o token. Pronto.
+1. No PC o instalador/atualizador já liga o Tailscale e dá ao PC o nome fixo **betina** (você só entra na sua conta uma vez, no link que ele mostra).
+2. No celular: instale o app **Tailscale**, entre **na mesma conta** e deixe conectado.
+3. Instale `Betina-IA.apk` e abra. Ele acha o PC sozinho em `http://betina:8080`, **sem endereço e sem token**
+   (quem vem pela VPN já foi autenticado pela sua conta). Se não achar, a tela de erro tem o botão "Abrir o Tailscale".
 
-O servidor aceita conexões de fora do PC **somente com o token**. Nunca abra a porta 8080 no roteador.
+Fora da VPN (rede de casa, por exemplo) o servidor aceita conexões **somente com o token** (para exigir o token também na VPN: `TAILNET_SEM_TOKEN=0`). Nunca abra a porta 8080 no roteador.
 Para recompilar o app: `cd android-client && gradle assembleDebug` (a chave de assinatura fica no
 repositório, para as atualizações instalarem por cima).
 

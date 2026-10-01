@@ -173,8 +173,12 @@ public class MainActivity extends Activity {
     }
 
     // ------------------------------------------------------------------ configuração
+    /** O PC se chama "betina" na VPN Tailscale: sem configurar nada o app já o encontra aqui. */
+    private static final String SERVIDOR_PADRAO = "http://betina:8080";
+
     private String servidor() {
-        return prefs.getString("servidor", "");
+        String v = prefs.getString("servidor", SERVIDOR_PADRAO);
+        return v.isEmpty() ? SERVIDOR_PADRAO : v;
     }
 
     private String token() {
@@ -205,8 +209,9 @@ public class MainActivity extends Activity {
         caixa.setPadding(dp(20), dp(12), dp(20), 0);
 
         TextView ajuda = new TextView(this);
-        ajuda.setText("No PC, abra o Betina & IA no navegador e clique em \"Conectar celular\" "
-                + "para ver estes dois dados. O Tailscale precisa estar ligado no celular e no PC.");
+        ajuda.setText("Normalmente você não precisa mexer aqui: o app procura o PC sozinho em "
+                + SERVIDOR_PADRAO + " pela VPN Tailscale. Só preencha se o seu PC tiver outro endereço "
+                + "(aparece em \"Conectar celular\" no PC). O token só é necessário fora da VPN.");
         caixa.addView(ajuda);
 
         final EditText srv = new EditText(this);
@@ -252,11 +257,27 @@ public class MainActivity extends Activity {
         String html = "<html><head><meta name='viewport' content='width=device-width,initial-scale=1'></head>"
                 + "<body style='font-family:sans-serif;padding:24px;background:#14161a;color:#e8eaed'>"
                 + "<h2>Não consegui falar com o seu PC</h2><p>" + seguro + "</p>"
-                + "<p>Confira se o PC está ligado e se o Tailscale está ativo no celular e no PC.</p>"
+                + "<p>Confira se o PC está ligado e se o Tailscale (a VPN) está <b>conectado</b> no celular.</p>"
+                + "<button " + estilo + " onclick='AndroidBridge.openTailscale()'>Abrir o Tailscale</button>"
                 + "<button " + estilo + " onclick='AndroidBridge.retry()'>Tentar de novo</button>"
                 + "<button " + estilo + " onclick='AndroidBridge.openSettings()'>Configurar servidor</button>"
                 + "</body></html>";
         v.loadDataWithBaseURL(null, html, "text/html", "utf-8", null);
+    }
+
+    /** Abre o app Tailscale; se não estiver instalado, abre a página dele na loja. */
+    private void abreTailscale() {
+        Intent i = getPackageManager().getLaunchIntentForPackage("com.tailscale.ipn");
+        try {
+            if (i != null) {
+                startActivity(i);
+            } else {
+                startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse("market://details?id=com.tailscale.ipn")));
+            }
+        } catch (ActivityNotFoundException e) {
+            startActivity(new Intent(Intent.ACTION_VIEW,
+                    Uri.parse("https://play.google.com/store/apps/details?id=com.tailscale.ipn")));
+        }
     }
 
     private void configuraWeb() {
@@ -462,6 +483,11 @@ public class MainActivity extends Activity {
         @JavascriptInterface
         public void openSettings() {
             runOnUiThread(() -> mostraConfig());
+        }
+
+        @JavascriptInterface
+        public void openTailscale() {
+            runOnUiThread(() -> abreTailscale());
         }
 
         @JavascriptInterface

@@ -6,6 +6,9 @@ HOME = Path.home()
 
 # Token exigido de quem NÃO está no próprio PC (o PC local dispensa o token)
 API_TOKEN = os.environ.get("LOCALAI_TOKEN", "")
+# Quem chega pela VPN Tailscale (100.64.0.0/10) já foi autenticado pela sua conta: entra sem token.
+# Para exigir o token também na VPN: TAILNET_SEM_TOKEN=0
+TAILNET_SEM_TOKEN = os.environ.get("TAILNET_SEM_TOKEN", "1") != "0"
 
 # Endereço do llama-server (llama.cpp), que expõe uma API compatível com a da OpenAI
 LLAMA_URL = os.environ.get("LLAMA_URL", "http://127.0.0.1:8081")

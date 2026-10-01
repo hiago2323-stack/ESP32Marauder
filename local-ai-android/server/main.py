@@ -16,6 +16,7 @@ Rotas:
 Conexões vindas do próprio PC (127.0.0.1) não precisam de token; as de fora precisam.
 """
 import asyncio
+import ipaddress
 from contextlib import asynccontextmanager
 import hmac
 import io
@@ -74,10 +75,23 @@ def _token_ok(candidato: str) -> bool:
     return bool(candidato) and bool(config.API_TOKEN) and hmac.compare_digest(candidato, config.API_TOKEN)
 
 
+_TAILNET = [ipaddress.ip_network("100.64.0.0/10"), ipaddress.ip_network("fd7a:115c:a1e0::/48")]
+
+
+def _na_tailnet(host: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return any(ip in rede for rede in _TAILNET)
+
+
 def require_token(request: Request, authorization: str = Header(default="")) -> None:
     """O próprio PC (127.0.0.1) entra sem senha; qualquer outro precisa do token,
     no cabeçalho Authorization (Bearer) ou no cookie 'localai_token'."""
     if request.client and request.client.host in LOCAL_HOSTS:
+        return
+    if config.TAILNET_SEM_TOKEN and request.client and _na_tailnet(request.client.host):
         return
     if not config.API_TOKEN:
         raise HTTPException(500, "LOCALAI_TOKEN não configurado no servidor")

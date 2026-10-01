@@ -138,6 +138,9 @@ HOME = Path.home()
 
 # Token exigido de quem NÃO está no próprio PC (o PC local dispensa o token)
 API_TOKEN = os.environ.get("LOCALAI_TOKEN", "")
+# Quem chega pela VPN Tailscale (100.64.0.0/10) já foi autenticado pela sua conta: entra sem token.
+# Para exigir o token também na VPN: TAILNET_SEM_TOKEN=0
+TAILNET_SEM_TOKEN = os.environ.get("TAILNET_SEM_TOKEN", "1") != "0"
 
 # Endereço do llama-server (llama.cpp), que expõe uma API compatível com a da OpenAI
 LLAMA_URL = os.environ.get("LLAMA_URL", "http://127.0.0.1:8081")
@@ -230,6 +233,7 @@ Rotas:
 Conexões vindas do próprio PC (127.0.0.1) não precisam de token; as de fora precisam.
 """
 import asyncio
+import ipaddress
 from contextlib import asynccontextmanager
 import hmac
 import io
@@ -288,10 +292,23 @@ def _token_ok(candidato: str) -> bool:
     return bool(candidato) and bool(config.API_TOKEN) and hmac.compare_digest(candidato, config.API_TOKEN)
 
 
+_TAILNET = [ipaddress.ip_network("100.64.0.0/10"), ipaddress.ip_network("fd7a:115c:a1e0::/48")]
+
+
+def _na_tailnet(host: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return any(ip in rede for rede in _TAILNET)
+
+
 def require_token(request: Request, authorization: str = Header(default="")) -> None:
     """O próprio PC (127.0.0.1) entra sem senha; qualquer outro precisa do token,
     no cabeçalho Authorization (Bearer) ou no cookie 'localai_token'."""
     if request.client and request.client.host in LOCAL_HOSTS:
+        return
+    if config.TAILNET_SEM_TOKEN and request.client and _na_tailnet(request.client.host):
         return
     if not config.API_TOKEN:
         raise HTTPException(500, "LOCALAI_TOKEN não configurado no servidor")
@@ -3667,7 +3684,7 @@ EOF
   <div id="pairUrls"></div>
   <div style="margin-top:12px"><b>Token (senha)</b></div>
   <div id="pairToken" class="copia"></div>
-  <div class="dica">No celular: instale o Tailscale, entre com a mesma conta e abra o app Betina &amp; IA. Não mostre o token a ninguém.</div>
+  <div class="dica">No celular: instale o Tailscale, entre com a mesma conta e abra o app Betina &amp; IA: ele acha este PC sozinho (nome <b>betina</b>) e, pela VPN, não pede token. O token só vale fora da VPN; não mostre a ninguém.</div>
   <div style="margin-top:14px"><button class="bt" id="pairClose">Fechar</button></div>
 </dialog>
 
@@ -4475,13 +4492,14 @@ instalar_tailscale() {
   elif [ -n "${SEM_TAILSCALE_LOGIN:-}" ]; then
     echo "Pulei o login do Tailscale. Depois rode: sudo tailscale up"; return 0
   else
-    if [ -n "${TS_AUTHKEY:-}" ] && sudo tailscale up --authkey "$TS_AUTHKEY"; then :
+    if [ -n "${TS_AUTHKEY:-}" ] && sudo tailscale up --hostname=betina --authkey "$TS_AUTHKEY"; then :
     else
       echo "==> Login do Tailscale: abra o link que aparece abaixo e entre na sua conta (espero até 5 minutos)."
-      timeout 300 sudo tailscale up || { echo "AVISO: login não concluído. Rode depois: sudo tailscale up"; return 1; }
+      timeout 300 sudo tailscale up --hostname=betina || { echo "AVISO: login não concluído. Rode depois: sudo tailscale up"; return 1; }
     fi
   fi
   sudo tailscale set --operator="$USER" >/dev/null 2>&1 || true    # permite usar o tailscale sem sudo
+  sudo tailscale set --hostname=betina >/dev/null 2>&1 || true     # nome fixo: o app acha o PC em http://betina:8080
   echo "Tailscale conectado. Depois deste login ele reconecta sozinho em todo boot."
 }
 
