@@ -1,23 +1,34 @@
 """Servidor do PC: conversa com o modelo, pesquisa na web e compila projetos Android.
 
 Rotas:
+  GET  /         -> tela de conversa (texto e voz) para usar no navegador do PC
   GET  /health   -> testa se o servidor está no ar (sem senha)
-  POST /chat     -> repassa a conversa ao llama-server (com streaming)
-  POST /search   -> pesquisa via SearXNG
+  POST /chat     -> repassa a conversa ao llama-server (streaming), com pesquisa web opcional
+  POST /stt      -> voz -> texto (faster-whisper, local)
+  POST /tts      -> texto -> voz (Piper, local), devolve WAV
+  POST /search   -> pesquisa na web (SearXNG ou DuckDuckGo)
   POST /fetch    -> baixa uma página e devolve o texto
   POST /build    -> recebe um .zip de projeto Gradle e devolve o APK debug
+
+Conexões vindas do próprio PC (127.0.0.1) não precisam de token; as de fora precisam.
 """
+import asyncio
 import hmac
+import io
 import re
 import shutil
 import subprocess
+import tempfile
+import threading
 import uuid
+import wave
 import zipfile
+from datetime import date
 from pathlib import Path
 
 import httpx
-from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 import config
@@ -26,7 +37,13 @@ app = FastAPI(title="Local AI Server")
 config.WORK_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def require_token(authorization: str = Header(default="")) -> None:
+STATIC = Path(__file__).parent / "static"
+LOCAL_HOSTS = {"127.0.0.1", "::1", "localhost"}
+
+
+def require_token(request: Request, authorization: str = Header(default="")) -> None:
+    if request.client and request.client.host in LOCAL_HOSTS:
+        return
     if not config.API_TOKEN:
         raise HTTPException(500, "LOCALAI_TOKEN não configurado no servidor")
     expected = f"Bearer {config.API_TOKEN}"
@@ -34,20 +51,56 @@ def require_token(authorization: str = Header(default="")) -> None:
         raise HTTPException(401, "Token inválido")
 
 
+@app.get("/")
+def index():
+    return FileResponse(STATIC / "index.html")
+
+
 @app.get("/health")
 def health():
     return {"ok": True}
 
 
+# ----------------------------------------------------------------- pesquisa web
+def _web_search_sync(query: str, limit: int) -> list[dict]:
+    if config.SEARXNG_URL:
+        r = httpx.get(f"{config.SEARXNG_URL}/search", params={"q": query, "format": "json"}, timeout=20)
+        r.raise_for_status()
+        items = r.json().get("results", [])[:limit]
+        return [{"title": x.get("title"), "url": x.get("url"), "snippet": x.get("content")} for x in items]
+    from ddgs import DDGS
+    items = DDGS().text(query, max_results=limit)
+    return [{"title": x.get("title"), "url": x.get("href"), "snippet": x.get("body")} for x in items]
+
+
 class ChatRequest(BaseModel):
     messages: list[dict]
-    max_tokens: int = 512
+    max_tokens: int = 700
     temperature: float = 0.7
+    web: bool = False
+
+
+async def _build_messages(req: ChatRequest) -> list[dict]:
+    system = f"{config.SYSTEM_PROMPT}\nData de hoje: {date.today().isoformat()}."
+    msgs = [{"role": "system", "content": system}]
+    if req.web:
+        last = next((m["content"] for m in reversed(req.messages) if m.get("role") == "user"), "")
+        try:
+            results = await asyncio.to_thread(_web_search_sync, last, 5)
+        except Exception as e:  # sem internet, bloqueio etc.: segue sem a pesquisa
+            results = []
+            msgs[0]["content"] += f"\n(A pesquisa na web falhou: {type(e).__name__}.)"
+        if results:
+            ctx = "\n".join(f"[{i+1}] {r['title']} - {r['url']}\n{r['snippet']}" for i, r in enumerate(results))
+            msgs[0]["content"] += "\n\nResultados da pesquisa na web:\n" + ctx
+    return msgs + req.messages
 
 
 @app.post("/chat", dependencies=[Depends(require_token)])
 async def chat(req: ChatRequest):
-    payload = {**req.model_dump(), "stream": True}
+    messages = await _build_messages(req)
+    payload = {"messages": messages, "max_tokens": req.max_tokens,
+               "temperature": req.temperature, "stream": True}
 
     async def stream():
         async with httpx.AsyncClient(timeout=None) as client:
@@ -61,9 +114,67 @@ async def chat(req: ChatRequest):
                     async for chunk in r.aiter_raw():
                         yield chunk
             except httpx.ConnectError:
-                yield b'data: {"error": "llama-server desligado"}\n\n'
+                yield b'data: {"error": "O modelo (llama-server) esta desligado"}\n\n'
 
     return StreamingResponse(stream(), media_type="text/event-stream")
+
+
+# ------------------------------------------------------------------ voz (local)
+_whisper = None
+_piper = None
+_voice_lock = threading.Lock()
+
+
+def _stt_sync(path: str) -> str:
+    global _whisper
+    with _voice_lock:
+        if _whisper is None:
+            from faster_whisper import WhisperModel
+            _whisper = WhisperModel(config.WHISPER_MODEL, device="cpu", compute_type="int8")
+        segments, _ = _whisper.transcribe(path, language="pt", vad_filter=True)
+        return " ".join(s.text.strip() for s in segments).strip()
+
+
+def _tts_sync(text: str) -> bytes:
+    global _piper
+    with _voice_lock:
+        if _piper is None:
+            if not config.PIPER_VOICE.exists():
+                raise FileNotFoundError(f"Voz não encontrada: {config.PIPER_VOICE}")
+            from piper import PiperVoice
+            _piper = PiperVoice.load(str(config.PIPER_VOICE))
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as w:
+            _piper.synthesize_wav(text, w)
+        return buf.getvalue()
+
+
+@app.post("/stt", dependencies=[Depends(require_token)])
+async def stt(audio: UploadFile = File(...)):
+    with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as f:
+        f.write(await audio.read())
+        path = f.name
+    try:
+        text = await asyncio.to_thread(_stt_sync, path)
+    finally:
+        Path(path).unlink(missing_ok=True)
+    return {"text": text}
+
+
+class TtsRequest(BaseModel):
+    text: str
+
+
+@app.post("/tts", dependencies=[Depends(require_token)])
+async def tts(req: TtsRequest):
+    text = req.text.strip()[:2000]
+    if not text:
+        raise HTTPException(400, "Texto vazio")
+    try:
+        wav = await asyncio.to_thread(_tts_sync, text)
+    except FileNotFoundError as e:
+        raise HTTPException(503, str(e))
+    return Response(wav, media_type="audio/wav")
 
 
 class SearchRequest(BaseModel):
@@ -73,18 +184,10 @@ class SearchRequest(BaseModel):
 
 @app.post("/search", dependencies=[Depends(require_token)])
 async def search(req: SearchRequest):
-    if not config.SEARXNG_URL:
-        raise HTTPException(503, "SEARXNG_URL não configurado")
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.get(
-            f"{config.SEARXNG_URL}/search", params={"q": req.query, "format": "json"}
-        )
-    r.raise_for_status()
-    results = r.json().get("results", [])[: req.limit]
-    return [
-        {"title": x.get("title"), "url": x.get("url"), "snippet": x.get("content")}
-        for x in results
-    ]
+    try:
+        return await asyncio.to_thread(_web_search_sync, req.query, req.limit)
+    except Exception as e:
+        raise HTTPException(502, f"Falha na pesquisa: {type(e).__name__}")
 
 
 class FetchRequest(BaseModel):

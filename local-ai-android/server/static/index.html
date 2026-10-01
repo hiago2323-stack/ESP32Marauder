@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IA Local</title>
+<style>
+  :root { --bg:#14161a; --panel:#1d2026; --line:#2c313a; --txt:#e8eaed; --mut:#9aa0a8; --acc:#5aa9ff; --me:#27405f; }
+  @media (prefers-color-scheme: light) {
+    :root { --bg:#f4f5f7; --panel:#fff; --line:#d9dce1; --txt:#1c1e22; --mut:#5b6068; --acc:#1a6fd6; --me:#d9e8fb; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--txt); font:16px/1.5 system-ui,sans-serif;
+         height:100dvh; display:flex; flex-direction:column; }
+  header { display:flex; gap:16px; align-items:center; padding:10px 16px; border-bottom:1px solid var(--line);
+           background:var(--panel); flex-wrap:wrap; }
+  header h1 { font-size:17px; margin:0; margin-right:auto; }
+  label { color:var(--mut); font-size:14px; display:flex; gap:6px; align-items:center; cursor:pointer; }
+  button { font:inherit; border:1px solid var(--line); background:var(--panel); color:var(--txt);
+           border-radius:8px; padding:8px 14px; cursor:pointer; }
+  button:hover { border-color:var(--acc); }
+  button:disabled { opacity:.5; cursor:default; }
+  #log { flex:1; overflow-y:auto; padding:16px; display:flex; flex-direction:column; gap:12px; }
+  .msg { max-width:860px; width:fit-content; padding:10px 14px; border-radius:12px; border:1px solid var(--line);
+         background:var(--panel); white-space:pre-wrap; word-wrap:break-word; }
+  .msg.user { align-self:flex-end; background:var(--me); }
+  .msg.err { border-color:#c0392b; color:#e57368; }
+  .msg pre { background:var(--bg); padding:10px; border-radius:8px; overflow-x:auto; margin:8px 0 0; white-space:pre; }
+  #bar { display:flex; gap:8px; padding:12px 16px; border-top:1px solid var(--line); background:var(--panel); }
+  textarea { flex:1; resize:none; font:inherit; color:var(--txt); background:var(--bg); border:1px solid var(--line);
+             border-radius:10px; padding:10px 12px; height:48px; max-height:160px; }
+  #mic.rec { background:#c0392b; border-color:#c0392b; color:#fff; }
+  #status { color:var(--mut); font-size:13px; padding:0 16px 8px; min-height:22px; background:var(--panel); }
+</style>
+</head>
+<body>
+<header>
+  <h1>IA Local</h1>
+  <label><input type="checkbox" id="web"> Pesquisar na web</label>
+  <label><input type="checkbox" id="speak"> Falar as respostas</label>
+  <button id="new">Nova conversa</button>
+</header>
+<div id="log"></div>
+<div id="status"></div>
+<div id="bar">
+  <button id="mic" title="Clique para gravar, clique de novo para enviar">🎤 Falar</button>
+  <textarea id="txt" placeholder="Escreva aqui (Enter envia, Shift+Enter quebra linha)"></textarea>
+  <button id="send">Enviar</button>
+</div>
+<script>
+const $ = id => document.getElementById(id);
+const log = $('log'), txt = $('txt'), statusEl = $('status');
+let history = [];
+let busy = false;
+const setStatus = t => statusEl.textContent = t || '';
+
+function render(el, text) {
+  // Mostra blocos ``` como <pre>; o resto como texto puro (sem HTML injetado)
+  el.textContent = '';
+  text.split(/```/).forEach((part, i) => {
+    if (i % 2) {
+      const pre = document.createElement('pre');
+      pre.textContent = part.replace(/^[\w+-]*\n/, '');
+      el.appendChild(pre);
+    } else if (part) {
+      el.appendChild(document.createTextNode(part));
+    }
+  });
+}
+function addMsg(role, text) {
+  const d = document.createElement('div');
+  d.className = 'msg ' + role;
+  render(d, text);
+  log.appendChild(d);
+  log.scrollTop = log.scrollHeight;
+  return d;
+}
+
+async function send(text) {
+  text = text.trim();
+  if (!text || busy) return;
+  busy = true; $('send').disabled = true;
+  txt.value = '';
+  history.push({role: 'user', content: text});
+  addMsg('user', text);
+  const out = addMsg('assistant', '…');
+  setStatus($('web').checked ? 'Pesquisando na web e pensando…' : 'Pensando…');
+  let answer = '';
+  try {
+    const r = await fetch('/chat', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({messages: history.slice(-12), web: $('web').checked})
+    });
+    if (!r.ok) throw new Error('Servidor respondeu ' + r.status);
+    const reader = r.body.getReader(), dec = new TextDecoder();
+    let buf = '';
+    for (;;) {
+      const {value, done} = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, {stream: true});
+      const lines = buf.split('\n'); buf = lines.pop();
+      for (const line of lines) {
+        if (!line.startsWith('data:')) continue;
+        const data = line.slice(5).trim();
+        if (!data || data === '[DONE]') continue;
+        const j = JSON.parse(data);
+        if (j.error) throw new Error(j.error);
+        answer += (j.choices?.[0]?.delta?.content) || '';
+        render(out, answer || '…');
+        log.scrollTop = log.scrollHeight;
+      }
+    }
+    history.push({role: 'assistant', content: answer});
+    setStatus('');
+    if ($('speak').checked && answer) await speak(answer);
+  } catch (e) {
+    out.classList.add('err'); render(out, 'Erro: ' + e.message);
+    history.pop();
+    setStatus('');
+  } finally {
+    busy = false; $('send').disabled = false; txt.focus();
+  }
+}
+
+async function speak(text) {
+  // Não lê blocos de código nem símbolos de formatação
+  const clean = text.replace(/```[\s\S]*?```/g, ' (código omitido) ')
+                    .replace(/https?:\/\/\S+/g, ' link ').replace(/[*_#`>]/g, '');
+  setStatus('Gerando voz…');
+  try {
+    const r = await fetch('/tts', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                   body: JSON.stringify({text: clean})});
+    if (!r.ok) throw new Error((await r.json()).detail || r.status);
+    const a = new Audio(URL.createObjectURL(await r.blob()));
+    setStatus('Falando…');
+    await a.play();
+    await new Promise(res => a.onended = res);
+  } catch (e) { setStatus('Voz indisponível: ' + e.message); return; }
+  setStatus('');
+}
+
+let rec = null, chunks = [];
+$('mic').onclick = async () => {
+  if (rec) { rec.stop(); return; }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({audio: true});
+    rec = new MediaRecorder(stream); chunks = [];
+    rec.ondataavailable = e => chunks.push(e.data);
+    rec.onstop = async () => {
+      stream.getTracks().forEach(t => t.stop());
+      $('mic').classList.remove('rec'); $('mic').textContent = '🎤 Falar';
+      const blob = new Blob(chunks, {type: rec.mimeType}); rec = null;
+      setStatus('Entendendo o que você disse…');
+      try {
+        const fd = new FormData(); fd.append('audio', blob, 'voz.webm');
+        const r = await fetch('/stt', {method: 'POST', body: fd});
+        if (!r.ok) throw new Error('Servidor respondeu ' + r.status);
+        const {text} = await r.json();
+        setStatus('');
+        if (text) { $('speak').checked = true; await send(text); }
+        else setStatus('Não consegui ouvir nada. Tente de novo.');
+      } catch (e) { setStatus('Erro na voz: ' + e.message); }
+    };
+    rec.start();
+    $('mic').classList.add('rec'); $('mic').textContent = '⏹ Enviar';
+    setStatus('Gravando… clique em "Enviar" quando terminar de falar.');
+  } catch (e) { setStatus('Sem acesso ao microfone: ' + e.message); }
+};
+
+$('send').onclick = () => send(txt.value);
+txt.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(txt.value); } });
+$('new').onclick = () => { history = []; log.textContent = ''; setStatus(''); };
+txt.focus();
+</script>
+</body>
+</html>

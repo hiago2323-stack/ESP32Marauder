@@ -1,59 +1,35 @@
 # Local AI Android
 
-IA local com app Android como controle remoto, servidor no PC (Ryzen + GTX 960)
-para rodar o modelo e compilar apps.
+IA 100% local no PC (Ryzen + GTX 960), com tela de conversa por **texto e voz**,
+pesquisa na web e compilação de apps Android. O celular e o acesso remoto
+(Tailscale) ficam para uma etapa futura.
+
+## Instalação (um comando)
+
+No Linux Mint XFCE, com o arquivo `instalar_tudo.sh` salvo no PC, **sem sudo**:
 
 ```
-Redmi A3 (app)  ⇄  Wi-Fi / Tailscale  ⇄  PC Linux Mint XFCE
-                                           ├─ llama-server (modelo)
-                                           └─ server/ (chat, busca, build)
+bash instalar_tudo.sh
 ```
 
-## Etapas
+Instala: driver NVIDIA 580 (a GTX 960 não é suportada pelo 590+), CUDA 12.6,
+telemetria/controle da GPU, llama.cpp + modelo Qwen2.5-Coder 7B, servidor, voz
+(Whisper para ouvir, Piper para falar), Android SDK, serviços no boot e atalho
+"IA Local" na área de trabalho. Log em `~/localai-install.log`.
 
-- [x] 1. Servidor do PC (`server/`)
-- [x] 1b. Telemetria, GPU e IA local no PC (scripts `install_*.sh`)
-- [ ] 2. App Android (chat + conexão com o PC)
-- [ ] 3. Pesquisa web (SearXNG no Positivo)
-- [ ] 4. IA pequena local no celular
-- [ ] 5. Memória / skills
+Depois de reiniciar, abra o atalho **IA Local** (ou `http://localhost:8080`).
 
-## Etapa 1 — Instalar o servidor no PC
+## Estrutura
 
-Depois do Linux Mint XFCE instalado e do driver NVIDIA (série 580) ativo:
+- `instalar_tudo.sh`: instalador completo (contém os arquivos de `server/` embutidos).
+- `server/`: código-fonte do servidor, usado para desenvolvimento.
+  - `main.py`: rotas `/` (tela), `/chat`, `/stt`, `/tts`, `/search`, `/fetch`, `/build`.
+  - `static/index.html`: tela de conversa.
 
-1. Copie esta pasta para o PC (ou `git clone` do repositório).
-2. Abra o terminal na pasta `local-ai-android/server` e rode:
-   ```
-   bash setup.sh
-   ```
-   Ele instala tudo e mostra o **token** (senha). Anote.
-3. Inicie:
-   ```
-   bash run.sh
-   ```
-4. No navegador do PC, abra `http://localhost:8080/health`. Deve aparecer `{"ok":true}`.
+O instalador é gerado a partir de `server/`; mantenha os dois iguais.
 
-O `/chat` só funciona depois de subir o `llama-server` (etapa seguinte, guia a caminho).
-O `/build` precisa do Android SDK instalado (também no próximo guia).
+## Próximas etapas
 
-## Segurança
-
-- Nunca abra a porta 8080 no roteador. Acesse de fora só pelo **Tailscale**.
-- O token fica em `server/.env`, que não vai para o Git.
-
-## Etapa 1b — Instalação completa no PC (um comando)
-
-Dentro de `server/`, **sem sudo**:
-
-```
-bash install_all.sh
-```
-
-Instala driver NVIDIA 580 (a GTX 960 não é suportada pelo 590+), CUDA 12.6,
-telemetria/controle da GPU, servidor, llama.cpp + modelo, Android SDK, Tailscale e
-serviços que sobem sozinhos no boot. Log em `~/localai-install.log`.
-
-Depois: reinicie, `nvidia-smi`, `sudo tailscale up`, `curl http://localhost:8080/health`.
-Ajuste as camadas na GPU editando `Environment=NGL=8` em
-`/etc/systemd/system/localai-llm.service`.
+- [ ] Compilar `.bin` de ESP32 (`arduino-cli`)
+- [ ] Memória: guardar o que a IA aprende na web
+- [ ] App Android + acesso remoto (Tailscale)
