@@ -18,7 +18,7 @@ anterior terminar e dispara este sozinho. Não salve um instalador novo com o no
 
 Instala: driver NVIDIA 580 (a GTX 960 não é suportada pelo 590+), CUDA 12.6,
 telemetria/controle da GPU, llama.cpp + modelo Qwen2.5-Coder 7B (ou 3B), servidor, memória, voz
-(Whisper para ouvir, Piper para falar), Android SDK, serviços no boot e atalho
+(Whisper para ouvir, Kokoro 'pf_dora' feminina para falar, Piper masculina como reserva), Android SDK, serviços no boot e atalho
 "IA Local" na área de trabalho. Log em `~/localai-install.log`.
 
 Depois de reiniciar, abra o atalho **IA Local** (ou `http://localhost:8080`).

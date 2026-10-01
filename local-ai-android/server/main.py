@@ -183,6 +183,7 @@ async def memory_delete(mem_id: int):
 # ------------------------------------------------------------------ voz (local)
 _whisper = None
 _piper = None
+_kokoro = None
 _voice_lock = threading.Lock()
 
 
@@ -196,9 +197,31 @@ def _stt_sync(path: str) -> str:
         return " ".join(s.text.strip() for s in segments).strip()
 
 
+def _tts_kokoro_sync(text: str) -> bytes:
+    global _kokoro
+    import numpy as np
+    if _kokoro is None:
+        from kokoro_onnx import Kokoro
+        _kokoro = Kokoro(str(config.KOKORO_MODEL), str(config.KOKORO_VOICES))
+    samples, rate = _kokoro.create(text, voice=config.KOKORO_VOICE, speed=config.TTS_SPEED, lang="pt-br")
+    pcm = (np.clip(samples, -1, 1) * 32767).astype(np.int16)
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(pcm.tobytes())
+    return buf.getvalue()
+
+
 def _tts_sync(text: str) -> bytes:
     global _piper
     with _voice_lock:
+        if config.KOKORO_MODEL.exists() and config.KOKORO_VOICES.exists():
+            try:
+                return _tts_kokoro_sync(text)
+            except Exception:  # se o Kokoro falhar, usa a voz reserva em vez de ficar mudo
+                pass
         if _piper is None:
             if not config.PIPER_VOICE.exists():
                 raise FileNotFoundError(f"Voz não encontrada: {config.PIPER_VOICE}")

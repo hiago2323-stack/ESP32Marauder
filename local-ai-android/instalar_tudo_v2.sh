@@ -31,6 +31,12 @@ MODEL="$HOME/models/$MODEL_FILE"
 FAILED=()
 
 [ "$(id -u)" -ne 0 ] || { echo "Rode SEM sudo: bash instalar_tudo.sh"; exit 1; }
+# Baixa para um arquivo temporário (.part) e só renomeia no final: um download interrompido
+# nunca é confundido com um arquivo completo. Pula se o arquivo final já existe.
+baixar() {  # baixar URL DESTINO
+  [ -s "$2" ] && return 0
+  curl -L --fail -C - -o "$2.part" "$1" && mv "$2.part" "$2"
+}
 step() { echo; echo "################ $1"; shift; "$@" || { echo "!!! FALHOU: $1"; FAILED+=("$1"); }; }
 
 echo "==> Digite a senha uma vez; ela fica ativa durante a instalação"
@@ -117,6 +123,7 @@ httpx==0.27.*
 python-multipart==0.0.*
 faster-whisper==1.2.*
 piper-tts==1.8.*
+kokoro-onnx==0.6.*
 ddgs==9.*
 EOF
   cat > config.py <<'EOF'
@@ -147,7 +154,14 @@ MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "100"))
 # Voz -> texto (faster-whisper, roda na CPU). Opções: tiny, base, small, medium
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")
 
-# Texto -> voz (Piper). Arquivo .onnx da voz (o .onnx.json fica ao lado)
+# Texto -> voz, voz FEMININA (Kokoro, pt-BR). Se os arquivos não existirem, cai no Piper (masculina).
+# Vozes pt-BR do Kokoro: pf_dora (feminina), pm_alex e pm_santa (masculinas)
+KOKORO_MODEL = Path(os.environ.get("KOKORO_MODEL", str(HOME / "models" / "kokoro-v1.0.onnx")))
+KOKORO_VOICES = Path(os.environ.get("KOKORO_VOICES", str(HOME / "models" / "voices-v1.0.bin")))
+KOKORO_VOICE = os.environ.get("KOKORO_VOICE", "pf_dora")
+TTS_SPEED = float(os.environ.get("TTS_SPEED", "1.0"))
+
+# Texto -> voz reserva (Piper). Arquivo .onnx da voz (o .onnx.json fica ao lado)
 PIPER_VOICE = Path(os.environ.get("PIPER_VOICE", str(HOME / "models" / "pt_BR-faber-medium.onnx")))
 
 SYSTEM_PROMPT = os.environ.get(
@@ -346,6 +360,7 @@ async def memory_delete(mem_id: int):
 # ------------------------------------------------------------------ voz (local)
 _whisper = None
 _piper = None
+_kokoro = None
 _voice_lock = threading.Lock()
 
 
@@ -359,9 +374,31 @@ def _stt_sync(path: str) -> str:
         return " ".join(s.text.strip() for s in segments).strip()
 
 
+def _tts_kokoro_sync(text: str) -> bytes:
+    global _kokoro
+    import numpy as np
+    if _kokoro is None:
+        from kokoro_onnx import Kokoro
+        _kokoro = Kokoro(str(config.KOKORO_MODEL), str(config.KOKORO_VOICES))
+    samples, rate = _kokoro.create(text, voice=config.KOKORO_VOICE, speed=config.TTS_SPEED, lang="pt-br")
+    pcm = (np.clip(samples, -1, 1) * 32767).astype(np.int16)
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(pcm.tobytes())
+    return buf.getvalue()
+
+
 def _tts_sync(text: str) -> bytes:
     global _piper
     with _voice_lock:
+        if config.KOKORO_MODEL.exists() and config.KOKORO_VOICES.exists():
+            try:
+                return _tts_kokoro_sync(text)
+            except Exception:  # se o Kokoro falhar, usa a voz reserva em vez de ficar mudo
+                pass
         if _piper is None:
             if not config.PIPER_VOICE.exists():
                 raise FileNotFoundError(f"Voz não encontrada: {config.PIPER_VOICE}")
@@ -707,6 +744,7 @@ const TEACH = /^\s*(lembre-se|lembre|guarde|aprenda|anote)(\s+disso|\s+que)?[:,]
 async function send(text) {
   text = text.trim();
   if (!text || busy) return;
+  pararVoz();
   busy = true; $('send').disabled = true;
   txt.value = '';
   history.push({role: 'user', content: text});
@@ -767,25 +805,54 @@ async function send(text) {
   }
 }
 
+// Divide o texto em pedaços de frases para a voz começar logo, sem esperar gerar tudo
+function pedacos(text, max = 220) {
+  const frases = text.split(/(?<=[.!?…])\s+|\n+/).map(f => f.trim()).filter(Boolean);
+  const out = []; let cur = '';
+  for (const f of frases) {
+    if (cur && (cur + ' ' + f).length > max) { out.push(cur); cur = f; }
+    else cur = (cur + ' ' + f).trim();
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+async function audioDe(texto) {
+  const r = await fetch('/tts', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                 body: JSON.stringify({text: texto})});
+  if (!r.ok) throw new Error((await r.json()).detail || r.status);
+  return URL.createObjectURL(await r.blob());
+}
+let falaId = 0, falaAtual = null;
+function pararVoz() { falaId++; if (falaAtual) falaAtual.pause(); }
+
 async function speak(text) {
   // Não lê blocos de código nem símbolos de formatação
   const clean = text.replace(/```[\s\S]*?```/g, ' (código omitido) ')
                     .replace(/https?:\/\/\S+/g, ' link ').replace(/[*_#`>]/g, '');
+  const partes = pedacos(clean).slice(0, 40);
+  if (!partes.length) return;
+  const id = ++falaId;
   setStatus('Gerando voz…');
   try {
-    const r = await fetch('/tts', {method: 'POST', headers: {'Content-Type': 'application/json'},
-                                   body: JSON.stringify({text: clean})});
-    if (!r.ok) throw new Error((await r.json()).detail || r.status);
-    const a = new Audio(URL.createObjectURL(await r.blob()));
-    setStatus('Falando…');
-    await a.play();
-    await new Promise(res => a.onended = res);
+    let proximo = audioDe(partes[0]);
+    for (let i = 0; i < partes.length; i++) {
+      const url = await proximo;
+      if (id !== falaId) return;
+      if (i + 1 < partes.length) proximo = audioDe(partes[i + 1]);  // prepara a próxima enquanto esta toca
+      const a = new Audio(url); falaAtual = a;
+      setStatus('Falando… (clique em 🎤 ou envie algo para interromper)');
+      await a.play();
+      await new Promise(res => { a.onended = res; a.onpause = res; });
+      URL.revokeObjectURL(url);
+      if (id !== falaId) return;
+    }
   } catch (e) { setStatus('Voz indisponível: ' + e.message); return; }
   setStatus('');
 }
 
 let rec = null, chunks = [];
 $('mic').onclick = async () => {
+  pararVoz();
   if (rec) { rec.stop(); return; }
   try {
     const stream = await navigator.mediaDevices.getUserMedia({audio: true});
@@ -835,7 +902,7 @@ $('memAdd').onclick = async () => {
 };
 $('send').onclick = () => send(txt.value);
 txt.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(txt.value); } });
-$('new').onclick = () => { history = []; log.textContent = ''; setStatus(''); };
+$('new').onclick = () => { pararVoz(); history = []; log.textContent = ''; setStatus(''); };
 txt.focus();
 </script>
 </body>
@@ -901,18 +968,21 @@ instalar_llama() {
     -DCMAKE_CUDA_COMPILER="$CUDA_DIR/bin/nvcc" &&
   cmake --build build --config Release -j 4 --target llama-server || return 1
   mkdir -p "$HOME/models"
-  if [ ! -f "$MODEL" ]; then
-    echo "==> Baixando o modelo $MODELO ($MODEL_TAM; retoma se cair)"
-    curl -L --fail -C - -o "$MODEL" "$MODEL_URL"
-  fi
+  echo "==> Modelo $MODELO ($MODEL_TAM; retoma se cair)"
+  baixar "$MODEL_URL" "$MODEL"
 }
 
 # ------------------------------------------------- 8. Voz (ouvir e falar)
 instalar_voz() {
   mkdir -p "$HOME/models"
+  echo "==> Baixando a voz feminina (Kokoro 'pf_dora', ~350 MB)"
+  local K=https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0
+  baixar "$K/kokoro-v1.0.onnx" "$HOME/models/kokoro-v1.0.onnx" &&
+  baixar "$K/voices-v1.0.bin" "$HOME/models/voices-v1.0.bin" || return 1
+  echo "==> Baixando a voz reserva (Piper, masculina)"
   local U=https://huggingface.co/rhasspy/piper-voices/resolve/main/pt/pt_BR/faber/medium
-  curl -L --fail -C - -o "$HOME/models/pt_BR-faber-medium.onnx" "$U/pt_BR-faber-medium.onnx" &&
-  curl -L --fail -C - -o "$HOME/models/pt_BR-faber-medium.onnx.json" "$U/pt_BR-faber-medium.onnx.json" || return 1
+  baixar "$U/pt_BR-faber-medium.onnx" "$HOME/models/pt_BR-faber-medium.onnx" &&
+  baixar "$U/pt_BR-faber-medium.onnx.json" "$HOME/models/pt_BR-faber-medium.onnx.json" || return 1
   echo "==> Baixando o modelo que entende sua voz (~460 MB)"
   "$SRV/.venv/bin/python" -c "from faster_whisper import WhisperModel; WhisperModel('small', device='cpu', compute_type='int8')"
 }

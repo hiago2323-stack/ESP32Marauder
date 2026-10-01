@@ -3,9 +3,9 @@
 #  ATUALIZA o servidor da IA local (tela, memória, correções) SEM reinstalar
 #  nada. Mantém token, memórias e o modelo que já estão em uso.
 #
-#  Uso:   bash atualizar.sh               (camadas na placa: 4)
-#         NGL=2 bash atualizar.sh         (ainda menos memória de vídeo; use se ainda der erro)
-#  Reinicia o modelo: ele leva alguns minutos para carregar de novo.
+#  Uso:   bash atualizar.sh               (mantém as camadas na placa que já estão em uso)
+#         NGL=4 bash atualizar.sh         (muda as camadas na placa; use se der erro de memória)
+#  O modelo SÓ é reiniciado (alguns minutos) se o NGL mudar; senão só o servidor reinicia.
 # =====================================================================
 set -euo pipefail
 BASE="$HOME/localai"
@@ -15,8 +15,10 @@ SRV="$BASE/server"
 # descobre qual modelo já está configurado (mantém o mesmo)
 MODEL_FILE=$(grep -o 'models/[^}"]*\.gguf' "$BASE/start_llm.sh" 2>/dev/null | head -1 | cut -d/ -f2 || true)
 [ -n "$MODEL_FILE" ] || MODEL_FILE=Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf
-NGL_PADRAO="${NGL:-4}"
-echo "==> Modelo: $MODEL_FILE | camadas na placa (NGL): $NGL_PADRAO"
+SERVICO_LLM="${SERVICO_LLM:-/etc/systemd/system/localai-llm.service}"
+NGL_ATUAL=$(grep -oP '^Environment=NGL=\K[0-9]+' "$SERVICO_LLM" 2>/dev/null || true)
+NGL_PADRAO="${NGL:-${NGL_ATUAL:-4}}"
+echo "==> Modelo: $MODEL_FILE | camadas na placa (NGL): $NGL_PADRAO (atual: ${NGL_ATUAL:-nenhum})"
 
 escrever_arquivos() {
   mkdir -p "$SRV" && cd "$SRV" || return 1
@@ -27,6 +29,7 @@ httpx==0.27.*
 python-multipart==0.0.*
 faster-whisper==1.2.*
 piper-tts==1.8.*
+kokoro-onnx==0.6.*
 ddgs==9.*
 EOF
   cat > config.py <<'EOF'
@@ -57,7 +60,14 @@ MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "100"))
 # Voz -> texto (faster-whisper, roda na CPU). Opções: tiny, base, small, medium
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")
 
-# Texto -> voz (Piper). Arquivo .onnx da voz (o .onnx.json fica ao lado)
+# Texto -> voz, voz FEMININA (Kokoro, pt-BR). Se os arquivos não existirem, cai no Piper (masculina).
+# Vozes pt-BR do Kokoro: pf_dora (feminina), pm_alex e pm_santa (masculinas)
+KOKORO_MODEL = Path(os.environ.get("KOKORO_MODEL", str(HOME / "models" / "kokoro-v1.0.onnx")))
+KOKORO_VOICES = Path(os.environ.get("KOKORO_VOICES", str(HOME / "models" / "voices-v1.0.bin")))
+KOKORO_VOICE = os.environ.get("KOKORO_VOICE", "pf_dora")
+TTS_SPEED = float(os.environ.get("TTS_SPEED", "1.0"))
+
+# Texto -> voz reserva (Piper). Arquivo .onnx da voz (o .onnx.json fica ao lado)
 PIPER_VOICE = Path(os.environ.get("PIPER_VOICE", str(HOME / "models" / "pt_BR-faber-medium.onnx")))
 
 SYSTEM_PROMPT = os.environ.get(
@@ -256,6 +266,7 @@ async def memory_delete(mem_id: int):
 # ------------------------------------------------------------------ voz (local)
 _whisper = None
 _piper = None
+_kokoro = None
 _voice_lock = threading.Lock()
 
 
@@ -269,9 +280,31 @@ def _stt_sync(path: str) -> str:
         return " ".join(s.text.strip() for s in segments).strip()
 
 
+def _tts_kokoro_sync(text: str) -> bytes:
+    global _kokoro
+    import numpy as np
+    if _kokoro is None:
+        from kokoro_onnx import Kokoro
+        _kokoro = Kokoro(str(config.KOKORO_MODEL), str(config.KOKORO_VOICES))
+    samples, rate = _kokoro.create(text, voice=config.KOKORO_VOICE, speed=config.TTS_SPEED, lang="pt-br")
+    pcm = (np.clip(samples, -1, 1) * 32767).astype(np.int16)
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(pcm.tobytes())
+    return buf.getvalue()
+
+
 def _tts_sync(text: str) -> bytes:
     global _piper
     with _voice_lock:
+        if config.KOKORO_MODEL.exists() and config.KOKORO_VOICES.exists():
+            try:
+                return _tts_kokoro_sync(text)
+            except Exception:  # se o Kokoro falhar, usa a voz reserva em vez de ficar mudo
+                pass
         if _piper is None:
             if not config.PIPER_VOICE.exists():
                 raise FileNotFoundError(f"Voz não encontrada: {config.PIPER_VOICE}")
@@ -617,6 +650,7 @@ const TEACH = /^\s*(lembre-se|lembre|guarde|aprenda|anote)(\s+disso|\s+que)?[:,]
 async function send(text) {
   text = text.trim();
   if (!text || busy) return;
+  pararVoz();
   busy = true; $('send').disabled = true;
   txt.value = '';
   history.push({role: 'user', content: text});
@@ -677,25 +711,54 @@ async function send(text) {
   }
 }
 
+// Divide o texto em pedaços de frases para a voz começar logo, sem esperar gerar tudo
+function pedacos(text, max = 220) {
+  const frases = text.split(/(?<=[.!?…])\s+|\n+/).map(f => f.trim()).filter(Boolean);
+  const out = []; let cur = '';
+  for (const f of frases) {
+    if (cur && (cur + ' ' + f).length > max) { out.push(cur); cur = f; }
+    else cur = (cur + ' ' + f).trim();
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+async function audioDe(texto) {
+  const r = await fetch('/tts', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                 body: JSON.stringify({text: texto})});
+  if (!r.ok) throw new Error((await r.json()).detail || r.status);
+  return URL.createObjectURL(await r.blob());
+}
+let falaId = 0, falaAtual = null;
+function pararVoz() { falaId++; if (falaAtual) falaAtual.pause(); }
+
 async function speak(text) {
   // Não lê blocos de código nem símbolos de formatação
   const clean = text.replace(/```[\s\S]*?```/g, ' (código omitido) ')
                     .replace(/https?:\/\/\S+/g, ' link ').replace(/[*_#`>]/g, '');
+  const partes = pedacos(clean).slice(0, 40);
+  if (!partes.length) return;
+  const id = ++falaId;
   setStatus('Gerando voz…');
   try {
-    const r = await fetch('/tts', {method: 'POST', headers: {'Content-Type': 'application/json'},
-                                   body: JSON.stringify({text: clean})});
-    if (!r.ok) throw new Error((await r.json()).detail || r.status);
-    const a = new Audio(URL.createObjectURL(await r.blob()));
-    setStatus('Falando…');
-    await a.play();
-    await new Promise(res => a.onended = res);
+    let proximo = audioDe(partes[0]);
+    for (let i = 0; i < partes.length; i++) {
+      const url = await proximo;
+      if (id !== falaId) return;
+      if (i + 1 < partes.length) proximo = audioDe(partes[i + 1]);  // prepara a próxima enquanto esta toca
+      const a = new Audio(url); falaAtual = a;
+      setStatus('Falando… (clique em 🎤 ou envie algo para interromper)');
+      await a.play();
+      await new Promise(res => { a.onended = res; a.onpause = res; });
+      URL.revokeObjectURL(url);
+      if (id !== falaId) return;
+    }
   } catch (e) { setStatus('Voz indisponível: ' + e.message); return; }
   setStatus('');
 }
 
 let rec = null, chunks = [];
 $('mic').onclick = async () => {
+  pararVoz();
   if (rec) { rec.stop(); return; }
   try {
     const stream = await navigator.mediaDevices.getUserMedia({audio: true});
@@ -745,7 +808,7 @@ $('memAdd').onclick = async () => {
 };
 $('send').onclick = () => send(txt.value);
 txt.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(txt.value); } });
-$('new').onclick = () => { history = []; log.textContent = ''; setStatus(''); };
+$('new').onclick = () => { pararVoz(); history = []; log.textContent = ''; setStatus(''); };
 txt.focus();
 </script>
 </body>
@@ -776,12 +839,25 @@ escrever_arquivos
 cd "$SRV"
 .venv/bin/pip install -q -r requirements.txt
 
-echo "==> Reiniciando os serviços"
-sudo sed -i "s/^Environment=NGL=.*/Environment=NGL=$NGL_PADRAO/" /etc/systemd/system/localai-llm.service
-sudo systemctl daemon-reload
-sudo systemctl restart localai-server.service localai-llm.service
+# Voz feminina (Kokoro 'pf_dora'): baixa só se ainda não existir
+mkdir -p "$HOME/models"
+baixar() { [ -s "$2" ] && return 0; curl -L --fail -C - -o "$2.part" "$1" && mv "$2.part" "$2"; }
+K=https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0
+echo "==> Voz feminina (~350 MB na primeira vez)"
+baixar "$K/kokoro-v1.0.onnx" "$HOME/models/kokoro-v1.0.onnx"
+baixar "$K/voices-v1.0.bin" "$HOME/models/voices-v1.0.bin"
 
-echo
-echo "Pronto. O modelo está recarregando (pode levar alguns minutos)."
-echo "Acompanhe com:   journalctl -fu localai-llm      (Ctrl+C para sair)"
-echo "Está pronto quando isto responder {\"status\":\"ok\"}:   curl -s localhost:8081/health"
+echo "==> Reiniciando"
+sudo sed -i "s/^Environment=NGL=.*/Environment=NGL=$NGL_PADRAO/" "$SERVICO_LLM"
+sudo systemctl daemon-reload
+if [ "$NGL_PADRAO" != "$NGL_ATUAL" ]; then
+  sudo systemctl restart localai-server.service localai-llm.service
+  echo
+  echo "Pronto. O NGL mudou, então o modelo está recarregando (pode levar alguns minutos)."
+  echo "Acompanhe com:   journalctl -fu localai-llm      (Ctrl+C para sair)"
+  echo "Está pronto quando isto responder {\"status\":\"ok\"}:   curl -s localhost:8081/health"
+else
+  sudo systemctl restart localai-server.service
+  echo
+  echo "Pronto. O modelo NÃO foi reiniciado (o NGL não mudou); só o servidor, que leva segundos."
+fi

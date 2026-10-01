@@ -118,6 +118,7 @@ const TEACH = /^\s*(lembre-se|lembre|guarde|aprenda|anote)(\s+disso|\s+que)?[:,]
 async function send(text) {
   text = text.trim();
   if (!text || busy) return;
+  pararVoz();
   busy = true; $('send').disabled = true;
   txt.value = '';
   history.push({role: 'user', content: text});
@@ -178,25 +179,54 @@ async function send(text) {
   }
 }
 
+// Divide o texto em pedaços de frases para a voz começar logo, sem esperar gerar tudo
+function pedacos(text, max = 220) {
+  const frases = text.split(/(?<=[.!?…])\s+|\n+/).map(f => f.trim()).filter(Boolean);
+  const out = []; let cur = '';
+  for (const f of frases) {
+    if (cur && (cur + ' ' + f).length > max) { out.push(cur); cur = f; }
+    else cur = (cur + ' ' + f).trim();
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+async function audioDe(texto) {
+  const r = await fetch('/tts', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                 body: JSON.stringify({text: texto})});
+  if (!r.ok) throw new Error((await r.json()).detail || r.status);
+  return URL.createObjectURL(await r.blob());
+}
+let falaId = 0, falaAtual = null;
+function pararVoz() { falaId++; if (falaAtual) falaAtual.pause(); }
+
 async function speak(text) {
   // Não lê blocos de código nem símbolos de formatação
   const clean = text.replace(/```[\s\S]*?```/g, ' (código omitido) ')
                     .replace(/https?:\/\/\S+/g, ' link ').replace(/[*_#`>]/g, '');
+  const partes = pedacos(clean).slice(0, 40);
+  if (!partes.length) return;
+  const id = ++falaId;
   setStatus('Gerando voz…');
   try {
-    const r = await fetch('/tts', {method: 'POST', headers: {'Content-Type': 'application/json'},
-                                   body: JSON.stringify({text: clean})});
-    if (!r.ok) throw new Error((await r.json()).detail || r.status);
-    const a = new Audio(URL.createObjectURL(await r.blob()));
-    setStatus('Falando…');
-    await a.play();
-    await new Promise(res => a.onended = res);
+    let proximo = audioDe(partes[0]);
+    for (let i = 0; i < partes.length; i++) {
+      const url = await proximo;
+      if (id !== falaId) return;
+      if (i + 1 < partes.length) proximo = audioDe(partes[i + 1]);  // prepara a próxima enquanto esta toca
+      const a = new Audio(url); falaAtual = a;
+      setStatus('Falando… (clique em 🎤 ou envie algo para interromper)');
+      await a.play();
+      await new Promise(res => { a.onended = res; a.onpause = res; });
+      URL.revokeObjectURL(url);
+      if (id !== falaId) return;
+    }
   } catch (e) { setStatus('Voz indisponível: ' + e.message); return; }
   setStatus('');
 }
 
 let rec = null, chunks = [];
 $('mic').onclick = async () => {
+  pararVoz();
   if (rec) { rec.stop(); return; }
   try {
     const stream = await navigator.mediaDevices.getUserMedia({audio: true});
@@ -246,7 +276,7 @@ $('memAdd').onclick = async () => {
 };
 $('send').onclick = () => send(txt.value);
 txt.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(txt.value); } });
-$('new').onclick = () => { history = []; log.textContent = ''; setStatus(''); };
+$('new').onclick = () => { pararVoz(); history = []; log.textContent = ''; setStatus(''); };
 txt.focus();
 </script>
 </body>

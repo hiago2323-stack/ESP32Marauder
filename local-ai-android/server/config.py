@@ -25,7 +25,14 @@ MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "100"))
 # Voz -> texto (faster-whisper, roda na CPU). Opções: tiny, base, small, medium
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")
 
-# Texto -> voz (Piper). Arquivo .onnx da voz (o .onnx.json fica ao lado)
+# Texto -> voz, voz FEMININA (Kokoro, pt-BR). Se os arquivos não existirem, cai no Piper (masculina).
+# Vozes pt-BR do Kokoro: pf_dora (feminina), pm_alex e pm_santa (masculinas)
+KOKORO_MODEL = Path(os.environ.get("KOKORO_MODEL", str(HOME / "models" / "kokoro-v1.0.onnx")))
+KOKORO_VOICES = Path(os.environ.get("KOKORO_VOICES", str(HOME / "models" / "voices-v1.0.bin")))
+KOKORO_VOICE = os.environ.get("KOKORO_VOICE", "pf_dora")
+TTS_SPEED = float(os.environ.get("TTS_SPEED", "1.0"))
+
+# Texto -> voz reserva (Piper). Arquivo .onnx da voz (o .onnx.json fica ao lado)
 PIPER_VOICE = Path(os.environ.get("PIPER_VOICE", str(HOME / "models" / "pt_BR-faber-medium.onnx")))
 
 SYSTEM_PROMPT = os.environ.get(
