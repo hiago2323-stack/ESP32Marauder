@@ -75,7 +75,9 @@ a GPU (antes, se o driver demorasse, a IA podia ficar só na CPU a sessão intei
 O servidor reconhece a placa sozinho. **AMD (driver amdgpu, ex.: RX 580 de 8 GB)**: temperatura, uso, VRAM e ventoinha são lidos e
 controlados pelo `/sys` (sem programas extras; o serviço de ventoinhas roda como root); o llama.cpp usa **Vulkan** (a RX 580 não é
 suportada pelo ROCm). **NVIDIA**: nvidia-smi/NVML e CUDA, como antes. Se tiver a gráfica integrada do Ryzen junto com a RX 580, vale a de
-maior VRAM. O `atualizar.sh` recompila o llama.cpp com o suporte certo (Vulkan para AMD) quando falta; leva de 15 a 40 min, só uma vez.
+maior VRAM. O `atualizar.sh` recompila o llama.cpp com o suporte certo (Vulkan para AMD) quando falta; leva de 15 a 40 min, só uma vez. Com a gráfica
+integrada junto da RX 580, o `start_llm.sh` fixa a placa de maior memória (`--device`). O instalador completo também reconhece AMD (não instala
+driver NVIDIA/CUDA nem o arquivo do X da NVIDIA; o `atualizar.sh` desativa esse arquivo se uma instalação antiga o deixou sem haver placa NVIDIA).
 Gerador de imagens e de vídeo ainda usam só a CPU na AMD.
 
 ## Pedir e instalar outras IAs pela conversa
@@ -89,6 +91,14 @@ Escreva do seu jeito, por exemplo: "bota o qwen coder de 14b pra eu testar", "qu
 ⚙ › **Meu perfil e foto**: envie seu nome e uma foto. Um modelo que enxerga (Qwen2.5-VL 3B, baixado na primeira vez, ~2,8 GB) descreve a foto
 uma vez, na CPU, e a descrição vai para o contexto das conversas para a IA saber como você é. Você pode corrigir o texto ou apagar tudo.
 Tudo fica só neste PC (`~/localai/perfil`).
+
+## Aprender sozinha (limitado e visível)
+
+Opção **🧠 Aprender sozinha** (ligada por padrão; desligue na tela quando quiser). Depois de cada resposta, a IA local extrai só **fatos
+duráveis que você mesmo disse sobre você** (nome, projeto, equipamento, preferências) e guarda em 🧠 Memória com a etiqueta "aprendi sozinha";
+a tela mostra o que ela aprendeu e você apaga o que quiser. Nunca guarda senhas, chaves, cartão, documentos nem dados sensíveis, descarta o que
+o modelo inventar (o fato precisa se apoiar no que você escreveu), pula se uma resposta estiver em andamento e guarda no máximo 200 itens.
+Ela **não** altera o próprio código nem os próprios comandos.
 
 ## Testes
 

@@ -295,6 +295,7 @@
           <div class="sec">Opções</div>
           <label><input type="checkbox" id="web"> 🌐 Pesquisar na web</label>
           <label title="Guarda na memória o que descobrir pesquisando"><input type="checkbox" id="learn" checked> 📚 Aprender com as pesquisas</label>
+          <label title="Depois das respostas, guarda na memória fatos duráveis que VOCÊ disse sobre você (nome, projeto, equipamento, preferências). Nunca guarda senhas nem dados sensíveis; tudo aparece em Memória e dá para apagar."><input type="checkbox" id="learnSelf" checked> 🧠 Aprender sozinha</label>
           <label><input type="checkbox" id="speak"> 🔊 Falar as respostas</label>
         </div>
         <div id="anexos"></div>
@@ -720,6 +721,10 @@ async function send(text) {
       if (webResults > 0 && $('learn').checked && ma.content && !teach) {
         try { await salvaMemoria(`Pergunta: ${text}\nResposta (pesquisa na web em ${new Date().toLocaleDateString('pt-BR')}): ${ma.content}`, 'web'); } catch (e) {}
       }
+      if ($('learnSelf').checked && ma.content && !teach) {   // aprende em segundo plano e mostra o que guardou
+        fetch('/aprender', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({pergunta: text, resposta: ma.content.slice(0, 600)})})
+          .then(r => r.ok ? r.json() : null).then(j => { if (j && j.fatos && j.fatos.length) { setStatus('🧠 Aprendi: ' + j.fatos.join(' · ')); setTimeout(() => setStatus(''), 9000); } }).catch(() => {});
+      }
       if ($('speak').checked && ma.content) speak(ma.content);
     } catch (e) {
       if (e.name === 'AbortError') {
@@ -886,6 +891,8 @@ function atualizaChips() {
   txt.placeholder = PLACEHOLDERS[m];
 }
 for (const id of ['web', 'speak', 'learn']) $(id).onchange = atualizaChips;
+try { $('learnSelf').checked = localStorage.getItem('learnSelf') !== '0'; } catch (e) {}
+$('learnSelf').onchange = () => { try { localStorage.setItem('learnSelf', $('learnSelf').checked ? '1' : '0'); } catch (e) {} };
 function atualizaForca() { $('imgForcaLinha').hidden = !(anexos.some(a => a.tipo === 'imagem') || (baseMod && baseMod.kind === 'img')); }
 $('imgPassos').oninput = () => $('imgPassosV').textContent = $('imgPassos').value;
 $('imgForca').oninput = () => $('imgForcaV').textContent = parseFloat($('imgForca').value).toFixed(2);
@@ -1048,7 +1055,7 @@ async function carregaMem() {
   for (const m of itens) {
     const row = document.createElement('div'); row.className = 'item-l';
     const t = document.createElement('div'); t.className = 't'; t.textContent = m.text;
-    const sm = document.createElement('small'); sm.textContent = (m.source === 'web' ? 'aprendido na web' : 'você ensinou') + ' · ' + new Date(m.created * 1000).toLocaleDateString('pt-BR'); t.appendChild(sm);
+    const sm = document.createElement('small'); sm.textContent = (m.source === 'web' ? 'aprendido na web' : m.source === 'aprendido' ? 'aprendi sozinha' : 'você ensinou') + ' · ' + new Date(m.created * 1000).toLocaleDateString('pt-BR'); t.appendChild(sm);
     const del = document.createElement('button'); del.className = 'bt'; del.textContent = 'Apagar';
     del.onclick = async () => { await fetch('/memory/' + m.id, {method: 'DELETE'}); carregaMem(); };
     row.append(t, del); box.appendChild(row);

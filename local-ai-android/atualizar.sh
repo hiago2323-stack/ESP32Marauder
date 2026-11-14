@@ -215,6 +215,7 @@ from fastapi.responses import FileResponse, RedirectResponse, Response, Streamin
 from pydantic import BaseModel
 
 import agente
+import aprendizado
 import androidgen
 import biblioteca
 import codegen
@@ -462,6 +463,14 @@ async def chat(req: ChatRequest):
                "top_p": 0.9, "top_k": 40, "min_p": 0.05, "repeat_penalty": 1.05, "cache_prompt": True, "stream": True}
 
     async def stream():
+        aprendizado.ativos += 1
+        try:
+            async for pedaco in _stream_modelo(payload):
+                yield pedaco
+        finally:
+            aprendizado.ativos -= 1
+
+    async def _stream_modelo(payload):
         async with httpx.AsyncClient(timeout=None) as client:
             try:
                 async with client.stream(
@@ -936,6 +945,17 @@ async def memory_add(item: MemoryIn):
         return await asyncio.to_thread(memory.add, item.text, item.source[:20])
     except ValueError as e:
         raise HTTPException(400, str(e))
+
+
+class AprenderReq(BaseModel):
+    pergunta: str
+    resposta: str = ""
+
+
+@app.post("/aprender", dependencies=[Depends(require_token)])
+async def aprender(req: AprenderReq):
+    """A tela chama depois de cada resposta (se 'Aprender sozinha' estiver ligado). Devolve o que foi guardado."""
+    return {"fatos": await aprendizado.aprende(req.pergunta, req.resposta)}
 
 
 @app.delete("/memory/{mem_id}", dependencies=[Depends(require_token)])
@@ -5130,6 +5150,100 @@ def fabricante(raiz: str = RAIZ) -> str | None:
         return "amd"
     return "nvidia" if shutil.which("nvidia-smi") else None
 EOF
+  cat > aprendizado.py <<'EOF'
+"""Aprender sozinha, de forma limitada e visível: depois de uma conversa, guarda na memória fatos DURÁVEIS que o usuário
+afirmou sobre si (nome, projeto, equipamento, preferências). Nada de código: ela não altera a si mesma.
+
+Cuidados: (1) nunca guarda segredos (senhas, chaves, cartão, documentos); (2) só guarda o que se apoia no que o usuário
+escreveu (descarta invenção do modelo); (3) tudo aparece em 🧠 Memória com a etiqueta "aprendi sozinha" e pode ser apagado;
+(4) não atrapalha a conversa: se um chat está em andamento ou outro aprendizado já roda, simplesmente pula.
+"""
+import asyncio
+import json
+import re
+
+import httpx
+
+import config
+import memory
+
+FONTE = "aprendido"
+LIMITE_GUARDADOS = 200          # passando disso, os mais antigos "aprendidos" saem
+ativos = 0                      # conversas em andamento (main.py soma e subtrai)
+_rodando = False
+
+SEGREDO = re.compile(
+    r"(?i)(senha|password|passwd|\btoken\b|api[_ -]?key|chave (?:de )?(?:api|privada|pix)|secret|segredo|cart[aã]o|\bcvv\b|"
+    r"\bcpf\b|\bcnpj\b|\bpix\b|\bcnh\b|\d{3}\.?\d{3}\.?\d{3}-?\d{2}|(?:\d[ -]?){13,19}|sk-[A-Za-z0-9_-]{10,}|"
+    r"gh[pousr]_[A-Za-z0-9]{10,}|bearer\s+\S{10,}|-----BEGIN)")
+SENSIVEL = re.compile(r"(?i)(diagn[oó]stic|doen[cç]a|rem[eé]dio|depress|sal[aá]rio|dívida|divida|endere[cç]o|mora (?:na|no|em))")
+
+SISTEMA = (
+    "Você extrai o que vale lembrar sobre o USUÁRIO, a partir da mensagem dele. Responda SOMENTE um JSON: "
+    "{\"fatos\": [\"...\"]}, com no máximo 2 itens curtos em português, no formato \"O usuário ...\".\n"
+    "Vale: nome, profissão, projeto em andamento, equipamento que usa, gostos e como prefere as respostas "
+    "(só o que ELE afirmou sobre si ou pediu para lembrar).\n"
+    "Não vale: perguntas de curiosidade, tarefas pontuais, o que a IA respondeu, opiniões sobre terceiros, e dados sensíveis "
+    "(senhas, documentos, saúde, finanças, endereço). Se nada vale, devolva {\"fatos\": []}.\n"
+    "Exemplos:\n"
+    "\"meu PC tem uma RX 580 de 8 GB e eu uso Linux Mint\" -> {\"fatos\": [\"O usuário tem um PC com RX 580 de 8 GB e usa Linux Mint.\"]}\n"
+    "\"me explica o que é recursão\" -> {\"fatos\": []}")
+
+
+def _palavras(s: str) -> set[str]:
+    return {w for w in re.findall(r"[a-zà-ú0-9]{4,}", s.lower())}
+
+
+def _apoiado(fato: str, fala: str) -> bool:
+    """O fato precisa repetir pelo menos duas palavras relevantes (4+ letras) da fala do usuário."""
+    return len(_palavras(fato) & _palavras(fala)) >= 2
+
+
+def _poda() -> None:
+    antigos = [m for m in memory.list_all(1000) if m["source"] == FONTE]
+    for m in antigos[LIMITE_GUARDADOS:]:          # list_all vem do mais novo para o mais antigo
+        memory.delete(m["id"])
+
+
+async def _pergunta_ao_modelo(fala: str) -> list[str]:
+    corpo = {"messages": [{"role": "system", "content": SISTEMA}, {"role": "user", "content": fala[:1500]}],
+             "temperature": 0, "max_tokens": 160, "cache_prompt": True, "response_format": {"type": "json_object"}}
+    async with httpx.AsyncClient(timeout=25) as c:
+        r = await c.post(f"{config.LLAMA_URL}/v1/chat/completions", json=corpo)
+    r.raise_for_status()
+    txt = r.json()["choices"][0]["message"]["content"]
+    j = json.loads(txt[txt.index("{"):txt.rindex("}") + 1])
+    fatos = j.get("fatos")
+    return [f.strip() for f in fatos if isinstance(f, str)] if isinstance(fatos, list) else []
+
+
+async def aprende(pergunta: str, resposta: str = "") -> list[str]:
+    """Devolve os fatos que guardou (vazio se não havia nada, se pulou ou se algo falhou)."""
+    global _rodando
+    fala = pergunta.strip()
+    if _rodando or ativos > 0 or len(fala) < 15:
+        return []
+    if SEGREDO.search(fala) or SEGREDO.search(resposta or ""):
+        return []
+    _rodando = True
+    try:
+        candidatos = await _pergunta_ao_modelo(fala)
+    except Exception:
+        return []
+    finally:
+        _rodando = False
+    guardados = []
+    for f in candidatos[:2]:
+        f = f[:240]
+        if not f or SEGREDO.search(f) or SENSIVEL.search(f) or not _apoiado(f, fala):
+            continue
+        r = await asyncio.to_thread(memory.add, f, FONTE)
+        if not r.get("duplicate"):
+            guardados.append(f)
+    if guardados:
+        await asyncio.to_thread(_poda)
+    return guardados
+EOF
   cat > video.py <<'EOF'
 """Vídeo curto a partir de texto, 100% local (Wan 2.1 pelo stable-diffusion.cpp).
 
@@ -5828,6 +5942,7 @@ EOF
           <div class="sec">Opções</div>
           <label><input type="checkbox" id="web"> 🌐 Pesquisar na web</label>
           <label title="Guarda na memória o que descobrir pesquisando"><input type="checkbox" id="learn" checked> 📚 Aprender com as pesquisas</label>
+          <label title="Depois das respostas, guarda na memória fatos duráveis que VOCÊ disse sobre você (nome, projeto, equipamento, preferências). Nunca guarda senhas nem dados sensíveis; tudo aparece em Memória e dá para apagar."><input type="checkbox" id="learnSelf" checked> 🧠 Aprender sozinha</label>
           <label><input type="checkbox" id="speak"> 🔊 Falar as respostas</label>
         </div>
         <div id="anexos"></div>
@@ -6253,6 +6368,10 @@ async function send(text) {
       if (webResults > 0 && $('learn').checked && ma.content && !teach) {
         try { await salvaMemoria(`Pergunta: ${text}\nResposta (pesquisa na web em ${new Date().toLocaleDateString('pt-BR')}): ${ma.content}`, 'web'); } catch (e) {}
       }
+      if ($('learnSelf').checked && ma.content && !teach) {   // aprende em segundo plano e mostra o que guardou
+        fetch('/aprender', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({pergunta: text, resposta: ma.content.slice(0, 600)})})
+          .then(r => r.ok ? r.json() : null).then(j => { if (j && j.fatos && j.fatos.length) { setStatus('🧠 Aprendi: ' + j.fatos.join(' · ')); setTimeout(() => setStatus(''), 9000); } }).catch(() => {});
+      }
       if ($('speak').checked && ma.content) speak(ma.content);
     } catch (e) {
       if (e.name === 'AbortError') {
@@ -6419,6 +6538,8 @@ function atualizaChips() {
   txt.placeholder = PLACEHOLDERS[m];
 }
 for (const id of ['web', 'speak', 'learn']) $(id).onchange = atualizaChips;
+try { $('learnSelf').checked = localStorage.getItem('learnSelf') !== '0'; } catch (e) {}
+$('learnSelf').onchange = () => { try { localStorage.setItem('learnSelf', $('learnSelf').checked ? '1' : '0'); } catch (e) {} };
 function atualizaForca() { $('imgForcaLinha').hidden = !(anexos.some(a => a.tipo === 'imagem') || (baseMod && baseMod.kind === 'img')); }
 $('imgPassos').oninput = () => $('imgPassosV').textContent = $('imgPassos').value;
 $('imgForca').oninput = () => $('imgForcaV').textContent = parseFloat($('imgForca').value).toFixed(2);
@@ -6581,7 +6702,7 @@ async function carregaMem() {
   for (const m of itens) {
     const row = document.createElement('div'); row.className = 'item-l';
     const t = document.createElement('div'); t.className = 't'; t.textContent = m.text;
-    const sm = document.createElement('small'); sm.textContent = (m.source === 'web' ? 'aprendido na web' : 'você ensinou') + ' · ' + new Date(m.created * 1000).toLocaleDateString('pt-BR'); t.appendChild(sm);
+    const sm = document.createElement('small'); sm.textContent = (m.source === 'web' ? 'aprendido na web' : m.source === 'aprendido' ? 'aprendi sozinha' : 'você ensinou') + ' · ' + new Date(m.created * 1000).toLocaleDateString('pt-BR'); t.appendChild(sm);
     const del = document.createElement('button'); del.className = 'bt'; del.textContent = 'Apagar';
     del.onclick = async () => { await fetch('/memory/' + m.id, {method: 'DELETE'}); carregaMem(); };
     row.append(t, del); box.appendChild(row);
@@ -6949,6 +7070,14 @@ tem '--threads-batch' && ARGS+=(-tb "$LOGICOS")
 tem '--parallel'      && ARGS+=(-np 1)              # 1 conversa por vez: usa o contexto todo e o cache do prompt
 tem '--mlock'         && ARGS+=(--mlock)            # mantém o modelo na RAM (evita lentidão por paginação)
 tem '--cache-reuse'   && ARGS+=(--cache-reuse 256)  # reaproveita o que já foi calculado entre perguntas
+# Vulkan com mais de uma placa (RX 580 + gráfica integrada do Ryzen): fixa a de maior memória, para o modelo não se dividir nas duas
+if tem '--list-devices' && tem '--device'; then
+  DISP="$("$BIN" --list-devices 2>&1 | grep -E '^[[:space:]]*Vulkan[0-9]+:' || true)"
+  if [ "$(grep -c . <<<"$DISP")" -gt 1 ]; then
+    MELHOR="$(sed -nE 's/^[[:space:]]*(Vulkan[0-9]+):.*\(([0-9]+) MiB.*/\2 \1/p' <<<"$DISP" | sort -rn | head -1 | cut -d' ' -f2)"
+    [ -n "$MELHOR" ] && ARGS+=(--device "$MELHOR") && echo "[start_llm] placas Vulkan: $(grep -c . <<<"$DISP"); usando $MELHOR"
+  fi
+fi
 exec "$BIN" "${ARGS[@]}"
 EOF
   sed -i "s/__NGL__/$NGL_PADRAO/; s/__MODEL__/$MODEL_FILE/" "$BASE/start_llm.sh"
@@ -7374,6 +7503,13 @@ fi
 echo "==> Reiniciando"
 sudo sed -i "s/^Environment=NGL=.*/Environment=NGL=$NGL_PADRAO/" "$SERVICO_LLM"
 sudo systemctl daemon-reload
+# Instalações antigas gravaram um arquivo do X pedindo o driver "nvidia" (Coolbits). Sem placa NVIDIA, ele só atrapalha a interface gráfica.
+XCOOL=/etc/X11/xorg.conf.d/20-nvidia-coolbits.conf
+if [ -f "$XCOOL" ] && ! command -v nvidia-smi >/dev/null 2>&1 && ! lsmod | grep -q '^nvidia'; then
+  echo "==> Desativando $XCOOL (não há placa NVIDIA neste PC; ele só atrapalharia a interface gráfica)"
+  sudo mv "$XCOOL" "$XCOOL.desativado" || echo "AVISO: não consegui mover $XCOOL"
+fi
+
 # llama.cpp: precisa (1) entender imagens (--mmproj, para a foto do perfil) e (2) usar a placa de vídeo certa:
 # AMD (ex.: RX 580) -> Vulkan; NVIDIA -> CUDA. Se faltar algum dos dois, atualiza e recompila (15 a 40 min, só desta vez).
 # Se falhar, o resto continua funcionando (a IA de texto fica como estava).

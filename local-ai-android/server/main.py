@@ -41,6 +41,7 @@ from fastapi.responses import FileResponse, RedirectResponse, Response, Streamin
 from pydantic import BaseModel
 
 import agente
+import aprendizado
 import androidgen
 import biblioteca
 import codegen
@@ -288,6 +289,14 @@ async def chat(req: ChatRequest):
                "top_p": 0.9, "top_k": 40, "min_p": 0.05, "repeat_penalty": 1.05, "cache_prompt": True, "stream": True}
 
     async def stream():
+        aprendizado.ativos += 1
+        try:
+            async for pedaco in _stream_modelo(payload):
+                yield pedaco
+        finally:
+            aprendizado.ativos -= 1
+
+    async def _stream_modelo(payload):
         async with httpx.AsyncClient(timeout=None) as client:
             try:
                 async with client.stream(
@@ -762,6 +771,17 @@ async def memory_add(item: MemoryIn):
         return await asyncio.to_thread(memory.add, item.text, item.source[:20])
     except ValueError as e:
         raise HTTPException(400, str(e))
+
+
+class AprenderReq(BaseModel):
+    pergunta: str
+    resposta: str = ""
+
+
+@app.post("/aprender", dependencies=[Depends(require_token)])
+async def aprender(req: AprenderReq):
+    """A tela chama depois de cada resposta (se 'Aprender sozinha' estiver ligado). Devolve o que foi guardado."""
+    return {"fatos": await aprendizado.aprende(req.pergunta, req.resposta)}
 
 
 @app.delete("/memory/{mem_id}", dependencies=[Depends(require_token)])
