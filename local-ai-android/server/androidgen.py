@@ -372,7 +372,9 @@ async def gera_app(descricao: str, emit, base_codigo: str | None = None, base_no
             nota_rev = ""
             if config.REVISAO:
                 await emit({"type": "status", "msg": "Compilou! A IA está conferindo se o app faz tudo o que você pediu…"})
-                faltando = await gerador.revisa(pedido, codigo, "java", _pede_revisao)
+                faltando = gerador.confere_pedido(pedido, codigo, "java")
+                faltando += [f for f in await gerador.revisa(pedido, codigo, "java", _pede_revisao) if f not in faltando]
+                faltando = faltando[:4]
                 if faltando:
                     await emit({"type": "status", "msg": "Faltou: " + "; ".join(faltando) + ". A IA está completando…"})
                     texto = await pede_codigo(gerador.mensagens_melhoria(SYSTEM_PROMPT, pedido, codigo, faltando, "java", nome), emit)

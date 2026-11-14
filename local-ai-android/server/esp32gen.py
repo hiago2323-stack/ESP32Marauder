@@ -182,7 +182,9 @@ async def gera_firmware(descricao: str, placa: str, emit, base_codigo: str | Non
             nota_rev = ""
             if config.REVISAO and not so_compilar:
                 await emit({"type": "status", "msg": "Compilou! A IA está conferindo se o firmware faz tudo o que você pediu…"})
-                faltando = await gerador.revisa(pedido, codigo, "cpp", androidgen._pede_revisao)
+                faltando = gerador.confere_pedido(pedido, codigo, "cpp")
+                faltando += [f for f in await gerador.revisa(pedido, codigo, "cpp", androidgen._pede_revisao) if f not in faltando]
+                faltando = faltando[:4]
                 if faltando:
                     await emit({"type": "status", "msg": "Faltou: " + "; ".join(faltando) + ". A IA está completando…"})
                     texto = await androidgen.pede_codigo(gerador.mensagens_melhoria(SYSTEM_PROMPT, pedido, codigo, faltando, "cpp", nome), emit)

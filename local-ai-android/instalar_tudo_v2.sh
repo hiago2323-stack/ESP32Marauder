@@ -1667,7 +1667,9 @@ async def gera_app(descricao: str, emit, base_codigo: str | None = None, base_no
             nota_rev = ""
             if config.REVISAO:
                 await emit({"type": "status", "msg": "Compilou! A IA está conferindo se o app faz tudo o que você pediu…"})
-                faltando = await gerador.revisa(pedido, codigo, "java", _pede_revisao)
+                faltando = gerador.confere_pedido(pedido, codigo, "java")
+                faltando += [f for f in await gerador.revisa(pedido, codigo, "java", _pede_revisao) if f not in faltando]
+                faltando = faltando[:4]
                 if faltando:
                     await emit({"type": "status", "msg": "Faltou: " + "; ".join(faltando) + ". A IA está completando…"})
                     texto = await pede_codigo(gerador.mensagens_melhoria(SYSTEM_PROMPT, pedido, codigo, faltando, "java", nome), emit)
@@ -1958,7 +1960,9 @@ async def gera_firmware(descricao: str, placa: str, emit, base_codigo: str | Non
             nota_rev = ""
             if config.REVISAO and not so_compilar:
                 await emit({"type": "status", "msg": "Compilou! A IA está conferindo se o firmware faz tudo o que você pediu…"})
-                faltando = await gerador.revisa(pedido, codigo, "cpp", androidgen._pede_revisao)
+                faltando = gerador.confere_pedido(pedido, codigo, "cpp")
+                faltando += [f for f in await gerador.revisa(pedido, codigo, "cpp", androidgen._pede_revisao) if f not in faltando]
+                faltando = faltando[:4]
                 if faltando:
                     await emit({"type": "status", "msg": "Faltou: " + "; ".join(faltando) + ". A IA está completando…"})
                     texto = await androidgen.pede_codigo(gerador.mensagens_melhoria(SYSTEM_PROMPT, pedido, codigo, faltando, "cpp", nome), emit)
@@ -4507,6 +4511,59 @@ async def garante_modelo_codigo(emit) -> None:
 
 
 # ======================================================================= revisão (o código faz TUDO o que foi pedido?)
+def _sem_coment_cpp(codigo: str) -> str:
+    codigo = re.sub(r"/\*.*?\*/", " ", codigo, flags=re.S)
+    return re.sub(r"//[^\n]*", " ", codigo)
+
+
+def confere_pedido(pedido: str, codigo: str, linguagem: str) -> list[str]:
+    """Conferência SEM IA das partes objetivas do pedido: pinos, intervalos de tempo, página que se atualiza,
+    dados salvos, toque longo e endereços citados. Devolve o que o código não faz (lista vazia = tudo certo)."""
+    p = pedido.lower()
+    c = _sem_coment_cpp(codigo)
+    cl = c.lower()
+    falta = []
+    # pinos citados ("pino 4", "GPIO 25", "no pino D5")
+    for n in dict.fromkeys(re.findall(r"\b(?:pino|gpio|pin)\s*(?:n[ºo°.]?\s*)?(?:d|gpio)?\s*(\d{1,2})\b", p)):
+        if not re.search(r"(?<![\w.])(?:GPIO_NUM_)?" + n + r"(?![\w.])", c):
+            falta.append(f"usar o pino {n}, como o pedido diz")
+    # intervalos de tempo ("a cada 5 segundos", "10 s", "2 minutos", "500 ms")
+    for num, uni in re.findall(r"(\d+(?:[.,]\d+)?)\s*(milissegundos?|ms|segundos?|seg|s|minutos?|min|horas?|h)\b", p):
+        v = float(num.replace(",", "."))
+        mult = 1 if uni.startswith(("mili", "ms")) else 3600000 if uni.startswith("h") else 60000 if uni.startswith("min") else 1000
+        ms = int(v * mult)
+        seg = ms / 1000
+        seg_txt = str(int(seg)) if seg == int(seg) else str(seg)
+        opcoes = [rf"(?<![\w.]){ms}(?:UL|L|u|l)?(?![\w.])", rf"(?<![\w.]){seg_txt}\s*\*\s*1000\b", rf"\b1000\s*\*\s*{seg_txt}(?![\w.])",
+                  rf"content\s*=\s*\\?['\"]{seg_txt}\b"]
+        if mult == 60000 and v == int(v):
+            opcoes += [rf"(?<![\w.]){int(v)}\s*\*\s*60\s*\*\s*1000", rf"(?<![\w.]){int(v)}\s*\*\s*60000"]
+        if mult == 3600000 and v == int(v):
+            opcoes += [rf"(?<![\w.]){int(v)}\s*\*\s*3600\s*\*\s*1000", rf"(?<![\w.]){int(v)}\s*\*\s*60\s*\*\s*60\s*\*\s*1000"]
+        if ms >= 1000 and not any(re.search(o, c) for o in opcoes):
+            falta.append(f"o intervalo de {num} {uni} pedido (= {ms} ms) não aparece no código")
+    # página web que se atualiza sozinha
+    web = re.search(r"p[aá]gina|web|site|navegador|html", p)
+    atualiza = re.search(r"atualiz|tempo real|ao vivo|sozinh|autom[aá]tic", p)
+    if linguagem == "cpp" and web and atualiza and re.search(r"webserver|asyncwebserver|server\.send|request->send", cl):
+        if not re.search(r"http-equiv|setinterval|settimeout|fetch\s*\(|xmlhttprequest|eventsource|websocket", cl):
+            falta.append("a página web não se atualiza sozinha: use <meta http-equiv='refresh' content='N'> ou JavaScript "
+                         "(setInterval + fetch de uma rota que devolve os valores)")
+    # dados que o usuário cria precisam ficar salvos (app Android)
+    if linguagem == "java" and re.search(r"\bsalv|\bguard|lembrar|persist|não perder|nao perder|hist[oó]rico|anota|notas?\b|tarefas?\b", p):
+        if not re.search(r"sharedpreferences|sqlite|openfileoutput|fileoutputstream", cl):
+            falta.append("salvar os dados no celular (SharedPreferences) e carregá-los ao abrir o app")
+    # toque longo
+    if linguagem == "java" and re.search(r"segur|toque longo|pressionar e segurar|long[ -]?press", p):
+        if not re.search(r"setonitemlongclicklistener|setonlongclicklistener|onlongclick", cl):
+            falta.append("a ação ao tocar e SEGURAR (setOnItemLongClickListener / setOnLongClickListener)")
+    # endereços citados (broker MQTT, sites)
+    for host in dict.fromkeys(re.findall(r"\b((?:[a-z0-9-]+\.)+(?:org|com|net|io|br|cloud))\b", p)):
+        if host not in cl:
+            falta.append(f"usar o endereço {host} citado no pedido")
+    return falta[:4]
+
+
 async def revisa(pedido: str, codigo: str, linguagem: str, pede) -> list[str]:
     """Pede à IA uma checagem curta do código contra o pedido. Devolve o que falta (até 3 itens; vazio = tudo ok).
 
