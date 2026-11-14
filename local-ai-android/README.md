@@ -125,6 +125,12 @@ ferramentas do Android (algumas centenas de MB) e demora mais.
 - **Modelo certo**: para criar código o servidor passa a usar o Qwen2.5-Coder (perfil Código) se ele estiver no PC
   (`CODIGO_AUTO=0` desliga).
 - No app avançado e em web/Python, as correções mantêm **todos** os arquivos da última versão (antes os não reenviados se perdiam).
+- **Revisão depois de compilar**: uma conferência exata (pinos, intervalos, página que se atualiza, dados salvos, toque longo,
+  endereços citados) e uma revisão pela IA (sem os "defeitos" que ela costuma inventar) completam o que faltou do pedido.
+- **Bateria de teste com o modelo real** (Qwen2.5-Coder 7B em 4 núcleos de CPU, compilação de verdade): 8 de 8 compilaram,
+  4 apps (lista de tarefas, IMC, cronômetro com voltas, bloco de notas) e 4 firmwares (DHT22 com página web, PWM, MQTT,
+  OLED com hora da internet), de 3 a 15 minutos cada. A revisão completou o botão de volta do cronômetro, o apagar/salvar do
+  bloco de notas e a atualização automática da página do DHT22.
 
 ## Anexar, modificar e criar
 

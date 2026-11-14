@@ -608,8 +608,10 @@ async def revisa(pedido: str, codigo: str, linguagem: str, pede) -> list[str]:
         {"role": "system", "content": "Você é um revisor de código rigoroso e objetivo. Responda só com JSON."},
         {"role": "user", "content": (
             f"Pedido do usuário: {pedido}\n\nCódigo:\n```{linguagem}\n{codigo}\n```\n\n"
-            "Confira se o código faz TUDO o que o pedido exige (funções, comportamento, números como pinos, intervalos e "
-            "tempos). Ignore estilo, comentários e detalhes não pedidos. Responda SOMENTE com JSON no formato "
+            "Este código JÁ COMPILOU: toda função que ele chama existe (inclusive as da plataforma, como temperatureRead(), "
+            "millis(), ledcAttach()). Valores equivalentes estão certos (10000 ms = 10 s). "
+            "Confira se o código faz TUDO o que o pedido exige (funções, comportamento, botões, o que deve ser salvo, o que deve "
+            "aparecer na tela). Ignore estilo, comentários e detalhes não pedidos. Responda SOMENTE com JSON no formato "
             '{"faltando": ["..."]}, com no máximo 3 itens curtos do que o pedido exige e o código NÃO faz. '
             'Se o código faz tudo, responda {"faltando": []}.')},
     ]
@@ -624,7 +626,28 @@ async def revisa(pedido: str, codigo: str, linguagem: str, pede) -> list[str]:
         itens = json.loads(m.group(0)).get("faltando", [])
     except (ValueError, AttributeError):
         return []
-    return [str(i).strip()[:160] for i in itens if str(i).strip()][:3] if isinstance(itens, list) else []
+    if not isinstance(itens, list):
+        return []
+    return filtra_revisao([str(i).strip()[:160] for i in itens if str(i).strip()], pedido, codigo, linguagem)[:3]
+
+
+def filtra_revisao(itens: list[str], pedido: str, codigo: str, linguagem: str) -> list[str]:
+    """Descarta os "defeitos" que a IA revisora costuma inventar:
+    - função/variável "não definida" num código que COMPILOU (é impossível);
+    - pinos e intervalos de tempo quando a conferência exata (confere_pedido) não achou problema neles
+      (ela entende que 10000 ms = 10 s; a IA às vezes não)."""
+    det = " ".join(confere_pedido(pedido, codigo, linguagem)).lower()
+    saida = []
+    for it in itens:
+        t = it.lower()
+        if re.search(r"n[ãa]o (est[áa] |foi |é )?(definid|declarad|implementad)|n[ãa]o existe|undefined|not defined|não reconhecid", t):
+            continue
+        if re.search(r"intervalo|segundo|\bms\b|milissegundo|minuto", t) and "intervalo" not in det:
+            continue
+        if re.search(r"\bpino|\bgpio", t) and "pino" not in det:
+            continue
+        saida.append(it)
+    return saida
 
 
 def mensagens_melhoria(system: str, pedido: str, codigo: str, faltando: list[str], linguagem: str, rotulo: str) -> list[dict]:
