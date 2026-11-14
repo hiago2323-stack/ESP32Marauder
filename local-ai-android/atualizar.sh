@@ -414,13 +414,15 @@ async def _build_messages(req: ChatRequest) -> tuple[list[dict], int]:
             partes.append("Pesquisa na web:\n" + "\n".join(
                 f"[{i+1}] {r['title']} - {r['url']}\n{(r['snippet'] or '')[:260]}" for i, r in enumerate(results)))
 
-    if req.web and n_web == 0:  # sem internet (ou sem resultados): a Wikipedia offline do disco grande ajuda
+    # Enciclopédias offline do disco grande (Wikipédia, Wikilivros, Wikiversidade, Wikcionário): em toda conversa
+    # entram os verbetes cujo título aparece na pergunta; sem internet (ou sem resultado na web), os mais parecidos.
+    if not n_web and len(pergunta) < 600:
         try:
-            wiki = await asyncio.to_thread(biblioteca.wikipedia, pergunta)
+            wiki = await asyncio.to_thread(biblioteca.wikipedia, pergunta, 2, 700, not req.web)
         except Exception:
             wiki = []
         if wiki:
-            partes.append("Wikipedia (offline):\n" + "\n".join(f"- {w['titulo']}: {w['texto']}" for w in wiki))
+            partes.append("Enciclopédia offline:\n" + "\n".join(f"- {w['titulo']}: {w['texto']}" for w in wiki))
 
     if partes:
         msgs[ultimo]["content"] = "[CONTEXTO]\n" + "\n\n".join(partes) + "\n[FIM DO CONTEXTO]\n\n" + pergunta
@@ -4705,30 +4707,115 @@ def _zims() -> list[Path]:
     return sorted(d.glob("*.zim")) if d.is_dir() else []
 
 
-def wikipedia(consulta: str, k: int = 2, max_chars: int = 700) -> list[dict]:
-    """Busca nos arquivos .zim (Wikipedia offline). Precisa do pacote libzim; sem ele, devolve vazio."""
+def _norm(t: str) -> list[str]:
+    import unicodedata
+    t = unicodedata.normalize("NFKD", t.lower()).encode("ascii", "ignore").decode()
+    return re.findall(r"[a-z0-9]+", t)
+
+
+def titulo_bate(titulo: str, consulta: str) -> bool:
+    """O título do verbete aparece na pergunta? (ex.: "Consentimento sexual" em "o que é consentimento sexual?")"""
+    pal_t = [w for w in _norm(re.sub(r"\(.*?\)", " ", titulo)) if len(w) > 2 or w.isdigit()]
+    q = set(_norm(consulta))
+    return bool(pal_t) and all(w in q or (w.endswith("s") and w[:-1] in q) or w + "s" in q for w in pal_t)
+
+
+PARADAS_Q = {"o", "a", "os", "as", "um", "uma", "de", "do", "da", "dos", "das", "e", "é", "que", "qual", "quais", "como", "me",
+             "eu", "você", "voce", "no", "na", "em", "por", "para", "pra", "com", "sobre", "mais", "minha", "meu", "ter",
+             "fazer", "explica", "explique", "fale", "conta", "diga", "dicas", "ajuda", "ajude", "isso", "ser", "se", "ao",
+             "à", "the", "of", "what", "is", "how", "praticar", "quero", "saber", "entender", "significa", "pode", "seria"}
+
+
+def _ngramas(consulta: str, maximo: int = 4) -> list[str]:
+    """Sequências de palavras da pergunta (as maiores primeiro), sem palavras vazias nas pontas: candidatas a título."""
+    pal = re.findall(r"[\wÀ-ÿ-]+", consulta)
+    out = []
+    for n in range(min(maximo, len(pal)), 0, -1):
+        for i in range(len(pal) - n + 1):
+            g = pal[i:i + n]
+            if g[0].lower() in PARADAS_Q or g[-1].lower() in PARADAS_Q or (n == 1 and len(g[0]) < 4):
+                continue
+            out.append(" ".join(g))
+    return list(dict.fromkeys(out))
+
+
+def _texto_do_verbete(e, max_chars: int) -> str:
+    item = e.get_item()
+    if "html" not in item.mimetype:
+        return ""
+    t = html.unescape(re.sub(r"<[^>]+>", " ", re.sub(r"(?is)<(script|style).*?</\1>", " ",
+                                                      bytes(item.content).decode("utf-8", "ignore"))))
+    t = re.sub(r"\s+", " ", t).strip()
+    if t.startswith(e.title):
+        t = t[len(e.title):].strip()
+    return t[:max_chars]
+
+
+def _por_titulo(arq, consulta: str) -> list:
+    """Verbetes cujo título é um pedaço da pergunta (busca exata pelo título, rápida e precisa)."""
+    achados = []
+    for g in _ngramas(consulta):
+        for cand in dict.fromkeys([g[:1].upper() + g[1:], g, g.lower(), g.title()]):
+            try:
+                e = arq.get_entry_by_title(cand)
+            except (KeyError, RuntimeError):
+                continue
+            if e.is_redirect:
+                e = e.get_redirect_entry()
+            if e.path not in [x.path for x in achados]:
+                achados.append(e)
+            break
+        if len(achados) >= 3:
+            break
+    return achados
+
+
+def _por_busca(arq, consulta: str, n: int) -> list:
+    """Busca de texto completo (o índice exige TODAS as palavras: tenta as palavras-chave juntas e depois uma a uma)."""
+    from libzim.search import Query, Searcher
+    chaves = [w for w in re.findall(r"[\wÀ-ÿ-]+", consulta.lower()) if w not in PARADAS_Q and len(w) > 2]
+    tentativas = ([" ".join(chaves)] if chaves else []) + sorted(chaves, key=len, reverse=True)
+    for q in tentativas[:5]:
+        res = Searcher(arq).search(Query().set_query(q))
+        pega = getattr(res, "get_results", None) or getattr(res, "getResults")   # o nome mudou nas versões novas
+        caminhos = [getattr(r, "path", r) for r in pega(0, n)]
+        if caminhos:
+            out = []
+            for c in caminhos:
+                e = arq.get_entry_by_path(c)
+                out.append(e.get_redirect_entry() if e.is_redirect else e)
+            return out
+    return []
+
+
+def wikipedia(consulta: str, k: int = 2, max_chars: int = 700, exigir_titulo: bool = False) -> list[dict]:
+    """Busca nos arquivos .zim do disco grande (Wikipédia, Wikilivros, Wikiversidade, Wikcionário). Precisa do
+    pacote libzim; sem ele, devolve vazio. exigir_titulo=True: só verbetes cujo título aparece na pergunta
+    (usado nas conversas comuns, para não encher o contexto com coisas que não têm a ver)."""
     zims = _zims()
     if not zims or not _palavras(consulta):
         return []
     try:
         from libzim.reader import Archive
-        from libzim.search import Query, Searcher
     except ImportError:
         return []
+    # a Wikipédia primeiro; dicionário por último
+    zims = sorted(zims, key=lambda z: (0 if "wikipedia" in z.name else 2 if "wiktionary" in z.name else 1, z.name))
     saida = []
     for z in zims:
         try:
             arq = Archive(str(z))
-            res = Searcher(arq).search(Query().set_query(consulta))
-            for caminho in res.getResults(0, k):
-                e = arq.get_entry_by_path(caminho)
-                item = e.get_item()
-                if "html" not in item.mimetype:
+            entradas = _por_titulo(arq, consulta)
+            if not exigir_titulo and not entradas:
+                entradas = _por_busca(arq, consulta, k)
+            for e in entradas:
+                if exigir_titulo and not titulo_bate(e.title, consulta):
                     continue
-                t = html.unescape(re.sub(r"<[^>]+>", " ", re.sub(r"(?is)<(script|style).*?</\1>", " ",
-                                                                  bytes(item.content).decode("utf-8", "ignore"))))
-                t = re.sub(r"\s+", " ", t).strip()
-                saida.append({"titulo": e.title, "texto": t[:max_chars], "fonte": z.name})
+                t = _texto_do_verbete(e, max_chars)
+                if t and e.title not in [x["titulo"] for x in saida]:
+                    saida.append({"titulo": e.title, "texto": t, "fonte": z.name})
+                if len(saida) >= k:
+                    break
         except Exception:
             continue
         if len(saida) >= k:
@@ -7282,16 +7369,13 @@ if [ ! -f "$BIB/docs/python/.ok" ]; then
   curl -L --fail -s https://docs.python.org/3/archives/python-3.12-docs-text.tar.bz2 | tar xj -C "$BIB/docs/python" --strip-components=1 && touch "$BIB/docs/python/.ok" || log "AVISO: falhou a documentação do Python"
 fi
 [ -d "$BIB/docs/mdn/.git" ] || { log "baixando MDN (HTML/CSS/JavaScript; ~1 GB)"; git clone --depth 1 --quiet https://github.com/mdn/content "$BIB/docs/mdn" || { rm -rf "$BIB/docs/mdn"; log "AVISO: falhou o MDN"; }; }
-log "== Wikipedia em português (offline)"
-if ! ls "$BIB"/zim/wikipedia_pt*.zim >/dev/null 2>&1; then
-  ARQ=$(curl -s --max-time 30 https://download.kiwix.org/zim/wikipedia/ | grep -o 'wikipedia_pt_all_nopic_[0-9-]*\.zim' | sort -u | tail -1)
-  if [ -n "$ARQ" ]; then
-    log "baixando $ARQ (alguns GB; pode demorar e continua de onde parou se interromper)"
-    curl -L --fail -C - -o "$BIB/zim/$ARQ.part" "https://download.kiwix.org/zim/wikipedia/$ARQ" && mv "$BIB/zim/$ARQ.part" "$BIB/zim/$ARQ" || log "AVISO: a Wikipedia não terminou; rode este script de novo"
-  else
-    log "AVISO: não achei a Wikipedia em português no servidor do Kiwix agora."
-  fi
-fi
+log "== Enciclopédias e livros em português (offline): Wikipédia, Wikilivros, Wikiversidade e Wikcionário"
+# zim_baixa PASTA_NO_KIWIX PREFIXO DESCRICAO: baixa a versão mais nova (o site do Kiwix redireciona: por isso o -L)
+zim_baixa() { ls "$BIB"/zim/"$2"_*.zim >/dev/null 2>&1 && return 0; local arq; arq=$(curl -sL --max-time 60 "https://download.kiwix.org/zim/$1/" | grep -oE "$2_[0-9-]+\.zim" | sort -u | tail -1); [ -n "$arq" ] || { log "AVISO: não achei $3 no Kiwix agora."; return 0; }; log "baixando $3: $arq (continua de onde parou se interromper)"; curl -L --fail -C - -o "$BIB/zim/$arq.part" "https://download.kiwix.org/zim/$1/$arq" && mv "$BIB/zim/$arq.part" "$BIB/zim/$arq" || log "AVISO: $3 não terminou; rode este script de novo"; }
+zim_baixa wikibooks wikibooks_pt_all_nopic "Wikilivros (~55 MB)"
+zim_baixa wikiversity wikiversity_pt_all_nopic "Wikiversidade (~45 MB)"
+zim_baixa wiktionary wiktionary_pt_all_nopic "Wikcionário (~350 MB)"
+zim_baixa wikipedia wikipedia_pt_all_nopic "Wikipédia completa (~6,6 GB)"
 log "FIM. A IA já pode consultar tudo isso (o índice é atualizado sozinho a cada poucos minutos)."
 BIBEOF
   chmod +x "$BASE/biblioteca_baixar.sh"
