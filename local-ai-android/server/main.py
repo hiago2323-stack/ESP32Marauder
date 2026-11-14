@@ -40,6 +40,8 @@ from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, Uplo
 from fastapi.responses import FileResponse, RedirectResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
+import agente
+import aprendizado
 import androidgen
 import biblioteca
 import codegen
@@ -49,6 +51,7 @@ import esp32gen
 import imagens
 import memory
 import modelos
+import perfil
 import perfis
 import recursos
 import telemetria
@@ -214,7 +217,8 @@ async def _build_messages(req: ChatRequest) -> tuple[list[dict], int]:
     entre um turno e outro, e o llama-server reaproveita o que já calculou (cache do prompt), em vez
     de reprocessar tudo a cada pergunta.
     """
-    system = f"{config.SYSTEM_PROMPT}\nData de hoje: {date.today().isoformat()}."
+    sobre = perfil.contexto()   # nome e aparência do usuário (muda raramente: não atrapalha o cache do prompt)
+    system = f"{config.SYSTEM_PROMPT}\nData de hoje: {date.today().isoformat()}." + (f"\n{sobre}" if sobre else "")
     msgs = [{"role": "system", "content": system}] + [dict(m) for m in req.messages]
     ultimo = next((i for i in range(len(msgs) - 1, -1, -1) if msgs[i].get("role") == "user"), None)
     if ultimo is None:
@@ -266,13 +270,35 @@ async def _build_messages(req: ChatRequest) -> tuple[list[dict], int]:
     return msgs, n_web
 
 
+def _sse_texto(texto: str):
+    """Resposta pronta (não vinda do modelo) no mesmo formato de streaming da conversa."""
+    async def gen():
+        for i in range(0, len(texto), 24):
+            yield f"data: {json.dumps({'choices': [{'delta': {'content': texto[i:i + 24]}}]})}\n\n".encode()
+        yield b"data: [DONE]\n\n"
+    return gen()
+
+
 @app.post("/chat", dependencies=[Depends(require_token)])
 async def chat(req: ChatRequest):
+    ultimo = next((m for m in reversed(req.messages) if m.get("role") == "user"), None)
+    if ultimo and not req.anexos and isinstance(ultimo.get("content"), str):
+        resposta = await agente.tenta(ultimo["content"])   # "instala o modelo X", "volta pro rápido"...
+        if resposta is not None:
+            return StreamingResponse(_sse_texto(resposta), media_type="text/event-stream", headers={"X-Web-Results": "0"})
     messages, n_web = await _build_messages(req)
     payload = {"messages": messages, "max_tokens": req.max_tokens, "temperature": req.temperature,
-               "top_p": 0.9, "repeat_penalty": 1.05, "cache_prompt": True, "stream": True}
+               "top_p": 0.9, "top_k": 40, "min_p": 0.05, "repeat_penalty": 1.05, "cache_prompt": True, "stream": True}
 
     async def stream():
+        aprendizado.ativos += 1
+        try:
+            async for pedaco in _stream_modelo(payload):
+                yield pedaco
+        finally:
+            aprendizado.ativos -= 1
+
+    async def _stream_modelo(payload):
         async with httpx.AsyncClient(timeout=None) as client:
             try:
                 async with client.stream(
@@ -391,6 +417,66 @@ async def modelos_apagar(req: PerfilReq):
     except ValueError as e:
         raise HTTPException(400, str(e))
     return {"ok": True}
+
+
+# ----------------------------------------------------------------------------- perfil: nome e foto do usuário
+class PerfilNome(BaseModel):
+    nome: str = ""
+
+
+class PerfilDescricao(BaseModel):
+    descricao: str = ""
+
+
+@app.get("/perfil", dependencies=[Depends(require_token)])
+async def perfil_info():
+    return perfil.estado()
+
+
+@app.post("/perfil", dependencies=[Depends(require_token)])
+async def perfil_nome(req: PerfilNome):
+    perfil.define_nome(req.nome)
+    return perfil.estado()
+
+
+@app.post("/perfil/descricao", dependencies=[Depends(require_token)])
+async def perfil_descricao(req: PerfilDescricao):
+    perfil.define_descricao(req.descricao)
+    return perfil.estado()
+
+
+@app.post("/perfil/foto", dependencies=[Depends(require_token)])
+async def perfil_foto(foto: UploadFile = File(...)):
+    dados = await foto.read()
+    try:
+        perfil.salva_foto(dados, Path(foto.filename or "").suffix or ".jpg")
+        perfil.analisar()
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return perfil.estado()
+
+
+@app.post("/perfil/analisar", dependencies=[Depends(require_token)])
+async def perfil_analisar():
+    try:
+        perfil.analisar()
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return perfil.estado()
+
+
+@app.get("/perfil/foto", dependencies=[Depends(require_token)])
+async def perfil_foto_arquivo():
+    f = perfil.caminho_foto()
+    if not f:
+        raise HTTPException(404, "Sem foto.")
+    return FileResponse(f, headers={"Cache-Control": "no-store"})
+
+
+@app.delete("/perfil", dependencies=[Depends(require_token)])
+async def perfil_apaga():
+    perfil.apaga()
+    return perfil.estado()
 
 
 @app.get("/imagem/modelos", dependencies=[Depends(require_token)])
@@ -689,6 +775,17 @@ async def memory_add(item: MemoryIn):
         raise HTTPException(400, str(e))
 
 
+class AprenderReq(BaseModel):
+    pergunta: str
+    resposta: str = ""
+
+
+@app.post("/aprender", dependencies=[Depends(require_token)])
+async def aprender(req: AprenderReq):
+    """A tela chama depois de cada resposta (se 'Aprender sozinha' estiver ligado). Devolve o que foi guardado."""
+    return {"fatos": await aprendizado.aprende(req.pergunta, req.resposta)}
+
+
 @app.delete("/memory/{mem_id}", dependencies=[Depends(require_token)])
 async def memory_delete(mem_id: int):
     await asyncio.to_thread(memory.delete, mem_id)
@@ -729,18 +826,45 @@ def _carrega_whisper():
         return WhisperModel(config.WHISPER_FALLBACK, device="cpu", compute_type="int8", cpu_threads=nucleos)
 
 
+def _limpa_audio(path: str) -> str | None:
+    """Prepara a gravação para o Whisper: 16 kHz mono, tira graves de ruído (ventoinha, mesa), reduz o
+    chiado e nivela o volume (fala baixa ou longe do microfone vira legível). Devolve o .wav limpo, ou
+    None se o ffmpeg não existe ou falhou (aí o áudio original é usado, sem perda)."""
+    if not config.STT_FILTRO or not shutil.which("ffmpeg"):
+        return None
+    saida = path + ".limpo.wav"
+    filtro = "highpass=f=80,afftdn=nf=-30,loudnorm=I=-16:TP=-1.5:LRA=11"
+    try:
+        r = subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", path, "-af", filtro,
+                            "-ar", "16000", "-ac", "1", saida], capture_output=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0 or not os.path.exists(saida) or os.path.getsize(saida) < 1000:
+        Path(saida).unlink(missing_ok=True)
+        return None
+    return saida
+
+
 def _stt_sync(path: str) -> str:
     global _whisper
-    with _voice_lock:
-        if _whisper is None:
-            _whisper = _carrega_whisper()
-            recursos.registra("whisper", _descarrega_whisper)
-        recursos.usou("whisper")
-        segments, _ = _whisper.transcribe(
-            path, language="pt", beam_size=5, vad_filter=True,
-            vad_parameters={"min_silence_duration_ms": 500},
-            initial_prompt=config.STT_DICA, condition_on_previous_text=False)
-        return " ".join(s.text.strip() for s in segments).strip()
+    limpo = _limpa_audio(path)
+    try:
+        with _voice_lock:
+            if _whisper is None:
+                _whisper = _carrega_whisper()
+                recursos.registra("whisper", _descarrega_whisper)
+            recursos.usou("whisper")
+            segments, _ = _whisper.transcribe(
+                limpo or path, language="pt", beam_size=5, best_of=5,
+                temperature=[0.0, 0.2, 0.4],           # se a primeira tentativa sair ruim, tenta de novo
+                vad_filter=True,
+                vad_parameters={"threshold": 0.45, "min_silence_duration_ms": 600, "speech_pad_ms": 300},
+                initial_prompt=config.STT_DICA, condition_on_previous_text=False,
+                no_speech_threshold=0.5, compression_ratio_threshold=2.2, log_prob_threshold=-1.0)
+            return " ".join(s.text.strip() for s in segments).strip()
+    finally:
+        if limpo:
+            Path(limpo).unlink(missing_ok=True)
 
 
 def _get_kokoro():

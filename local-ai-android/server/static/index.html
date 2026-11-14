@@ -235,6 +235,7 @@
       <div id="estadoLlm"><span class="bolinha" id="bolinha"></span><span id="estadoTxt">Verificando o modelo…</span></div>
       <div class="menu acima" id="gearMenu" hidden style="left:0;right:0">
         <button class="item" id="voiceBtn">🔊 Voz</button>
+        <button class="item" id="perfilBtn">👤 Meu perfil e foto</button>
         <button class="item" id="llmBtn">🤖 Modelo de IA</button>
         <button class="item" id="memBtn">🧠 Memória</button>
         <button class="item" id="filesBtn">📁 Arquivos criados</button>
@@ -294,6 +295,7 @@
           <div class="sec">Opções</div>
           <label><input type="checkbox" id="web"> 🌐 Pesquisar na web</label>
           <label title="Guarda na memória o que descobrir pesquisando"><input type="checkbox" id="learn" checked> 📚 Aprender com as pesquisas</label>
+          <label title="Depois das respostas, guarda na memória fatos duráveis que VOCÊ disse sobre você (nome, projeto, equipamento, preferências). Nunca guarda senhas nem dados sensíveis; tudo aparece em Memória e dá para apagar."><input type="checkbox" id="learnSelf" checked> 🧠 Aprender sozinha</label>
           <label><input type="checkbox" id="speak"> 🔊 Falar as respostas</label>
         </div>
         <div id="anexos"></div>
@@ -328,6 +330,23 @@
   <div style="margin:14px 0 4px">Velocidade: <span id="velVal">1.00</span>×</div>
   <input type="range" id="vel" min="0.7" max="1.4" step="0.05" value="1">
   <div style="display:flex;gap:8px;margin-top:16px"><button class="bt pri" id="vozTest">▶ Testar</button><button class="bt" id="vozClose">Fechar</button></div>
+</dialog>
+
+<dialog id="perfilDlg">
+  <h2>Meu perfil e foto</h2>
+  <div class="dica">Mande uma foto sua e a IA aprende como você é: ela descreve a foto uma vez e usa isso nas conversas. A foto e a descrição ficam só neste PC; apague quando quiser.</div>
+  <div style="display:flex;gap:14px;align-items:flex-start;margin:12px 0;flex-wrap:wrap">
+    <img id="perfilImg" alt="" hidden style="width:120px;height:120px;object-fit:cover;border-radius:16px;border:1px solid var(--line)">
+    <div style="flex:1;min-width:200px">
+      <input type="text" class="campo" id="perfilNome" placeholder="Como devo te chamar?" style="width:100%;margin-bottom:8px">
+      <input type="file" id="perfilArq" accept="image/jpeg,image/png,image/webp" hidden>
+      <button class="bt pri" id="perfilEscolhe">📷 Escolher minha foto</button>
+    </div>
+  </div>
+  <div class="dica" id="perfilEstado"></div>
+  <div style="margin:10px 0 4px">Como a IA te vê (você pode corrigir)</div>
+  <textarea class="campo" id="perfilDesc" rows="4" style="width:100%" placeholder="Aparece aqui depois que a IA analisar a foto."></textarea>
+  <div style="display:flex;gap:8px;margin-top:14px;flex-wrap:wrap"><button class="bt pri" id="perfilSalva">Salvar</button><button class="bt" id="perfilRefaz">Analisar de novo</button><button class="bt" id="perfilApaga">Apagar tudo</button><button class="bt" id="perfilClose">Fechar</button></div>
 </dialog>
 
 <dialog id="llmDlg">
@@ -702,6 +721,10 @@ async function send(text) {
       if (webResults > 0 && $('learn').checked && ma.content && !teach) {
         try { await salvaMemoria(`Pergunta: ${text}\nResposta (pesquisa na web em ${new Date().toLocaleDateString('pt-BR')}): ${ma.content}`, 'web'); } catch (e) {}
       }
+      if ($('learnSelf').checked && ma.content && !teach) {   // aprende em segundo plano e mostra o que guardou
+        fetch('/aprender', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({pergunta: text, resposta: ma.content.slice(0, 600)})})
+          .then(r => r.ok ? r.json() : null).then(j => { if (j && j.fatos && j.fatos.length) { setStatus('🧠 Aprendi: ' + j.fatos.join(' · ')); setTimeout(() => setStatus(''), 9000); } }).catch(() => {});
+      }
       if ($('speak').checked && ma.content) speak(ma.content);
     } catch (e) {
       if (e.name === 'AbortError') {
@@ -827,7 +850,7 @@ function fechaFolha() { $('folha').hidden = true; }
 $('folhaFundo').onclick = fechaFolha;
 function folhaMais() {
   const l = document.createElement('div'); l.className = 'linhas';
-  for (const [e, nome, id] of [['🤖', 'Modelos de IA e adicionar outras', 'llmBtn'], ['🔊', 'Voz', 'voiceBtn'], ['🧠', 'Memória', 'memBtn'], ['🖥', 'Sistema e ventoinhas', 'sisBtn'], ['📲', 'Conectar celular', 'pairBtn'], ['⚙', 'Servidor do app', 'cfgBtn'], ['🌓', 'Tema', 'temaBtn'], ['＋', 'Nova conversa', 'new']]) {
+  for (const [e, nome, id] of [['👤', 'Meu perfil e foto', 'perfilBtn'], ['🤖', 'Modelos de IA e adicionar outras', 'llmBtn'], ['🔊', 'Voz', 'voiceBtn'], ['🧠', 'Memória', 'memBtn'], ['🖥', 'Sistema e ventoinhas', 'sisBtn'], ['📲', 'Conectar celular', 'pairBtn'], ['⚙', 'Servidor do app', 'cfgBtn'], ['🌓', 'Tema', 'temaBtn'], ['＋', 'Nova conversa', 'new']]) {
     if ($(id).hidden) continue;
     const b = document.createElement('button'); b.innerHTML = '<span class="e"></span><span></span>'; b.querySelector('.e').textContent = e; b.lastChild.textContent = nome;
     b.onclick = () => { fechaFolha(); $(id).click(); }; l.appendChild(b);
@@ -868,6 +891,8 @@ function atualizaChips() {
   txt.placeholder = PLACEHOLDERS[m];
 }
 for (const id of ['web', 'speak', 'learn']) $(id).onchange = atualizaChips;
+try { $('learnSelf').checked = localStorage.getItem('learnSelf') !== '0'; } catch (e) {}
+$('learnSelf').onchange = () => { try { localStorage.setItem('learnSelf', $('learnSelf').checked ? '1' : '0'); } catch (e) {} };
 function atualizaForca() { $('imgForcaLinha').hidden = !(anexos.some(a => a.tipo === 'imagem') || (baseMod && baseMod.kind === 'img')); }
 $('imgPassos').oninput = () => $('imgPassosV').textContent = $('imgPassos').value;
 $('imgForca').oninput = () => $('imgForcaV').textContent = parseFloat($('imgForca').value).toFixed(2);
@@ -1030,7 +1055,7 @@ async function carregaMem() {
   for (const m of itens) {
     const row = document.createElement('div'); row.className = 'item-l';
     const t = document.createElement('div'); t.className = 't'; t.textContent = m.text;
-    const sm = document.createElement('small'); sm.textContent = (m.source === 'web' ? 'aprendido na web' : 'você ensinou') + ' · ' + new Date(m.created * 1000).toLocaleDateString('pt-BR'); t.appendChild(sm);
+    const sm = document.createElement('small'); sm.textContent = (m.source === 'web' ? 'aprendido na web' : m.source === 'aprendido' ? 'aprendi sozinha' : 'você ensinou') + ' · ' + new Date(m.created * 1000).toLocaleDateString('pt-BR'); t.appendChild(sm);
     const del = document.createElement('button'); del.className = 'bt'; del.textContent = 'Apagar';
     del.onclick = async () => { await fetch('/memory/' + m.id, {method: 'DELETE'}); carregaMem(); };
     row.append(t, del); box.appendChild(row);
@@ -1304,6 +1329,42 @@ atualId = le('iaAtual', '');
 if (!conv()) { const n = novaConv(); convs.push(n); atualId = n.id; }
 desenha(); atualizaChips(); autoAltura(); checaLlm(); setInterval(checaLlm, 5000); chipsLoop(); setInterval(chipsLoop, 3000); setTimeout(retomaVideo, 1500);
 txt.focus();
+
+// --- perfil: nome e foto do usuário
+let perfilTimer = null;
+const PERFIL_MSG = {vazio: 'Ainda sem foto.', baixando_visao: '⬇ Baixando o modelo que enxerga (~2,8 GB, só na primeira vez)…',
+  descrevendo: '👀 A IA está olhando a foto… (alguns minutos no primeiro uso)', pronto: '✅ Pronto: a IA já sabe como você é.',
+  erro: '⚠ ', interrompido: '⚠ '};
+async function carregaPerfil(manter) {
+  let p; try { p = await (await fetch('/perfil')).json(); } catch (e) { $('perfilEstado').textContent = '⚠ Sem conexão com o servidor.'; return; }
+  if (!manter) { $('perfilNome').value = p.nome || ''; $('perfilDesc').value = p.descricao || ''; }
+  else if (p.estado === 'pronto' && !$('perfilDesc').value) $('perfilDesc').value = p.descricao || '';
+  const img = $('perfilImg'); img.hidden = !p.tem_foto; if (p.tem_foto) img.src = '/perfil/foto?t=' + Date.now();
+  let t = PERFIL_MSG[p.estado] || ''; if (p.estado === 'baixando_visao' && p.progresso != null) t += ' ' + Math.round(p.progresso * 100) + '%';
+  if (p.erro) t += p.erro; $('perfilEstado').textContent = t;
+  $('perfilRefaz').hidden = !p.tem_foto;
+  clearTimeout(perfilTimer);
+  if ($('perfilDlg').open && (p.estado === 'baixando_visao' || p.estado === 'descrevendo')) perfilTimer = setTimeout(() => carregaPerfil(true), 3000);
+}
+$('perfilBtn').onclick = () => { abreDlg('perfilDlg'); carregaPerfil(false); };
+$('perfilClose').onclick = () => { clearTimeout(perfilTimer); $('perfilDlg').close(); };
+$('perfilEscolhe').onclick = () => $('perfilArq').click();
+$('perfilArq').onchange = async () => {
+  const f = $('perfilArq').files[0]; if (!f) return;
+  $('perfilEstado').textContent = 'Enviando a foto…'; const fd = new FormData(); fd.append('foto', f, f.name);
+  const r = await fetch('/perfil/foto', {method: 'POST', body: fd}); $('perfilArq').value = '';
+  if (!r.ok) { $('perfilEstado').textContent = '⚠ ' + ((await r.json()).detail || 'Não consegui enviar.'); return; }
+  $('perfilDesc').value = ''; carregaPerfil(true);
+};
+async function salvaPerfil() {
+  await fetch('/perfil', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({nome: $('perfilNome').value})});
+  if ($('perfilDesc').value.trim()) await fetch('/perfil/descricao', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({descricao: $('perfilDesc').value})});
+  carregaPerfil(false);
+}
+$('perfilSalva').onclick = async () => { await salvaPerfil(); $('perfilEstado').textContent = '✅ Salvo.'; };
+$('perfilNome').onchange = salvaPerfil;
+$('perfilRefaz').onclick = async () => { $('perfilDesc').value = ''; const r = await fetch('/perfil/analisar', {method: 'POST'}); if (!r.ok) $('perfilEstado').textContent = '⚠ ' + (await r.json()).detail; carregaPerfil(true); };
+$('perfilApaga').onclick = async () => { if (!confirm('Apagar a foto, o nome e a descrição?')) return; await fetch('/perfil', {method: 'DELETE'}); $('perfilNome').value = ''; $('perfilDesc').value = ''; carregaPerfil(false); };
 </script>
 </body>
 </html>

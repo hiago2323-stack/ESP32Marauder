@@ -49,6 +49,8 @@ def _salva(itens: list[dict]) -> None:
 
 
 def _pasta(tipo: str) -> Path:
+    if tipo == "visao":
+        return config.MODELS_DIR / "visao"
     return config.MODELS_DIR / "imagens" if tipo == "imagem" else config.MODELS_DIR
 
 
@@ -214,9 +216,17 @@ async def arquivos(repo: str, tipo: str = "texto") -> list[dict]:
             continue
         m = PARTE_RE.match(n)
         base = (m.group(1) + ".gguf") if m else n
-        g = grupos.setdefault(base, {"nome": base, "arquivos": [], "tam": 0, "quant": _quant(base)})
-        g["arquivos"].append(n)
-        g["tam"] += f.get("size") or 0
+        g = grupos.setdefault(base, {"nome": base, "inteiro": None, "partes": [], "quant": _quant(base)})
+        if m:
+            g["partes"].append((n, f.get("size") or 0))
+        else:
+            g["inteiro"] = (n, f.get("size") or 0)
+    # Alguns repositórios (ex.: Qwen) publicam a mesma quantização inteira E dividida em partes: baixar os dois
+    # dobraria o tamanho. Havendo o arquivo inteiro, ele vale; senão, vale o conjunto de partes.
+    for g in grupos.values():
+        usados = [g["inteiro"]] if g["inteiro"] else g["partes"]
+        g["arquivos"] = [n for n, _ in usados]
+        g["tam"] = sum(t for _, t in usados)
     itens = sorted(grupos.values(), key=lambda g: g["tam"])
     partes = re.search(r"(?i)flux|sd3|sd-?3\.5|z-?image|qwen-?image|hidream|chroma|wan2|lumina|cosmos|kontext", repo)
     for g in itens:
@@ -311,6 +321,12 @@ async def _baixa(job: dict, repo: str, tipo: str, nome: str, arquivos_: list[str
             item["compativel"], item["motivo"] = await asyncio.to_thread(sd_completo, primeiro)
         itens.append(item)
         _salva(itens)
+        if job.get("usar_depois") and tipo == "texto":   # pediram "instala e já deixa selecionado"
+            try:
+                await asyncio.to_thread(usar, job["id"])
+                job["selecionado"] = True
+            except Exception as e:   # baixou, mas não deu para trocar sozinho: o modelo fica na lista
+                job["aviso"] = str(e)[:240]
     except asyncio.CancelledError:
         raise
     except Exception as e:
@@ -319,7 +335,7 @@ async def _baixa(job: dict, repo: str, tipo: str, nome: str, arquivos_: list[str
         job["fim"] = True
 
 
-def baixar(repo: str, arquivos_: list[str], tipo: str = "texto", total: int = 0) -> str:
+def baixar(repo: str, arquivos_: list[str], tipo: str = "texto", total: int = 0, usar_depois: bool = False) -> str:
     if not REPO_RE.match(repo) or not arquivos_ or any(not ARQ_RE.match(a) or ".." in a for a in arquivos_):
         raise ValueError("Pedido inválido.")
     id_ = _id(repo, arquivos_[0])
@@ -332,7 +348,8 @@ def baixar(repo: str, arquivos_: list[str], tipo: str = "texto", total: int = 0)
         raise ValueError(f"Falta espaço no disco: preciso de uns {total / 1e9:.1f} GB livres.")
     nome = repo.split("/")[-1].replace("-GGUF", "").replace("_GGUF", "")
     job = {"id": id_, "repo": repo, "tipo": tipo, "arquivos": [Path(a).name for a in arquivos_], "tam": total,
-           "pasta": pasta, "fim": False, "erro": ""}
+           "pasta": pasta, "fim": False, "erro": "", "usar_depois": usar_depois,
+           "selecionado": False, "aviso": ""}
     job["task"] = asyncio.get_running_loop().create_task(_baixa(job, repo, tipo, nome, arquivos_))
     _baixando[id_] = job
     return id_
@@ -348,7 +365,8 @@ def estado() -> dict:
             p = f.with_suffix(".gguf.part")
             feito += f.stat().st_size if f.exists() else (p.stat().st_size if p.exists() else 0)
         andamento.append({"id": id_, "repo": j["repo"], "tipo": j["tipo"], "progresso": round(min(feito / j["tam"], 1.0), 3) if j["tam"] else 0,
-                          "feito": feito, "tam": j["tam"], "fim": j["fim"], "erro": j["erro"]})
+                          "feito": feito, "tam": j["tam"], "fim": j["fim"], "erro": j["erro"],
+                          "selecionado": j.get("selecionado", False), "aviso": j.get("aviso", "")})
         if j["fim"] and not j["erro"] and any(m["id"] == id_ for m in lista()):
             _baixando.pop(id_, None)
     return {"baixando": andamento, "modelos": lista()}
@@ -404,3 +422,101 @@ def usar(id_: str) -> None:
     if r is None or r.returncode != 0:
         raise RuntimeError("Salvei a escolha, mas não consegui reiniciar o modelo sozinho. "
                            "Rode no PC: bash atualizar.sh (ele libera essa permissão) ou sudo systemctl restart localai-llm")
+
+
+# ------------------------------------------------------------------ "ache, instale e já deixe selecionado"
+_RUIDO = {"gguf", "modelo", "modelos", "llm", "llms", "ia", "ias", "o", "a", "os", "as", "de", "da", "do", "um", "uma",
+          "pra", "para", "no", "na", "me", "meu", "minha", "the", "model", "hugging", "face", "huggingface"}
+_QUANT_PEDIDA = re.compile(r"(?i)(?<![\w.])(iq\d_\w+|q\d(?:_k)?(?:_[sml01])?|bf16|f16)(?![\w.])")
+
+
+def separa_pedido(q: str) -> tuple[str, str]:
+    """('qwen2.5 coder 14b q5_k_m') -> ('qwen2.5 coder 14b', 'Q5_K_M'). Links e 'dono/repo:Q4_K_M' ficam como estão."""
+    q = q.strip()
+    if _repo_de(q):
+        return q.split(":")[0] if not q.startswith("http") else q, (q.split(":")[1].upper() if ":" in q and not q.startswith("http") else "")
+    m = _QUANT_PEDIDA.search(q)
+    quant = m.group(1).upper() if m else ""
+    if m:
+        q = (q[:m.start()] + " " + q[m.end():]).strip()
+    return re.sub(r"\s+", " ", q), quant
+
+
+def _tokens(q: str) -> list[str]:
+    return [t for t in re.split(r"[^a-z0-9.]+", q.lower()) if t and t not in _RUIDO]
+
+
+def _pontua(repo: str, tokens: list[str]) -> float:
+    r = repo.lower()
+    return sum(t in r for t in tokens) / len(tokens) if tokens else 0.0
+
+
+def escolhe_repo(candidatos: list[dict], q: str) -> tuple[dict | None, bool]:
+    """Entre os resultados da busca, o que contém TODAS as palavras do pedido e tem mais downloads.
+    Se nenhum contém todas, devolve o que casa mais (aproximado=True)."""
+    tk = _tokens(q)
+    if not candidatos:
+        return None, False
+    pont = [(_pontua(c["repo"], tk), c.get("downloads", 0), c) for c in candidatos]
+    completos = [p for p in pont if p[0] >= 0.999]
+    if completos:
+        return max(completos, key=lambda p: p[1])[2], False
+    return max(pont, key=lambda p: (p[0], p[1]))[2], True
+
+
+def _escolhe_arquivo(itens: list[dict], quant: str) -> dict | None:
+    if quant:
+        q = next((g for g in itens if g["quant"] == quant), None) or \
+            next((g for g in itens if g["quant"].startswith(quant)), None)
+        if q:
+            return q
+    return next((g for g in itens if g.get("recomendado")), itens[0] if itens else None)
+
+
+async def instalar_e_usar(pedido: str, tipo: str = "texto") -> dict:
+    """Acha o modelo pelo nome, escolhe a versão que cabe no PC, baixa e, ao terminar, deixa selecionado.
+
+    Devolve {estado: 'baixando'|'pronto', repo, arquivo, tam, aviso, alternativas, aproximado, quant_pedida_ok}.
+    Se o modelo já estava baixado, só passa a usá-lo (estado 'pronto')."""
+    nome, quant = separa_pedido(pedido)
+    if not nome:
+        raise ValueError("Diga o nome do modelo que você quer (por exemplo: qwen2.5 coder 7b).")
+    resultados = await buscar(nome, tipo, limite=30)
+    if not resultados:
+        raise ValueError(f"Não achei nada no Hugging Face para \"{nome}\".")
+    repo, aproximado = escolhe_repo(resultados, nome)
+    alternativas = [r["repo"] for r in resultados if r["repo"] != repo["repo"]][:3]
+    itens = await arquivos(repo["repo"], tipo)
+    if not itens:
+        raise ValueError(f"{repo['repo']} não tem arquivo .gguf para baixar.")
+    g = _escolhe_arquivo(itens, quant)
+    primeiro = Path(g["arquivos"][0]).name
+    info = {"repo": repo["repo"], "arquivo": g["nome"], "quant": g["quant"], "tam": g["tam"], "aviso": g["aviso"],
+            "alternativas": alternativas, "aproximado": aproximado, "quant_pedida_ok": (not quant) or g["quant"].startswith(quant)}
+    ja = next((m for m in lista() if m["repo"] == repo["repo"] and m["arquivo"] == primeiro
+               and Path(m["caminho"]).exists() and m["tipo"] == tipo), None)
+    if ja:
+        await asyncio.to_thread(usar, ja["id"])
+        return {**info, "estado": "pronto", "id": ja["id"]}
+    id_ = baixar(repo["repo"], g["arquivos"], tipo, g["tam"], usar_depois=True)
+    return {**info, "estado": "baixando", "id": id_}
+
+
+def acha_instalado(pedido: str) -> dict | None:
+    """Procura, entre o que já está no PC (perfis e modelos adicionados), o que casa com o pedido."""
+    import perfis
+    tk = _tokens(separa_pedido(pedido)[0])
+    if not tk:
+        return None
+    melhor, pts = None, 0.0
+    for id_, p in perfis.PERFIS.items():
+        if perfis.presente(p):
+            v = _pontua(f"{p['nome']} {p['modelo']} {p['arquivo']}", tk)
+            if v > pts:
+                melhor, pts = {"id": id_, "nome": p["modelo"], "perfil": True}, v
+    for m in lista():
+        if m["tipo"] == "texto" and Path(m["caminho"]).exists():
+            v = _pontua(f"{m['nome']} {m['repo']} {m['arquivo']}", tk)
+            if v > pts:
+                melhor, pts = {"id": m["id"], "nome": m["nome"], "perfil": False}, v
+    return melhor if pts >= 0.999 else None

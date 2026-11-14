@@ -21,6 +21,8 @@ import subprocess
 import sys
 import time
 
+import placa
+
 # (temperatura em °C, ventoinha em %). Entre os pontos, interpola.
 CURVA_GPU = [(35, 30), (45, 42), (55, 58), (62, 72), (70, 88), (76, 100)]
 CURVA_CPU = [(35, 30), (45, 42), (55, 58), (62, 72), (70, 88), (76, 100)]
@@ -252,6 +254,12 @@ def candidatos():
     """Todas as saídas PWM (com ventoinha e modo manual disponíveis) dos chips da placa-mãe."""
     saida = []
     for d in sorted(glob.glob(f"{HWMON}/hwmon*")):
+        try:
+            chip = _ler(f"{d}/name")
+        except OSError:
+            chip = ""
+        if chip in ("amdgpu", "radeon", "nouveau"):   # ventoinha da placa de vídeo: quem cuida é a classe da GPU
+            continue
         for p in sorted(glob.glob(f"{d}/pwm[0-9]*")):
             m = re.search(r"/pwm(\d+)$", p)
             if not m:
@@ -379,7 +387,9 @@ def grava_status(estado):
 
 
 def main():
-    gpu = GpuNvidia()
+    amd = placa.acha_amd()
+    gpu = amd if amd else GpuNvidia()
+    print(f"[fanctl] placa de vídeo: {amd.nome() + ' (AMD, via amdgpu)' if amd else 'NVIDIA'}", flush=True)
     pwms = descobre_pwms()
     ctl = Controlador(gpu, pwms)
 

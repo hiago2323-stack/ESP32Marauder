@@ -77,6 +77,9 @@ STT_DICA = os.environ.get(
     "Wi-Fi, Bluetooth, firmware, GPU, CPU, Python, Linux, Kotlin, Java.",
 )
 
+# Limpeza do áudio (ffmpeg: tira ruído grave e chiado, nivela o volume) antes de reconhecer a fala. STT_FILTRO=0 desliga.
+STT_FILTRO = os.environ.get("STT_FILTRO", "1") != "0"
+
 # Texto -> voz, voz FEMININA (Kokoro, pt-BR). Se os arquivos não existirem, cai no Piper (masculina).
 # Vozes pt-BR do Kokoro: pf_dora (feminina), pm_alex e pm_santa (masculinas)
 KOKORO_MODEL = Path(os.environ.get("KOKORO_MODEL", str(HOME / "models" / "kokoro-v1.0.onnx")))
@@ -96,7 +99,11 @@ SYSTEM_PROMPT = os.environ.get(
     "sem avisos desnecessários e sem rodeios: trate o usuário como um adulto capaz. "
     "Entenda os pedidos de forma sumária: capte a essência de pedidos curtos ou vagos (por exemplo, "
     "\"app de lista\" ou \"gato astronauta\"), assuma padrões sensatos e entregue em vez de devolver perguntas; "
-    "só pergunte se faltar algo sem o qual não dá para fazer. Respostas curtas e objetivas, com detalhes só se pedirem.",
+    "só pergunte se faltar algo sem o qual não dá para fazer. Respostas curtas e objetivas, com detalhes só se pedirem. "
+    "O usuário muitas vezes fala em vez de digitar, e a fala vira texto automaticamente: pode haver palavras trocadas por "
+    "outras de som parecido, termos em inglês escritos errado, números por extenso e pontuação ausente. Interprete pelo "
+    "contexto o que a pessoa quis dizer (por exemplo, \"i esse pe trinta e dois\" é ESP32) e responda ao pedido real, "
+    "sem comentar o erro de transcrição.",
 )
 
 # Banco da memória de longo prazo (o que o usuário ensina e o que a IA aprende)
@@ -159,6 +166,16 @@ VIDEO_ARQUIVOS = {
             "url": f"{_HF}/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/vae/wan_2.1_vae.safetensors"},
 }
 VIDEO_FPS = 16
+
+# ---- Visão: foto do usuário e imagens anexadas ----
+# Modelo que "enxerga" (Qwen2.5-VL 3B, Apache-2.0, ~2,8 GB). Roda na CPU, só durante a análise, e é desligado em seguida.
+VISAO_REPO = os.environ.get("VISAO_REPO", "ggml-org/Qwen2.5-VL-3B-Instruct-GGUF")
+VISAO_ARQUIVOS = ["Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf", "mmproj-Qwen2.5-VL-3B-Instruct-Q8_0.gguf"]
+VISAO_TAM = 1930000000 + 840000000
+VISAO_PORTA = int(os.environ.get("VISAO_PORTA", "8082"))
+LLAMA_SERVER_BIN = Path(os.environ.get("LLAMA_SERVER_BIN", str(HOME / "llama.cpp" / "build" / "bin" / "llama-server")))
+# Foto e nome do usuário (ficam só neste PC)
+PERFIL_DIR = Path(os.environ.get("PERFIL_DIR", str(HOME / "localai" / "perfil")))
 EOF
   cat > main.py <<'EOF'
 """Servidor do PC: conversa com o modelo, pesquisa na web e compila projetos Android.
@@ -203,6 +220,8 @@ from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, Uplo
 from fastapi.responses import FileResponse, RedirectResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
+import agente
+import aprendizado
 import androidgen
 import biblioteca
 import codegen
@@ -212,6 +231,7 @@ import esp32gen
 import imagens
 import memory
 import modelos
+import perfil
 import perfis
 import recursos
 import telemetria
@@ -377,7 +397,8 @@ async def _build_messages(req: ChatRequest) -> tuple[list[dict], int]:
     entre um turno e outro, e o llama-server reaproveita o que já calculou (cache do prompt), em vez
     de reprocessar tudo a cada pergunta.
     """
-    system = f"{config.SYSTEM_PROMPT}\nData de hoje: {date.today().isoformat()}."
+    sobre = perfil.contexto()   # nome e aparência do usuário (muda raramente: não atrapalha o cache do prompt)
+    system = f"{config.SYSTEM_PROMPT}\nData de hoje: {date.today().isoformat()}." + (f"\n{sobre}" if sobre else "")
     msgs = [{"role": "system", "content": system}] + [dict(m) for m in req.messages]
     ultimo = next((i for i in range(len(msgs) - 1, -1, -1) if msgs[i].get("role") == "user"), None)
     if ultimo is None:
@@ -429,13 +450,35 @@ async def _build_messages(req: ChatRequest) -> tuple[list[dict], int]:
     return msgs, n_web
 
 
+def _sse_texto(texto: str):
+    """Resposta pronta (não vinda do modelo) no mesmo formato de streaming da conversa."""
+    async def gen():
+        for i in range(0, len(texto), 24):
+            yield f"data: {json.dumps({'choices': [{'delta': {'content': texto[i:i + 24]}}]})}\n\n".encode()
+        yield b"data: [DONE]\n\n"
+    return gen()
+
+
 @app.post("/chat", dependencies=[Depends(require_token)])
 async def chat(req: ChatRequest):
+    ultimo = next((m for m in reversed(req.messages) if m.get("role") == "user"), None)
+    if ultimo and not req.anexos and isinstance(ultimo.get("content"), str):
+        resposta = await agente.tenta(ultimo["content"])   # "instala o modelo X", "volta pro rápido"...
+        if resposta is not None:
+            return StreamingResponse(_sse_texto(resposta), media_type="text/event-stream", headers={"X-Web-Results": "0"})
     messages, n_web = await _build_messages(req)
     payload = {"messages": messages, "max_tokens": req.max_tokens, "temperature": req.temperature,
-               "top_p": 0.9, "repeat_penalty": 1.05, "cache_prompt": True, "stream": True}
+               "top_p": 0.9, "top_k": 40, "min_p": 0.05, "repeat_penalty": 1.05, "cache_prompt": True, "stream": True}
 
     async def stream():
+        aprendizado.ativos += 1
+        try:
+            async for pedaco in _stream_modelo(payload):
+                yield pedaco
+        finally:
+            aprendizado.ativos -= 1
+
+    async def _stream_modelo(payload):
         async with httpx.AsyncClient(timeout=None) as client:
             try:
                 async with client.stream(
@@ -554,6 +597,66 @@ async def modelos_apagar(req: PerfilReq):
     except ValueError as e:
         raise HTTPException(400, str(e))
     return {"ok": True}
+
+
+# ----------------------------------------------------------------------------- perfil: nome e foto do usuário
+class PerfilNome(BaseModel):
+    nome: str = ""
+
+
+class PerfilDescricao(BaseModel):
+    descricao: str = ""
+
+
+@app.get("/perfil", dependencies=[Depends(require_token)])
+async def perfil_info():
+    return perfil.estado()
+
+
+@app.post("/perfil", dependencies=[Depends(require_token)])
+async def perfil_nome(req: PerfilNome):
+    perfil.define_nome(req.nome)
+    return perfil.estado()
+
+
+@app.post("/perfil/descricao", dependencies=[Depends(require_token)])
+async def perfil_descricao(req: PerfilDescricao):
+    perfil.define_descricao(req.descricao)
+    return perfil.estado()
+
+
+@app.post("/perfil/foto", dependencies=[Depends(require_token)])
+async def perfil_foto(foto: UploadFile = File(...)):
+    dados = await foto.read()
+    try:
+        perfil.salva_foto(dados, Path(foto.filename or "").suffix or ".jpg")
+        perfil.analisar()
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return perfil.estado()
+
+
+@app.post("/perfil/analisar", dependencies=[Depends(require_token)])
+async def perfil_analisar():
+    try:
+        perfil.analisar()
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return perfil.estado()
+
+
+@app.get("/perfil/foto", dependencies=[Depends(require_token)])
+async def perfil_foto_arquivo():
+    f = perfil.caminho_foto()
+    if not f:
+        raise HTTPException(404, "Sem foto.")
+    return FileResponse(f, headers={"Cache-Control": "no-store"})
+
+
+@app.delete("/perfil", dependencies=[Depends(require_token)])
+async def perfil_apaga():
+    perfil.apaga()
+    return perfil.estado()
 
 
 @app.get("/imagem/modelos", dependencies=[Depends(require_token)])
@@ -852,6 +955,17 @@ async def memory_add(item: MemoryIn):
         raise HTTPException(400, str(e))
 
 
+class AprenderReq(BaseModel):
+    pergunta: str
+    resposta: str = ""
+
+
+@app.post("/aprender", dependencies=[Depends(require_token)])
+async def aprender(req: AprenderReq):
+    """A tela chama depois de cada resposta (se 'Aprender sozinha' estiver ligado). Devolve o que foi guardado."""
+    return {"fatos": await aprendizado.aprende(req.pergunta, req.resposta)}
+
+
 @app.delete("/memory/{mem_id}", dependencies=[Depends(require_token)])
 async def memory_delete(mem_id: int):
     await asyncio.to_thread(memory.delete, mem_id)
@@ -892,18 +1006,45 @@ def _carrega_whisper():
         return WhisperModel(config.WHISPER_FALLBACK, device="cpu", compute_type="int8", cpu_threads=nucleos)
 
 
+def _limpa_audio(path: str) -> str | None:
+    """Prepara a gravação para o Whisper: 16 kHz mono, tira graves de ruído (ventoinha, mesa), reduz o
+    chiado e nivela o volume (fala baixa ou longe do microfone vira legível). Devolve o .wav limpo, ou
+    None se o ffmpeg não existe ou falhou (aí o áudio original é usado, sem perda)."""
+    if not config.STT_FILTRO or not shutil.which("ffmpeg"):
+        return None
+    saida = path + ".limpo.wav"
+    filtro = "highpass=f=80,afftdn=nf=-30,loudnorm=I=-16:TP=-1.5:LRA=11"
+    try:
+        r = subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", path, "-af", filtro,
+                            "-ar", "16000", "-ac", "1", saida], capture_output=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0 or not os.path.exists(saida) or os.path.getsize(saida) < 1000:
+        Path(saida).unlink(missing_ok=True)
+        return None
+    return saida
+
+
 def _stt_sync(path: str) -> str:
     global _whisper
-    with _voice_lock:
-        if _whisper is None:
-            _whisper = _carrega_whisper()
-            recursos.registra("whisper", _descarrega_whisper)
-        recursos.usou("whisper")
-        segments, _ = _whisper.transcribe(
-            path, language="pt", beam_size=5, vad_filter=True,
-            vad_parameters={"min_silence_duration_ms": 500},
-            initial_prompt=config.STT_DICA, condition_on_previous_text=False)
-        return " ".join(s.text.strip() for s in segments).strip()
+    limpo = _limpa_audio(path)
+    try:
+        with _voice_lock:
+            if _whisper is None:
+                _whisper = _carrega_whisper()
+                recursos.registra("whisper", _descarrega_whisper)
+            recursos.usou("whisper")
+            segments, _ = _whisper.transcribe(
+                limpo or path, language="pt", beam_size=5, best_of=5,
+                temperature=[0.0, 0.2, 0.4],           # se a primeira tentativa sair ruim, tenta de novo
+                vad_filter=True,
+                vad_parameters={"threshold": 0.45, "min_silence_duration_ms": 600, "speech_pad_ms": 300},
+                initial_prompt=config.STT_DICA, condition_on_previous_text=False,
+                no_speech_threshold=0.5, compression_ratio_threshold=2.2, log_prob_threshold=-1.0)
+            return " ".join(s.text.strip() for s in segments).strip()
+    finally:
+        if limpo:
+            Path(limpo).unlink(missing_ok=True)
 
 
 def _get_kokoro():
@@ -2053,6 +2194,7 @@ import json
 import os
 import subprocess
 
+import placa
 import recursos
 import time
 from pathlib import Path
@@ -2068,6 +2210,9 @@ def _num(s: str):
 
 
 def _gpu() -> dict | None:
+    amd = placa.acha_amd()
+    if amd:   # placa AMD (ex.: RX 580): lê pelo /sys
+        return amd.resumo()
     try:
         r = subprocess.run(
             ["nvidia-smi", "--query-gpu=temperature.gpu,utilization.gpu,memory.used,memory.total,fan.speed,power.draw,name",
@@ -2201,6 +2346,8 @@ import signal
 import subprocess
 import sys
 import time
+
+import placa
 
 # (temperatura em °C, ventoinha em %). Entre os pontos, interpola.
 CURVA_GPU = [(35, 30), (45, 42), (55, 58), (62, 72), (70, 88), (76, 100)]
@@ -2433,6 +2580,12 @@ def candidatos():
     """Todas as saídas PWM (com ventoinha e modo manual disponíveis) dos chips da placa-mãe."""
     saida = []
     for d in sorted(glob.glob(f"{HWMON}/hwmon*")):
+        try:
+            chip = _ler(f"{d}/name")
+        except OSError:
+            chip = ""
+        if chip in ("amdgpu", "radeon", "nouveau"):   # ventoinha da placa de vídeo: quem cuida é a classe da GPU
+            continue
         for p in sorted(glob.glob(f"{d}/pwm[0-9]*")):
             m = re.search(r"/pwm(\d+)$", p)
             if not m:
@@ -2560,7 +2713,9 @@ def grava_status(estado):
 
 
 def main():
-    gpu = GpuNvidia()
+    amd = placa.acha_amd()
+    gpu = amd if amd else GpuNvidia()
+    print(f"[fanctl] placa de vídeo: {amd.nome() + ' (AMD, via amdgpu)' if amd else 'NVIDIA'}", flush=True)
     pwms = descobre_pwms()
     ctl = Controlador(gpu, pwms)
 
@@ -2615,6 +2770,7 @@ import time
 from pathlib import Path
 
 import config
+import placa
 
 # Trabalhos pesados (compilar, gerar imagem, criar app/firmware): um de cada vez.
 pesado = asyncio.Lock()
@@ -2648,7 +2804,7 @@ def ram_livre_mb() -> int:
 
 
 def vram_livre_mb() -> int | None:
-    """VRAM livre da GPU NVIDIA em MiB, ou None se não houver GPU/nvidia-smi."""
+    """VRAM livre da GPU em MiB (NVIDIA pelo nvidia-smi, AMD pelo /sys), ou None se não houver placa."""
     try:
         r = subprocess.run(["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
                            capture_output=True, text=True, timeout=3)
@@ -2656,7 +2812,8 @@ def vram_livre_mb() -> int | None:
             return int(float(r.stdout.strip().splitlines()[0]))
     except (OSError, subprocess.TimeoutExpired, ValueError):
         pass
-    return None
+    amd = placa.acha_amd()
+    return amd.vram_livre_mb() if amd else None
 
 
 def baixa_prioridade(cmd: list[str]) -> list[str]:
@@ -4958,6 +5115,8 @@ def _salva(itens: list[dict]) -> None:
 
 
 def _pasta(tipo: str) -> Path:
+    if tipo == "visao":
+        return config.MODELS_DIR / "visao"
     return config.MODELS_DIR / "imagens" if tipo == "imagem" else config.MODELS_DIR
 
 
@@ -5123,9 +5282,17 @@ async def arquivos(repo: str, tipo: str = "texto") -> list[dict]:
             continue
         m = PARTE_RE.match(n)
         base = (m.group(1) + ".gguf") if m else n
-        g = grupos.setdefault(base, {"nome": base, "arquivos": [], "tam": 0, "quant": _quant(base)})
-        g["arquivos"].append(n)
-        g["tam"] += f.get("size") or 0
+        g = grupos.setdefault(base, {"nome": base, "inteiro": None, "partes": [], "quant": _quant(base)})
+        if m:
+            g["partes"].append((n, f.get("size") or 0))
+        else:
+            g["inteiro"] = (n, f.get("size") or 0)
+    # Alguns repositórios (ex.: Qwen) publicam a mesma quantização inteira E dividida em partes: baixar os dois
+    # dobraria o tamanho. Havendo o arquivo inteiro, ele vale; senão, vale o conjunto de partes.
+    for g in grupos.values():
+        usados = [g["inteiro"]] if g["inteiro"] else g["partes"]
+        g["arquivos"] = [n for n, _ in usados]
+        g["tam"] = sum(t for _, t in usados)
     itens = sorted(grupos.values(), key=lambda g: g["tam"])
     partes = re.search(r"(?i)flux|sd3|sd-?3\.5|z-?image|qwen-?image|hidream|chroma|wan2|lumina|cosmos|kontext", repo)
     for g in itens:
@@ -5220,6 +5387,12 @@ async def _baixa(job: dict, repo: str, tipo: str, nome: str, arquivos_: list[str
             item["compativel"], item["motivo"] = await asyncio.to_thread(sd_completo, primeiro)
         itens.append(item)
         _salva(itens)
+        if job.get("usar_depois") and tipo == "texto":   # pediram "instala e já deixa selecionado"
+            try:
+                await asyncio.to_thread(usar, job["id"])
+                job["selecionado"] = True
+            except Exception as e:   # baixou, mas não deu para trocar sozinho: o modelo fica na lista
+                job["aviso"] = str(e)[:240]
     except asyncio.CancelledError:
         raise
     except Exception as e:
@@ -5228,7 +5401,7 @@ async def _baixa(job: dict, repo: str, tipo: str, nome: str, arquivos_: list[str
         job["fim"] = True
 
 
-def baixar(repo: str, arquivos_: list[str], tipo: str = "texto", total: int = 0) -> str:
+def baixar(repo: str, arquivos_: list[str], tipo: str = "texto", total: int = 0, usar_depois: bool = False) -> str:
     if not REPO_RE.match(repo) or not arquivos_ or any(not ARQ_RE.match(a) or ".." in a for a in arquivos_):
         raise ValueError("Pedido inválido.")
     id_ = _id(repo, arquivos_[0])
@@ -5241,7 +5414,8 @@ def baixar(repo: str, arquivos_: list[str], tipo: str = "texto", total: int = 0)
         raise ValueError(f"Falta espaço no disco: preciso de uns {total / 1e9:.1f} GB livres.")
     nome = repo.split("/")[-1].replace("-GGUF", "").replace("_GGUF", "")
     job = {"id": id_, "repo": repo, "tipo": tipo, "arquivos": [Path(a).name for a in arquivos_], "tam": total,
-           "pasta": pasta, "fim": False, "erro": ""}
+           "pasta": pasta, "fim": False, "erro": "", "usar_depois": usar_depois,
+           "selecionado": False, "aviso": ""}
     job["task"] = asyncio.get_running_loop().create_task(_baixa(job, repo, tipo, nome, arquivos_))
     _baixando[id_] = job
     return id_
@@ -5257,7 +5431,8 @@ def estado() -> dict:
             p = f.with_suffix(".gguf.part")
             feito += f.stat().st_size if f.exists() else (p.stat().st_size if p.exists() else 0)
         andamento.append({"id": id_, "repo": j["repo"], "tipo": j["tipo"], "progresso": round(min(feito / j["tam"], 1.0), 3) if j["tam"] else 0,
-                          "feito": feito, "tam": j["tam"], "fim": j["fim"], "erro": j["erro"]})
+                          "feito": feito, "tam": j["tam"], "fim": j["fim"], "erro": j["erro"],
+                          "selecionado": j.get("selecionado", False), "aviso": j.get("aviso", "")})
         if j["fim"] and not j["erro"] and any(m["id"] == id_ for m in lista()):
             _baixando.pop(id_, None)
     return {"baixando": andamento, "modelos": lista()}
@@ -5313,6 +5488,747 @@ def usar(id_: str) -> None:
     if r is None or r.returncode != 0:
         raise RuntimeError("Salvei a escolha, mas não consegui reiniciar o modelo sozinho. "
                            "Rode no PC: bash atualizar.sh (ele libera essa permissão) ou sudo systemctl restart localai-llm")
+
+
+# ------------------------------------------------------------------ "ache, instale e já deixe selecionado"
+_RUIDO = {"gguf", "modelo", "modelos", "llm", "llms", "ia", "ias", "o", "a", "os", "as", "de", "da", "do", "um", "uma",
+          "pra", "para", "no", "na", "me", "meu", "minha", "the", "model", "hugging", "face", "huggingface"}
+_QUANT_PEDIDA = re.compile(r"(?i)(?<![\w.])(iq\d_\w+|q\d(?:_k)?(?:_[sml01])?|bf16|f16)(?![\w.])")
+
+
+def separa_pedido(q: str) -> tuple[str, str]:
+    """('qwen2.5 coder 14b q5_k_m') -> ('qwen2.5 coder 14b', 'Q5_K_M'). Links e 'dono/repo:Q4_K_M' ficam como estão."""
+    q = q.strip()
+    if _repo_de(q):
+        return q.split(":")[0] if not q.startswith("http") else q, (q.split(":")[1].upper() if ":" in q and not q.startswith("http") else "")
+    m = _QUANT_PEDIDA.search(q)
+    quant = m.group(1).upper() if m else ""
+    if m:
+        q = (q[:m.start()] + " " + q[m.end():]).strip()
+    return re.sub(r"\s+", " ", q), quant
+
+
+def _tokens(q: str) -> list[str]:
+    return [t for t in re.split(r"[^a-z0-9.]+", q.lower()) if t and t not in _RUIDO]
+
+
+def _pontua(repo: str, tokens: list[str]) -> float:
+    r = repo.lower()
+    return sum(t in r for t in tokens) / len(tokens) if tokens else 0.0
+
+
+def escolhe_repo(candidatos: list[dict], q: str) -> tuple[dict | None, bool]:
+    """Entre os resultados da busca, o que contém TODAS as palavras do pedido e tem mais downloads.
+    Se nenhum contém todas, devolve o que casa mais (aproximado=True)."""
+    tk = _tokens(q)
+    if not candidatos:
+        return None, False
+    pont = [(_pontua(c["repo"], tk), c.get("downloads", 0), c) for c in candidatos]
+    completos = [p for p in pont if p[0] >= 0.999]
+    if completos:
+        return max(completos, key=lambda p: p[1])[2], False
+    return max(pont, key=lambda p: (p[0], p[1]))[2], True
+
+
+def _escolhe_arquivo(itens: list[dict], quant: str) -> dict | None:
+    if quant:
+        q = next((g for g in itens if g["quant"] == quant), None) or \
+            next((g for g in itens if g["quant"].startswith(quant)), None)
+        if q:
+            return q
+    return next((g for g in itens if g.get("recomendado")), itens[0] if itens else None)
+
+
+async def instalar_e_usar(pedido: str, tipo: str = "texto") -> dict:
+    """Acha o modelo pelo nome, escolhe a versão que cabe no PC, baixa e, ao terminar, deixa selecionado.
+
+    Devolve {estado: 'baixando'|'pronto', repo, arquivo, tam, aviso, alternativas, aproximado, quant_pedida_ok}.
+    Se o modelo já estava baixado, só passa a usá-lo (estado 'pronto')."""
+    nome, quant = separa_pedido(pedido)
+    if not nome:
+        raise ValueError("Diga o nome do modelo que você quer (por exemplo: qwen2.5 coder 7b).")
+    resultados = await buscar(nome, tipo, limite=30)
+    if not resultados:
+        raise ValueError(f"Não achei nada no Hugging Face para \"{nome}\".")
+    repo, aproximado = escolhe_repo(resultados, nome)
+    alternativas = [r["repo"] for r in resultados if r["repo"] != repo["repo"]][:3]
+    itens = await arquivos(repo["repo"], tipo)
+    if not itens:
+        raise ValueError(f"{repo['repo']} não tem arquivo .gguf para baixar.")
+    g = _escolhe_arquivo(itens, quant)
+    primeiro = Path(g["arquivos"][0]).name
+    info = {"repo": repo["repo"], "arquivo": g["nome"], "quant": g["quant"], "tam": g["tam"], "aviso": g["aviso"],
+            "alternativas": alternativas, "aproximado": aproximado, "quant_pedida_ok": (not quant) or g["quant"].startswith(quant)}
+    ja = next((m for m in lista() if m["repo"] == repo["repo"] and m["arquivo"] == primeiro
+               and Path(m["caminho"]).exists() and m["tipo"] == tipo), None)
+    if ja:
+        await asyncio.to_thread(usar, ja["id"])
+        return {**info, "estado": "pronto", "id": ja["id"]}
+    id_ = baixar(repo["repo"], g["arquivos"], tipo, g["tam"], usar_depois=True)
+    return {**info, "estado": "baixando", "id": id_}
+
+
+def acha_instalado(pedido: str) -> dict | None:
+    """Procura, entre o que já está no PC (perfis e modelos adicionados), o que casa com o pedido."""
+    import perfis
+    tk = _tokens(separa_pedido(pedido)[0])
+    if not tk:
+        return None
+    melhor, pts = None, 0.0
+    for id_, p in perfis.PERFIS.items():
+        if perfis.presente(p):
+            v = _pontua(f"{p['nome']} {p['modelo']} {p['arquivo']}", tk)
+            if v > pts:
+                melhor, pts = {"id": id_, "nome": p["modelo"], "perfil": True}, v
+    for m in lista():
+        if m["tipo"] == "texto" and Path(m["caminho"]).exists():
+            v = _pontua(f"{m['nome']} {m['repo']} {m['arquivo']}", tk)
+            if v > pts:
+                melhor, pts = {"id": m["id"], "nome": m["nome"], "perfil": False}, v
+    return melhor if pts >= 0.999 else None
+EOF
+  cat > agente.py <<'EOF'
+"""Entende pedidos em linguagem livre e executa (sem frases fixas): trocar, achar e instalar modelos de IA.
+
+Fluxo: um filtro barato decide se a mensagem PODE ser um comando sobre modelos de IA; só então a própria IA local
+interpreta o pedido (JSON curto). Se ela estiver desligada ou reiniciando, regras simples fazem o mesmo.
+Mensagens que não são comandos seguem a conversa normal (devolve None).
+"""
+import json
+import re
+
+import httpx
+
+import config
+import modelos
+import perfis
+
+# a mensagem fala de modelos de IA (palavra genérica ou nome de família conhecida)...
+ASSUNTO = re.compile(r"(?i)\b(modelos?|llms?|gguf|hugging ?face|ias?|llama|qwen|mistral|mixtral|gemma|phi|deepseek|"
+                     r"granite|smollm|olmo|falcon|starcoder|codestral|nemotron|hermes|dolphin|tinyllama|yi|solar|"
+                     r"stable ?diffusion|sdxl|flux)\b")
+# ...e pede uma ação
+ACAO = re.compile(r"(?i)\b(instal\w*|baix\w*|coloc\w*|bot[ae]\w*|troc\w*|mud\w*|us(?:e|ar|a|ando)|ativ\w*|selecion\w*|"
+                  r"test\w*|carreg\w*|quero|queria|procur\w*|ach\w*|busc\w*|traz\w*|pega\w*|trabalh\w*|lista\w*|mostr\w*|"
+                  r"quais|qual)\b")
+FILLER = {"instala", "instale", "instalar", "baixa", "baixe", "baixar", "coloca", "coloque", "colocar", "bota", "bote",
+          "botar", "troca", "troque", "trocar", "muda", "mude", "mudar", "usa", "use", "usar", "ativa", "ative", "ativar",
+          "seleciona", "selecione", "selecionar", "testa", "teste", "testar", "carrega", "carregue", "carregar", "quero",
+          "queria", "procura", "procure", "procurar", "acha", "ache", "achar", "busca", "busque", "buscar", "traz", "traga",
+          "pega", "pegue", "pegar", "agora", "aí", "ai", "por", "favor", "pf", "pfv", "eu", "pra", "para", "que", "esse",
+          "este", "essa", "esta", "aquele", "aquela", "meu", "minha", "no", "na", "de", "da", "do", "um", "uma", "o", "a",
+          "os", "as", "e", "ou", "modelo", "modelos", "llm", "llms", "ia", "ias", "online", "internet", "hugging", "face",
+          "huggingface", "gguf", "já", "ja", "deixa", "deixe", "deixar", "selecionado", "selecionada", "testando", "teste"}
+
+SISTEMA = (
+    "Você decide se a mensagem do usuário é um PEDIDO para gerenciar modelos de IA neste computador. "
+    "Responda SOMENTE um JSON: {\"acao\": ..., \"consulta\": ..., \"tipo\": ...}.\n"
+    "acao: \"instalar_modelo\" (achar na internet/baixar/instalar/testar um modelo que talvez não esteja no PC), "
+    "\"usar_modelo\" (trocar para um modelo já instalado), \"listar_modelos\" (ver o que está instalado ou em uso), "
+    "\"nenhuma\" (qualquer outra coisa: perguntas sobre IA, conversa, explicações).\n"
+    "consulta: o nome do modelo como se digitaria numa busca (ex.: \"qwen2.5 coder 14b\"), sem verbos nem enfeites; "
+    "vazio se não houver.\n"
+    "tipo: \"texto\" (conversa/código) ou \"imagem\" (gera imagens, ex.: stable diffusion).\n"
+    "Exemplos:\n"
+    "\"bota o qwen coder de 14b pra eu testar\" -> {\"acao\":\"instalar_modelo\",\"consulta\":\"qwen2.5 coder 14b\",\"tipo\":\"texto\"}\n"
+    "\"quero testar o deepseek r1 pequeno\" -> {\"acao\":\"instalar_modelo\",\"consulta\":\"deepseek r1 distill 7b\",\"tipo\":\"texto\"}\n"
+    "\"volta pro modelo rápido\" -> {\"acao\":\"usar_modelo\",\"consulta\":\"rápido\",\"tipo\":\"texto\"}\n"
+    "\"que modelos eu tenho?\" -> {\"acao\":\"listar_modelos\",\"consulta\":\"\",\"tipo\":\"texto\"}\n"
+    "\"o que é um LLM?\" -> {\"acao\":\"nenhuma\",\"consulta\":\"\",\"tipo\":\"texto\"}"
+)
+ACOES = {"instalar_modelo", "usar_modelo", "listar_modelos", "nenhuma"}
+
+
+def parece_comando(msg: str) -> bool:
+    return 3 <= len(msg) <= 400 and bool(ASSUNTO.search(msg)) and bool(ACAO.search(msg))
+
+
+def heuristica(msg: str) -> dict:
+    """Plano B sem IA: tira os verbos e enfeites e fica com o nome do modelo."""
+    if re.search(r"(?i)\b(que|quais|qual)\b.*\bmodelos?\b.*\b(tenho|tem|instalad\w+|uso|usando)\b|"
+                 r"\b(lista\w*|mostr\w*)\b.*\bmodelos?\b", msg):
+        return {"acao": "listar_modelos", "consulta": "", "tipo": "texto"}
+    if msg.strip().endswith("?"):   # pergunta, não pedido
+        return {"acao": "nenhuma", "consulta": "", "tipo": "texto"}
+    palavras = [p for p in re.split(r"[^\w.\-/:+]+", msg) if p]
+    resto = [p for p in palavras if p.lower() not in FILLER]
+    tipo = "imagem" if re.search(r"(?i)stable ?diffusion|sdxl|flux|imagens?", msg) else "texto"
+    if not resto or not ACAO.search(msg):
+        return {"acao": "nenhuma", "consulta": "", "tipo": "texto"}
+    return {"acao": "instalar_modelo", "consulta": " ".join(resto), "tipo": tipo}
+
+
+async def interpreta(msg: str) -> dict:
+    payload = {"messages": [{"role": "system", "content": SISTEMA}, {"role": "user", "content": msg}],
+               "temperature": 0, "max_tokens": 120, "cache_prompt": True,
+               "response_format": {"type": "json_object"}}
+    try:
+        async with httpx.AsyncClient(timeout=25) as c:
+            r = await c.post(f"{config.LLAMA_URL}/v1/chat/completions", json=payload)
+        r.raise_for_status()
+        txt = r.json()["choices"][0]["message"]["content"]
+        j = json.loads(txt[txt.index("{"):txt.rindex("}") + 1])
+        if j.get("acao") in ACOES:
+            return {"acao": j["acao"], "consulta": str(j.get("consulta") or "")[:120].strip(),
+                    "tipo": "imagem" if j.get("tipo") == "imagem" else "texto"}
+    except Exception:
+        pass
+    return heuristica(msg)
+
+
+def _gb(n: int) -> str:
+    return f"{n / 1e9:.1f} GB".replace(".", ",")
+
+
+async def _instalar(consulta: str, tipo: str) -> str:
+    try:
+        r = await modelos.instalar_e_usar(consulta, tipo)
+    except ValueError as e:
+        return f"Não consegui: {e}"
+    except httpx.HTTPError:
+        return "Não consegui falar com o Hugging Face agora. O PC está sem internet?"
+    linhas = []
+    nome = f"**{r['repo']}**" + (f" ({r['quant']}, {_gb(r['tam'])})" if r["quant"] else f" ({_gb(r['tam'])})")
+    if r["aproximado"]:
+        linhas.append(f"Não achei um modelo com exatamente esse nome; o mais parecido foi {nome}.")
+    else:
+        linhas.append(f"Achei {nome}.")
+    if not r["quant_pedida_ok"]:
+        linhas.append("Essa versão (quantização) não existe nesse repositório; escolhi a que cabe melhor no seu PC.")
+    if r["aviso"]:
+        linhas.append(f"⚠ {r['aviso']}")
+    if r["estado"] == "pronto":
+        linhas.append("Já estava baixado: passei a usar agora. O modelo recarrega em alguns minutos; é só testar depois.")
+    elif tipo == "imagem":
+        linhas.append("Estou baixando; quando terminar ele aparece na lista de modelos de imagem. "
+                      "Acompanhe em ⚙ Configurações › Modelo de IA.")
+    else:
+        linhas.append("Estou baixando agora. Quando terminar, **deixo selecionado e reinicio o modelo** para você testar "
+                      "(a conversa fica indisponível por alguns minutos nessa troca). Acompanhe em ⚙ Configurações › Modelo de IA.")
+    if r["alternativas"]:
+        linhas.append("Se não era esse, diga o nome exato ou cole o link do Hugging Face. Outros que apareceram: "
+                      + ", ".join(r["alternativas"]) + ".")
+    return "\n\n".join(linhas)
+
+
+async def _usar(consulta: str, tipo: str) -> str:
+    import asyncio
+    achado = modelos.acha_instalado(consulta)
+    if not achado:
+        return "Esse eu não tenho instalado. " + await _instalar(consulta, tipo)
+    try:
+        if achado["perfil"]:
+            await asyncio.to_thread(perfis.seleciona, achado["id"])
+        else:
+            await asyncio.to_thread(modelos.usar, achado["id"])
+    except (ValueError, RuntimeError) as e:
+        return f"Não consegui trocar: {e}"
+    return f"Troquei para **{achado['nome']}**. O modelo recarrega em alguns minutos; é só testar depois."
+
+
+def _lista() -> str:
+    atual = perfis._le_env().get("MODEL", "")
+    from pathlib import Path
+    em_uso = Path(atual).name if atual else ""
+    linhas = []
+    for p in perfis.lista():
+        if p["presente"]:
+            linhas.append(f"- {p['modelo']} ({p['nome']})" + (" ← em uso" if p["id"] == perfis.atual() else ""))
+    for m in modelos.lista():
+        if m["tipo"] == "texto":
+            linhas.append(f"- {m['nome']} ({m.get('quant') or '?'}, {_gb(m['tam'])})" + (" ← em uso" if m["arquivo"] == em_uso else ""))
+    return "Modelos de texto instalados:\n" + ("\n".join(linhas) if linhas else "- nenhum") + \
+        "\n\nPara trazer outro, é só pedir: por exemplo, \"instala o gemma 3 4b\"."
+
+
+async def tenta(msg: str) -> str | None:
+    """Se a mensagem é um comando sobre modelos, executa e devolve a resposta; senão, None (conversa normal)."""
+    if not parece_comando(msg):
+        return None
+    it = await interpreta(msg)
+    if it["acao"] == "instalar_modelo" and it["consulta"]:
+        return await _instalar(it["consulta"], it["tipo"])
+    if it["acao"] == "usar_modelo" and it["consulta"]:
+        return await _usar(it["consulta"], it["tipo"])
+    if it["acao"] == "listar_modelos":
+        return _lista()
+    return None
+EOF
+  cat > visao.py <<'EOF'
+"""Visão: descreve uma imagem (a foto do usuário, imagens anexadas) com um modelo que enxerga.
+
+O modelo (Qwen2.5-VL 3B) é baixado na primeira vez. A análise sobe uma segunda cópia do llama-server só com ele,
+na CPU (a placa fica para o modelo de conversa), e a desliga em seguida: nada fica ocupando memória depois.
+"""
+import asyncio
+import base64
+import io
+import os
+import time
+
+import httpx
+
+import config
+import modelos
+import recursos
+
+PROMPT_FOTO = (
+    "Esta é uma foto do próprio usuário, que a enviou para a IA saber como ele é. Descreva em português do Brasil, "
+    "em 3 a 5 frases, apenas o que dá para ver: cabelo (cor, comprimento, estilo), barba ou bigode, óculos, faixa etária "
+    "aparente, expressão, roupa, acessórios e o fundo. Não adivinhe nome, etnia ou raça, saúde, religião, orientação ou "
+    "qualquer coisa que não esteja visível. Se não houver uma pessoa na foto, diga só isso."
+)
+
+
+def arquivos() -> tuple[str, str] | None:
+    pasta = config.MODELS_DIR / "visao"
+    m, p = (pasta / n for n in config.VISAO_ARQUIVOS)
+    return (str(m), str(p)) if m.exists() and p.exists() else None
+
+
+def pronto() -> bool:
+    return arquivos() is not None
+
+
+def baixar() -> str | None:
+    """Começa o download do modelo de visão (se ainda não existe). Devolve o id do download, ou None se já está pronto."""
+    if pronto():
+        return None
+    return modelos.baixar(config.VISAO_REPO, config.VISAO_ARQUIVOS, "visao", config.VISAO_TAM)
+
+
+def progresso() -> dict | None:
+    for j in modelos.estado()["baixando"]:
+        if j["tipo"] == "visao":
+            return j
+    return None
+
+
+def _jpeg_pequeno(caminho, maximo: int = 896) -> str:
+    """A imagem reduzida (lado maior 896 px) em base64: foto de celular em tamanho cheio deixaria a análise lentíssima."""
+    from PIL import Image, ImageOps
+    with Image.open(caminho) as im:
+        im = ImageOps.exif_transpose(im).convert("RGB")
+        im.thumbnail((maximo, maximo))
+        buf = io.BytesIO()
+        im.save(buf, "JPEG", quality=88)
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+async def descreve(caminho, prompt: str = PROMPT_FOTO, espera_max: int = 240) -> str:
+    """Descreve a imagem. Levanta RuntimeError com uma mensagem em português se algo falhar."""
+    arq = arquivos()
+    if not arq:
+        raise RuntimeError("O modelo de visão ainda não foi baixado.")
+    if not config.LLAMA_SERVER_BIN.exists():
+        raise RuntimeError("Não achei o llama-server. Rode no PC: bash atualizar.sh")
+    b64 = await asyncio.to_thread(_jpeg_pequeno, caminho)
+    async with recursos.pesado:
+        recursos.garante_ram(4500, "analisar a imagem")
+        porta = config.VISAO_PORTA
+        proc = await asyncio.create_subprocess_exec(
+            str(config.LLAMA_SERVER_BIN), "-m", arq[0], "--mmproj", arq[1], "--host", "127.0.0.1", "--port", str(porta),
+            "-ngl", "0", "-c", "4096", "-t", str(recursos.nucleos_fisicos()),
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL, start_new_session=True)
+        try:
+            url = f"http://127.0.0.1:{porta}"
+            limite = time.time() + 180
+            async with httpx.AsyncClient(timeout=10) as c:
+                while True:
+                    if proc.returncode is not None:
+                        raise RuntimeError("O modelo de visão não iniciou (versão do llama.cpp sem suporte a imagens?). "
+                                           "Rode no PC: bash atualizar.sh")
+                    try:
+                        if (await c.get(f"{url}/health")).status_code == 200:
+                            break
+                    except httpx.HTTPError:
+                        pass
+                    if time.time() > limite:
+                        raise RuntimeError("O modelo de visão demorou demais para carregar.")
+                    await asyncio.sleep(1.5)
+            corpo = {"messages": [{"role": "user", "content": [
+                         {"type": "text", "text": prompt},
+                         {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + b64}}]}],
+                     "temperature": 0.1, "max_tokens": 350}
+            async with httpx.AsyncClient(timeout=espera_max) as c:
+                r = await c.post(f"{url}/v1/chat/completions", json=corpo)
+            if r.status_code != 200:
+                raise RuntimeError(f"O modelo de visão respondeu com erro {r.status_code}.")
+            return r.json()["choices"][0]["message"]["content"].strip()
+        except httpx.TimeoutException:
+            raise RuntimeError("A análise da imagem demorou demais.")
+        finally:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            await proc.wait()
+EOF
+  cat > perfil.py <<'EOF'
+"""Perfil do usuário: nome e foto. A IA descreve a foto uma vez (modelo de visão) e usa essa descrição para saber
+quem ele é e como é. Tudo fica só neste PC, em ~/localai/perfil, e pode ser corrigido ou apagado pela tela."""
+import asyncio
+import json
+import time
+from pathlib import Path
+
+import config
+import visao
+
+ARQ = lambda: config.PERFIL_DIR / "perfil.json"   # noqa: E731
+EXT = {".jpg", ".jpeg", ".png", ".webp"}
+_tarefa: asyncio.Task | None = None
+PADRAO = {"nome": "", "descricao": "", "foto": "", "estado": "vazio", "erro": ""}
+
+
+def le() -> dict:
+    try:
+        return {**PADRAO, **json.loads(ARQ().read_text())}
+    except (OSError, ValueError):
+        return dict(PADRAO)
+
+
+def _grava(p: dict) -> None:
+    config.PERFIL_DIR.mkdir(parents=True, exist_ok=True)
+    ARQ().write_text(json.dumps(p, ensure_ascii=False, indent=1))
+
+
+def _muda(**kw) -> dict:
+    p = {**le(), **kw}
+    _grava(p)
+    return p
+
+
+def estado() -> dict:
+    p = le()
+    ocupado = _tarefa is not None and not _tarefa.done()
+    if p["estado"] in ("baixando_visao", "descrevendo") and not ocupado:   # o servidor reiniciou no meio
+        p["estado"], p["erro"] = "interrompido", "A análise foi interrompida. Toque em \"Analisar de novo\"."
+    out = {"nome": p["nome"], "descricao": p["descricao"], "tem_foto": bool(p["foto"]) and Path(p["foto"]).exists(),
+           "estado": p["estado"], "erro": p["erro"], "progresso": None}
+    if p["estado"] == "baixando_visao":
+        j = visao.progresso()
+        out["progresso"] = j["progresso"] if j else None
+    return out
+
+
+def define_nome(nome: str) -> None:
+    _muda(nome=nome.strip()[:60])
+
+
+def define_descricao(txt: str) -> None:
+    _muda(descricao=txt.strip()[:1200], estado="pronto" if txt.strip() else le()["estado"], erro="")
+
+
+def caminho_foto() -> Path | None:
+    f = le()["foto"]
+    return Path(f) if f and Path(f).exists() else None
+
+
+def salva_foto(dados: bytes, ext: str) -> None:
+    ext = ext.lower()
+    if ext not in EXT:
+        raise ValueError("Use uma foto .jpg, .png ou .webp.")
+    if len(dados) > 25 * 1024 * 1024:
+        raise ValueError("A foto é grande demais (máximo 25 MB).")
+    config.PERFIL_DIR.mkdir(parents=True, exist_ok=True)
+    antiga = caminho_foto()
+    destino = config.PERFIL_DIR / f"foto-{int(time.time())}{ext}"
+    destino.write_bytes(dados)
+    if antiga and antiga != destino:
+        antiga.unlink(missing_ok=True)
+    _muda(foto=str(destino), descricao="", estado="descrevendo", erro="")
+
+
+def apaga() -> None:
+    f = caminho_foto()
+    if f:
+        f.unlink(missing_ok=True)
+    _grava(dict(PADRAO))
+
+
+def contexto() -> str:
+    """Texto para o prompt do sistema; vazio se o usuário não preencheu nada."""
+    p = le()
+    partes = []
+    if p["nome"]:
+        partes.append(f"O nome do usuário é {p['nome']}.")
+    if p["descricao"]:
+        partes.append(f"Aparência do usuário (descrita a partir da foto que ele mesmo enviou): {p['descricao']}")
+    return ("Sobre o usuário: " + " ".join(partes) + " Use isso com naturalidade, sem repetir sem necessidade.") if partes else ""
+
+
+async def _analisa() -> None:
+    try:
+        foto = caminho_foto()
+        if not foto:
+            _muda(estado="vazio", erro="")
+            return
+        if not visao.pronto():
+            _muda(estado="baixando_visao", erro="")
+            try:
+                visao.baixar()
+            except ValueError as e:
+                _muda(estado="erro", erro=str(e))
+                return
+            while not visao.pronto():
+                j = visao.progresso()
+                if j is None or j.get("erro"):
+                    _muda(estado="erro", erro=(j or {}).get("erro") or "O download do modelo de visão não terminou. Tente de novo.")
+                    return
+                await asyncio.sleep(3)
+        _muda(estado="descrevendo", erro="")
+        texto = await visao.descreve(foto)
+        if caminho_foto() == foto:   # a foto não foi trocada enquanto analisava
+            _muda(descricao=texto, estado="pronto", erro="")
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        _muda(estado="erro", erro=str(e)[:240])
+
+
+def analisar() -> None:
+    """Começa (ou recomeça) a análise da foto em segundo plano."""
+    global _tarefa
+    if _tarefa is not None and not _tarefa.done():
+        return
+    if not caminho_foto():
+        raise ValueError("Envie uma foto primeiro.")
+    _muda(estado="descrevendo", erro="")
+    _tarefa = asyncio.get_running_loop().create_task(_analisa())
+EOF
+  cat > placa.py <<'EOF'
+"""Placa de vídeo AMD (driver amdgpu): leitura e controle da ventoinha pelo /sys, sem programas extras.
+
+Para NVIDIA o servidor usa nvidia-smi/NVML; aqui fica o equivalente para AMD (ex.: RX 580). Se houver mais de uma
+AMD (a gráfica integrada do Ryzen e a placa dedicada), vale a de maior VRAM, que é a placa dedicada.
+Controle da ventoinha: pwm1_enable = 1 (manual) / 2 (automático da placa) e pwm1 de 0 a 255; precisa de root.
+"""
+import glob
+import os
+from pathlib import Path
+
+RAIZ = "/sys/class/drm"
+AMD = "0x1002"
+
+
+def _ler(p: Path) -> str | None:
+    try:
+        return p.read_text().strip()
+    except OSError:
+        return None
+
+
+def _int(p: Path) -> int | None:
+    v = _ler(p)
+    try:
+        return int(v) if v is not None else None
+    except ValueError:
+        return None
+
+
+class PlacaAmd:
+    def __init__(self, dev: Path):
+        self.dev = Path(dev)
+        hw = sorted(glob.glob(str(self.dev / "hwmon" / "hwmon*")))
+        self.hw = Path(hw[0]) if hw else None
+        self.metodo = None
+        self.erro = ""
+        self._manual = False
+
+    # ---- leitura
+    def nome(self) -> str:
+        return _ler(self.dev / "product_name") or "AMD Radeon"
+
+    def temp(self) -> float:
+        if self.hw:
+            for f in ("temp1_input", "temp2_input"):
+                v = _int(self.hw / f)
+                if v is not None:
+                    return v / 1000
+        raise OSError("sem sensor de temperatura da placa AMD")
+
+    def uso(self) -> float | None:
+        v = _int(self.dev / "gpu_busy_percent")
+        return None if v is None else float(v)
+
+    def vram_mb(self) -> tuple[int, int] | None:
+        """(usada, total) em MiB."""
+        t, u = _int(self.dev / "mem_info_vram_total"), _int(self.dev / "mem_info_vram_used")
+        return None if t is None else ((u or 0) // 1048576, t // 1048576)
+
+    def vram_livre_mb(self) -> int | None:
+        v = self.vram_mb()
+        return None if v is None else max(0, v[1] - v[0])
+
+    def ventoinha_pct(self) -> float | None:
+        if not self.hw:
+            return None
+        pwm = _int(self.hw / "pwm1")
+        if pwm is not None:
+            return round(100 * pwm / 255, 1)
+        rpm, mx = _int(self.hw / "fan1_input"), _int(self.hw / "fan1_max")
+        return round(100 * rpm / mx, 1) if rpm is not None and mx else None
+
+    def watts(self) -> float | None:
+        if self.hw:
+            for f in ("power1_average", "power1_input"):
+                v = _int(self.hw / f)
+                if v is not None:
+                    return round(v / 1e6, 1)
+        return None
+
+    def resumo(self) -> dict:
+        v = self.vram_mb()
+        try:
+            t = round(self.temp(), 1)
+        except OSError:
+            t = None
+        return {"nome": self.nome(), "temp": t, "uso": self.uso(), "mem_usada": v[0] if v else None,
+                "mem_total": v[1] if v else None, "ventoinha": self.ventoinha_pct(), "watts": self.watts()}
+
+    # ---- ventoinha (mesma interface do GpuNvidia do fanctl)
+    def definir(self, pct) -> None:
+        if not self.hw or not (self.hw / "pwm1_enable").exists():
+            self.metodo, self.erro = None, "esta placa AMD não expõe controle de ventoinha (pwm1)"
+            raise RuntimeError(self.erro)
+        try:
+            if not self._manual:
+                (self.hw / "pwm1_enable").write_text("1")   # 1 = manual
+                self._manual = True
+            lo, hi = _int(self.hw / "pwm1_min"), _int(self.hw / "pwm1_max")
+            valor = round(255 * max(0, min(100, pct)) / 100)
+            valor = max(lo or 0, min(hi if hi else 255, valor))
+            (self.hw / "pwm1").write_text(str(valor))
+            if self.metodo != "amdgpu":
+                print("[fanctl] GPU: controle da ventoinha via amdgpu (sysfs)", flush=True)
+            self.metodo, self.erro = "amdgpu", ""
+        except OSError as e:
+            self.metodo, self.erro = None, str(e)[:160]
+            raise RuntimeError(f"Não consegui controlar a ventoinha da placa AMD: {e}")
+
+    def restaurar(self) -> None:
+        """Devolve a ventoinha ao controle automático da placa."""
+        if self.hw and self._manual:
+            try:
+                (self.hw / "pwm1_enable").write_text("2")   # 2 = automático
+            except OSError as e:
+                print(f"[fanctl] aviso ao restaurar a GPU: {e}", flush=True)
+        self._manual = False
+        self.metodo = None
+
+
+def acha_amd(raiz: str = RAIZ) -> PlacaAmd | None:
+    melhor, tam = None, -1
+    for c in sorted(glob.glob(f"{raiz}/card[0-9]*")):
+        dev = Path(c) / "device"
+        if _ler(dev / "vendor") != AMD:
+            continue
+        t = _int(dev / "mem_info_vram_total")
+        if t is not None and t > tam:
+            melhor, tam = dev, t
+    return PlacaAmd(melhor) if melhor else None
+
+
+def fabricante(raiz: str = RAIZ) -> str | None:
+    import shutil
+    if acha_amd(raiz):
+        return "amd"
+    return "nvidia" if shutil.which("nvidia-smi") else None
+EOF
+  cat > aprendizado.py <<'EOF'
+"""Aprender sozinha, de forma limitada e visível: depois de uma conversa, guarda na memória fatos DURÁVEIS que o usuário
+afirmou sobre si (nome, projeto, equipamento, preferências). Nada de código: ela não altera a si mesma.
+
+Cuidados: (1) nunca guarda segredos (senhas, chaves, cartão, documentos); (2) só guarda o que se apoia no que o usuário
+escreveu (descarta invenção do modelo); (3) tudo aparece em 🧠 Memória com a etiqueta "aprendi sozinha" e pode ser apagado;
+(4) não atrapalha a conversa: se um chat está em andamento ou outro aprendizado já roda, simplesmente pula.
+"""
+import asyncio
+import json
+import re
+
+import httpx
+
+import config
+import memory
+
+FONTE = "aprendido"
+LIMITE_GUARDADOS = 200          # passando disso, os mais antigos "aprendidos" saem
+ativos = 0                      # conversas em andamento (main.py soma e subtrai)
+_rodando = False
+
+SEGREDO = re.compile(
+    r"(?i)(senha|password|passwd|\btoken\b|api[_ -]?key|chave (?:de )?(?:api|privada|pix)|secret|segredo|cart[aã]o|\bcvv\b|"
+    r"\bcpf\b|\bcnpj\b|\bpix\b|\bcnh\b|\d{3}\.?\d{3}\.?\d{3}-?\d{2}|(?:\d[ -]?){13,19}|sk-[A-Za-z0-9_-]{10,}|"
+    r"gh[pousr]_[A-Za-z0-9]{10,}|bearer\s+\S{10,}|-----BEGIN)")
+SENSIVEL = re.compile(r"(?i)(diagn[oó]stic|doen[cç]a|rem[eé]dio|depress|sal[aá]rio|dívida|divida|endere[cç]o|mora (?:na|no|em))")
+
+SISTEMA = (
+    "Você extrai o que vale lembrar sobre o USUÁRIO, a partir da mensagem dele. Responda SOMENTE um JSON: "
+    "{\"fatos\": [\"...\"]}, com no máximo 2 itens curtos em português, no formato \"O usuário ...\".\n"
+    "Vale: nome, profissão, projeto em andamento, equipamento que usa, gostos e como prefere as respostas "
+    "(só o que ELE afirmou sobre si ou pediu para lembrar).\n"
+    "Não vale: perguntas de curiosidade, tarefas pontuais, o que a IA respondeu, opiniões sobre terceiros, e dados sensíveis "
+    "(senhas, documentos, saúde, finanças, endereço). Se nada vale, devolva {\"fatos\": []}.\n"
+    "Exemplos:\n"
+    "\"meu PC tem uma RX 580 de 8 GB e eu uso Linux Mint\" -> {\"fatos\": [\"O usuário tem um PC com RX 580 de 8 GB e usa Linux Mint.\"]}\n"
+    "\"me explica o que é recursão\" -> {\"fatos\": []}")
+
+
+def _palavras(s: str) -> set[str]:
+    return {w for w in re.findall(r"[a-zà-ú0-9]{4,}", s.lower())}
+
+
+def _apoiado(fato: str, fala: str) -> bool:
+    """O fato precisa repetir pelo menos duas palavras relevantes (4+ letras) da fala do usuário."""
+    return len(_palavras(fato) & _palavras(fala)) >= 2
+
+
+def _poda() -> None:
+    antigos = [m for m in memory.list_all(1000) if m["source"] == FONTE]
+    for m in antigos[LIMITE_GUARDADOS:]:          # list_all vem do mais novo para o mais antigo
+        memory.delete(m["id"])
+
+
+async def _pergunta_ao_modelo(fala: str) -> list[str]:
+    corpo = {"messages": [{"role": "system", "content": SISTEMA}, {"role": "user", "content": fala[:1500]}],
+             "temperature": 0, "max_tokens": 160, "cache_prompt": True, "response_format": {"type": "json_object"}}
+    async with httpx.AsyncClient(timeout=25) as c:
+        r = await c.post(f"{config.LLAMA_URL}/v1/chat/completions", json=corpo)
+    r.raise_for_status()
+    txt = r.json()["choices"][0]["message"]["content"]
+    j = json.loads(txt[txt.index("{"):txt.rindex("}") + 1])
+    fatos = j.get("fatos")
+    return [f.strip() for f in fatos if isinstance(f, str)] if isinstance(fatos, list) else []
+
+
+async def aprende(pergunta: str, resposta: str = "") -> list[str]:
+    """Devolve os fatos que guardou (vazio se não havia nada, se pulou ou se algo falhou)."""
+    global _rodando
+    fala = pergunta.strip()
+    if _rodando or ativos > 0 or len(fala) < 15:
+        return []
+    if SEGREDO.search(fala) or SEGREDO.search(resposta or ""):
+        return []
+    _rodando = True
+    try:
+        candidatos = await _pergunta_ao_modelo(fala)
+    except Exception:
+        return []
+    finally:
+        _rodando = False
+    guardados = []
+    for f in candidatos[:2]:
+        f = f[:240]
+        if not f or SEGREDO.search(f) or SENSIVEL.search(f) or not _apoiado(f, fala):
+            continue
+        r = await asyncio.to_thread(memory.add, f, FONTE)
+        if not r.get("duplicate"):
+            guardados.append(f)
+    if guardados:
+        await asyncio.to_thread(_poda)
+    return guardados
 EOF
   cat > video.py <<'EOF'
 """Vídeo curto a partir de texto, 100% local (Wan 2.1 pelo stable-diffusion.cpp).
@@ -5940,6 +6856,7 @@ EOF
       <div id="estadoLlm"><span class="bolinha" id="bolinha"></span><span id="estadoTxt">Verificando o modelo…</span></div>
       <div class="menu acima" id="gearMenu" hidden style="left:0;right:0">
         <button class="item" id="voiceBtn">🔊 Voz</button>
+        <button class="item" id="perfilBtn">👤 Meu perfil e foto</button>
         <button class="item" id="llmBtn">🤖 Modelo de IA</button>
         <button class="item" id="memBtn">🧠 Memória</button>
         <button class="item" id="filesBtn">📁 Arquivos criados</button>
@@ -5999,6 +6916,7 @@ EOF
           <div class="sec">Opções</div>
           <label><input type="checkbox" id="web"> 🌐 Pesquisar na web</label>
           <label title="Guarda na memória o que descobrir pesquisando"><input type="checkbox" id="learn" checked> 📚 Aprender com as pesquisas</label>
+          <label title="Depois das respostas, guarda na memória fatos duráveis que VOCÊ disse sobre você (nome, projeto, equipamento, preferências). Nunca guarda senhas nem dados sensíveis; tudo aparece em Memória e dá para apagar."><input type="checkbox" id="learnSelf" checked> 🧠 Aprender sozinha</label>
           <label><input type="checkbox" id="speak"> 🔊 Falar as respostas</label>
         </div>
         <div id="anexos"></div>
@@ -6033,6 +6951,23 @@ EOF
   <div style="margin:14px 0 4px">Velocidade: <span id="velVal">1.00</span>×</div>
   <input type="range" id="vel" min="0.7" max="1.4" step="0.05" value="1">
   <div style="display:flex;gap:8px;margin-top:16px"><button class="bt pri" id="vozTest">▶ Testar</button><button class="bt" id="vozClose">Fechar</button></div>
+</dialog>
+
+<dialog id="perfilDlg">
+  <h2>Meu perfil e foto</h2>
+  <div class="dica">Mande uma foto sua e a IA aprende como você é: ela descreve a foto uma vez e usa isso nas conversas. A foto e a descrição ficam só neste PC; apague quando quiser.</div>
+  <div style="display:flex;gap:14px;align-items:flex-start;margin:12px 0;flex-wrap:wrap">
+    <img id="perfilImg" alt="" hidden style="width:120px;height:120px;object-fit:cover;border-radius:16px;border:1px solid var(--line)">
+    <div style="flex:1;min-width:200px">
+      <input type="text" class="campo" id="perfilNome" placeholder="Como devo te chamar?" style="width:100%;margin-bottom:8px">
+      <input type="file" id="perfilArq" accept="image/jpeg,image/png,image/webp" hidden>
+      <button class="bt pri" id="perfilEscolhe">📷 Escolher minha foto</button>
+    </div>
+  </div>
+  <div class="dica" id="perfilEstado"></div>
+  <div style="margin:10px 0 4px">Como a IA te vê (você pode corrigir)</div>
+  <textarea class="campo" id="perfilDesc" rows="4" style="width:100%" placeholder="Aparece aqui depois que a IA analisar a foto."></textarea>
+  <div style="display:flex;gap:8px;margin-top:14px;flex-wrap:wrap"><button class="bt pri" id="perfilSalva">Salvar</button><button class="bt" id="perfilRefaz">Analisar de novo</button><button class="bt" id="perfilApaga">Apagar tudo</button><button class="bt" id="perfilClose">Fechar</button></div>
 </dialog>
 
 <dialog id="llmDlg">
@@ -6407,6 +7342,10 @@ async function send(text) {
       if (webResults > 0 && $('learn').checked && ma.content && !teach) {
         try { await salvaMemoria(`Pergunta: ${text}\nResposta (pesquisa na web em ${new Date().toLocaleDateString('pt-BR')}): ${ma.content}`, 'web'); } catch (e) {}
       }
+      if ($('learnSelf').checked && ma.content && !teach) {   // aprende em segundo plano e mostra o que guardou
+        fetch('/aprender', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({pergunta: text, resposta: ma.content.slice(0, 600)})})
+          .then(r => r.ok ? r.json() : null).then(j => { if (j && j.fatos && j.fatos.length) { setStatus('🧠 Aprendi: ' + j.fatos.join(' · ')); setTimeout(() => setStatus(''), 9000); } }).catch(() => {});
+      }
       if ($('speak').checked && ma.content) speak(ma.content);
     } catch (e) {
       if (e.name === 'AbortError') {
@@ -6532,7 +7471,7 @@ function fechaFolha() { $('folha').hidden = true; }
 $('folhaFundo').onclick = fechaFolha;
 function folhaMais() {
   const l = document.createElement('div'); l.className = 'linhas';
-  for (const [e, nome, id] of [['🤖', 'Modelos de IA e adicionar outras', 'llmBtn'], ['🔊', 'Voz', 'voiceBtn'], ['🧠', 'Memória', 'memBtn'], ['🖥', 'Sistema e ventoinhas', 'sisBtn'], ['📲', 'Conectar celular', 'pairBtn'], ['⚙', 'Servidor do app', 'cfgBtn'], ['🌓', 'Tema', 'temaBtn'], ['＋', 'Nova conversa', 'new']]) {
+  for (const [e, nome, id] of [['👤', 'Meu perfil e foto', 'perfilBtn'], ['🤖', 'Modelos de IA e adicionar outras', 'llmBtn'], ['🔊', 'Voz', 'voiceBtn'], ['🧠', 'Memória', 'memBtn'], ['🖥', 'Sistema e ventoinhas', 'sisBtn'], ['📲', 'Conectar celular', 'pairBtn'], ['⚙', 'Servidor do app', 'cfgBtn'], ['🌓', 'Tema', 'temaBtn'], ['＋', 'Nova conversa', 'new']]) {
     if ($(id).hidden) continue;
     const b = document.createElement('button'); b.innerHTML = '<span class="e"></span><span></span>'; b.querySelector('.e').textContent = e; b.lastChild.textContent = nome;
     b.onclick = () => { fechaFolha(); $(id).click(); }; l.appendChild(b);
@@ -6573,6 +7512,8 @@ function atualizaChips() {
   txt.placeholder = PLACEHOLDERS[m];
 }
 for (const id of ['web', 'speak', 'learn']) $(id).onchange = atualizaChips;
+try { $('learnSelf').checked = localStorage.getItem('learnSelf') !== '0'; } catch (e) {}
+$('learnSelf').onchange = () => { try { localStorage.setItem('learnSelf', $('learnSelf').checked ? '1' : '0'); } catch (e) {} };
 function atualizaForca() { $('imgForcaLinha').hidden = !(anexos.some(a => a.tipo === 'imagem') || (baseMod && baseMod.kind === 'img')); }
 $('imgPassos').oninput = () => $('imgPassosV').textContent = $('imgPassos').value;
 $('imgForca').oninput = () => $('imgForcaV').textContent = parseFloat($('imgForca').value).toFixed(2);
@@ -6735,7 +7676,7 @@ async function carregaMem() {
   for (const m of itens) {
     const row = document.createElement('div'); row.className = 'item-l';
     const t = document.createElement('div'); t.className = 't'; t.textContent = m.text;
-    const sm = document.createElement('small'); sm.textContent = (m.source === 'web' ? 'aprendido na web' : 'você ensinou') + ' · ' + new Date(m.created * 1000).toLocaleDateString('pt-BR'); t.appendChild(sm);
+    const sm = document.createElement('small'); sm.textContent = (m.source === 'web' ? 'aprendido na web' : m.source === 'aprendido' ? 'aprendi sozinha' : 'você ensinou') + ' · ' + new Date(m.created * 1000).toLocaleDateString('pt-BR'); t.appendChild(sm);
     const del = document.createElement('button'); del.className = 'bt'; del.textContent = 'Apagar';
     del.onclick = async () => { await fetch('/memory/' + m.id, {method: 'DELETE'}); carregaMem(); };
     row.append(t, del); box.appendChild(row);
@@ -7009,6 +7950,42 @@ atualId = le('iaAtual', '');
 if (!conv()) { const n = novaConv(); convs.push(n); atualId = n.id; }
 desenha(); atualizaChips(); autoAltura(); checaLlm(); setInterval(checaLlm, 5000); chipsLoop(); setInterval(chipsLoop, 3000); setTimeout(retomaVideo, 1500);
 txt.focus();
+
+// --- perfil: nome e foto do usuário
+let perfilTimer = null;
+const PERFIL_MSG = {vazio: 'Ainda sem foto.', baixando_visao: '⬇ Baixando o modelo que enxerga (~2,8 GB, só na primeira vez)…',
+  descrevendo: '👀 A IA está olhando a foto… (alguns minutos no primeiro uso)', pronto: '✅ Pronto: a IA já sabe como você é.',
+  erro: '⚠ ', interrompido: '⚠ '};
+async function carregaPerfil(manter) {
+  let p; try { p = await (await fetch('/perfil')).json(); } catch (e) { $('perfilEstado').textContent = '⚠ Sem conexão com o servidor.'; return; }
+  if (!manter) { $('perfilNome').value = p.nome || ''; $('perfilDesc').value = p.descricao || ''; }
+  else if (p.estado === 'pronto' && !$('perfilDesc').value) $('perfilDesc').value = p.descricao || '';
+  const img = $('perfilImg'); img.hidden = !p.tem_foto; if (p.tem_foto) img.src = '/perfil/foto?t=' + Date.now();
+  let t = PERFIL_MSG[p.estado] || ''; if (p.estado === 'baixando_visao' && p.progresso != null) t += ' ' + Math.round(p.progresso * 100) + '%';
+  if (p.erro) t += p.erro; $('perfilEstado').textContent = t;
+  $('perfilRefaz').hidden = !p.tem_foto;
+  clearTimeout(perfilTimer);
+  if ($('perfilDlg').open && (p.estado === 'baixando_visao' || p.estado === 'descrevendo')) perfilTimer = setTimeout(() => carregaPerfil(true), 3000);
+}
+$('perfilBtn').onclick = () => { abreDlg('perfilDlg'); carregaPerfil(false); };
+$('perfilClose').onclick = () => { clearTimeout(perfilTimer); $('perfilDlg').close(); };
+$('perfilEscolhe').onclick = () => $('perfilArq').click();
+$('perfilArq').onchange = async () => {
+  const f = $('perfilArq').files[0]; if (!f) return;
+  $('perfilEstado').textContent = 'Enviando a foto…'; const fd = new FormData(); fd.append('foto', f, f.name);
+  const r = await fetch('/perfil/foto', {method: 'POST', body: fd}); $('perfilArq').value = '';
+  if (!r.ok) { $('perfilEstado').textContent = '⚠ ' + ((await r.json()).detail || 'Não consegui enviar.'); return; }
+  $('perfilDesc').value = ''; carregaPerfil(true);
+};
+async function salvaPerfil() {
+  await fetch('/perfil', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({nome: $('perfilNome').value})});
+  if ($('perfilDesc').value.trim()) await fetch('/perfil/descricao', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({descricao: $('perfilDesc').value})});
+  carregaPerfil(false);
+}
+$('perfilSalva').onclick = async () => { await salvaPerfil(); $('perfilEstado').textContent = '✅ Salvo.'; };
+$('perfilNome').onchange = salvaPerfil;
+$('perfilRefaz').onclick = async () => { $('perfilDesc').value = ''; const r = await fetch('/perfil/analisar', {method: 'POST'}); if (!r.ok) $('perfilEstado').textContent = '⚠ ' + (await r.json()).detail; carregaPerfil(true); };
+$('perfilApaga').onclick = async () => { if (!confirm('Apagar a foto, o nome e a descrição?')) return; await fetch('/perfil', {method: 'DELETE'}); $('perfilNome').value = ''; $('perfilDesc').value = ''; carregaPerfil(false); };
 </script>
 </body>
 </html>
@@ -7039,6 +8016,13 @@ for _ in $(seq 1 60); do nvidia-smi >/dev/null 2>&1 && break; sleep 2; done
 # do modelo e para a tela (RESERVA_VRAM, em MiB). Assim a placa é aproveitada ao máximo sem estourar.
 if [ "$NGL" = "auto" ]; then
   LIVRE=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -dc '0-9')
+  if [ -z "$LIVRE" ]; then   # placa AMD (driver amdgpu): lê a VRAM pelo /sys; vale a de maior VRAM (a RX, não a gráfica do Ryzen)
+    for d in "${DRM_RAIZ:-/sys/class/drm}"/card[0-9]*/device; do
+      [ "$(cat "$d/vendor" 2>/dev/null)" = "0x1002" ] && [ -r "$d/mem_info_vram_total" ] || continue
+      L=$(( ( $(cat "$d/mem_info_vram_total") - $(cat "$d/mem_info_vram_used" 2>/dev/null || echo 0) ) / 1048576 ))
+      [ "$L" -gt "${LIVRE:-0}" ] && LIVRE=$L
+    done
+  fi
   TAM=$(( $(stat -c %s "$MODEL" 2>/dev/null || echo 0) / 1048576 ))
   # CAMADAS vem do modelo.env quando o modelo foi adicionado pela tela (lido do próprio arquivo); senão, pelo nome
   if [ -z "${CAMADAS:-}" ]; then
@@ -7075,6 +8059,14 @@ tem '--threads-batch' && ARGS+=(-tb "$LOGICOS")
 tem '--parallel'      && ARGS+=(-np 1)              # 1 conversa por vez: usa o contexto todo e o cache do prompt
 tem '--mlock'         && ARGS+=(--mlock)            # mantém o modelo na RAM (evita lentidão por paginação)
 tem '--cache-reuse'   && ARGS+=(--cache-reuse 256)  # reaproveita o que já foi calculado entre perguntas
+# Vulkan com mais de uma placa (RX 580 + gráfica integrada do Ryzen): fixa a de maior memória, para o modelo não se dividir nas duas
+if tem '--list-devices' && tem '--device'; then
+  DISP="$("$BIN" --list-devices 2>&1 | grep -E '^[[:space:]]*Vulkan[0-9]+:' || true)"
+  if [ "$(grep -c . <<<"$DISP")" -gt 1 ]; then
+    MELHOR="$(sed -nE 's/^[[:space:]]*(Vulkan[0-9]+):.*\(([0-9]+) MiB.*/\2 \1/p' <<<"$DISP" | sort -rn | head -1 | cut -d' ' -f2)"
+    [ -n "$MELHOR" ] && ARGS+=(--device "$MELHOR") && echo "[start_llm] placas Vulkan: $(grep -c . <<<"$DISP"); usando $MELHOR"
+  fi
+fi
 exec "$BIN" "${ARGS[@]}"
 EOF
   sed -i "s/__NGL__/$NGL_PADRAO/; s/__MODEL__/$MODEL_FILE/" "$BASE/start_llm.sh"
@@ -7497,7 +8489,49 @@ fi
 echo "==> Reiniciando"
 sudo sed -i "s/^Environment=NGL=.*/Environment=NGL=$NGL_PADRAO/" "$SERVICO_LLM"
 sudo systemctl daemon-reload
+# Instalações antigas gravaram um arquivo do X pedindo o driver "nvidia" (Coolbits). Sem placa NVIDIA, ele só atrapalha a interface gráfica.
+XCOOL=/etc/X11/xorg.conf.d/20-nvidia-coolbits.conf
+if [ -f "$XCOOL" ] && ! command -v nvidia-smi >/dev/null 2>&1 && ! lsmod | grep -q '^nvidia'; then
+  echo "==> Desativando $XCOOL (não há placa NVIDIA neste PC; ele só atrapalharia a interface gráfica)"
+  sudo mv "$XCOOL" "$XCOOL.desativado" || echo "AVISO: não consegui mover $XCOOL"
+fi
+
+# llama.cpp: precisa (1) entender imagens (--mmproj, para a foto do perfil) e (2) usar a placa de vídeo certa:
+# AMD (ex.: RX 580) -> Vulkan; NVIDIA -> CUDA. Se faltar algum dos dois, atualiza e recompila (15 a 40 min, só desta vez).
+# Se falhar, o resto continua funcionando (a IA de texto fica como estava).
+LLAMA_BIN="$HOME/llama.cpp/build/bin/llama-server"
 PRECISA_LLM=0
+GPU_AMD=0
+for d in "${DRM_RAIZ:-/sys/class/drm}"/card[0-9]*/device; do
+  [ "$(cat "$d/vendor" 2>/dev/null)" = "0x1002" ] && [ -r "$d/mem_info_vram_total" ] && GPU_AMD=1
+done
+if [ -d "$HOME/llama.cpp" ]; then
+  RECOMPILAR=0
+  AJUDA_LLAMA="$("$LLAMA_BIN" --help 2>&1 || true)"
+  grep -q -- '--mmproj' <<<"$AJUDA_LLAMA" || RECOMPILAR=1
+  if [ "$GPU_AMD" = 1 ]; then
+    "$LLAMA_BIN" --list-devices 2>&1 | grep -qi vulkan || RECOMPILAR=1
+    CMAKE_GPU="-DGGML_VULKAN=ON -DGGML_CUDA=OFF"
+  elif [ -x "$CUDA_DIR/bin/nvcc" ]; then
+    CMAKE_GPU="-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=52 -DCMAKE_CUDA_COMPILER=$CUDA_DIR/bin/nvcc"
+  else
+    CMAKE_GPU=""
+  fi
+  if [ "$RECOMPILAR" = 1 ]; then
+    echo "==> Atualizando o llama.cpp (${CMAKE_GPU:-só CPU}); 15 a 40 minutos, só desta vez"
+    if [ "$GPU_AMD" = 1 ]; then
+      sudo apt install -y libvulkan-dev glslc mesa-vulkan-drivers vulkan-tools cmake build-essential git ||
+      sudo apt install -y libvulkan-dev libshaderc-dev glslang-tools mesa-vulkan-drivers vulkan-tools cmake build-essential git ||
+      echo "AVISO: não consegui instalar os pacotes do Vulkan (precisa do glslc)."
+    fi
+    if ( export PATH="$CUDA_DIR/bin:$PATH"; cd "$HOME/llama.cpp" && git pull --ff-only &&
+         cmake -B build $CMAKE_GPU && cmake --build build --config Release -j 4 --target llama-server ); then
+      PRECISA_LLM=1
+    else
+      echo "AVISO: não consegui atualizar o llama.cpp. A IA de texto segue como estava; fotos (e a placa AMD, se for o caso) não funcionarão até isso."
+    fi
+  fi
+fi
 [ "$NGL_PADRAO" != "$NGL_ATUAL" ] && PRECISA_LLM=1
 cmp -s "$BASE/start_llm.sh" /tmp/start_llm.antes || PRECISA_LLM=1
 [ "$LLM_UNIT_MUDOU" = 1 ] && PRECISA_LLM=1

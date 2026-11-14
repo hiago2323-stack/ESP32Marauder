@@ -18,6 +18,7 @@ import time
 from pathlib import Path
 
 import config
+import placa
 
 # Trabalhos pesados (compilar, gerar imagem, criar app/firmware): um de cada vez.
 pesado = asyncio.Lock()
@@ -51,7 +52,7 @@ def ram_livre_mb() -> int:
 
 
 def vram_livre_mb() -> int | None:
-    """VRAM livre da GPU NVIDIA em MiB, ou None se não houver GPU/nvidia-smi."""
+    """VRAM livre da GPU em MiB (NVIDIA pelo nvidia-smi, AMD pelo /sys), ou None se não houver placa."""
     try:
         r = subprocess.run(["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
                            capture_output=True, text=True, timeout=3)
@@ -59,7 +60,8 @@ def vram_livre_mb() -> int | None:
             return int(float(r.stdout.strip().splitlines()[0]))
     except (OSError, subprocess.TimeoutExpired, ValueError):
         pass
-    return None
+    amd = placa.acha_amd()
+    return amd.vram_livre_mb() if amd else None
 
 
 def baixa_prioridade(cmd: list[str]) -> list[str]:

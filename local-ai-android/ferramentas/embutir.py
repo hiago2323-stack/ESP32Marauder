@@ -19,7 +19,8 @@ SCRIPTS = [RAIZ / "atualizar.sh", RAIZ / "instalar_tudo_v2.sh"]
 ARQUIVOS = {n: n for n in [
     "requirements.txt", "config.py", "main.py", "memory.py", "androidgen.py", "entregas.py", "esp32gen.py", "perfis.py",
     "telemetria.py", "fanctl.py", "recursos.py", "uploads.py", "imagens.py", "imggen.py", "codegen.py", "gerador.py",
-    "biblioteca.py", "modelos.py", "video.py", "vidgen.py", "static/index.html"]}
+    "biblioteca.py", "modelos.py", "video.py", "vidgen.py", "static/index.html",
+    "agente.py", "visao.py", "perfil.py", "placa.py", "aprendizado.py"]}
 ARQUIVOS['"$BASE/diagnostico_fans.sh"'] = "diagnostico_fans.sh"
 ANCORA = "codegen.py"   # onde entram os arquivos novos
 

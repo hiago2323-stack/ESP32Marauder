@@ -70,6 +70,40 @@ Os serviços `localai-llm` (modelo), `localai-server` (servidor) e `localai-fan`
 login. No boot o modelo espera o driver da placa e os discos (SSD) ficarem prontos antes de decidir quantas camadas vão para
 a GPU (antes, se o driver demorasse, a IA podia ficar só na CPU a sessão inteira). O atualizador refaz os serviços.
 
+## Placa de vídeo: NVIDIA ou AMD (RX 580)
+
+O servidor reconhece a placa sozinho. **AMD (driver amdgpu, ex.: RX 580 de 8 GB)**: temperatura, uso, VRAM e ventoinha são lidos e
+controlados pelo `/sys` (sem programas extras; o serviço de ventoinhas roda como root); o llama.cpp usa **Vulkan** (a RX 580 não é
+suportada pelo ROCm). **NVIDIA**: nvidia-smi/NVML e CUDA, como antes. Se tiver a gráfica integrada do Ryzen junto com a RX 580, vale a de
+maior VRAM. O `atualizar.sh` recompila o llama.cpp com o suporte certo (Vulkan para AMD) quando falta; leva de 15 a 40 min, só uma vez. Com a gráfica
+integrada junto da RX 580, o `start_llm.sh` fixa a placa de maior memória (`--device`). O instalador completo também reconhece AMD (não instala
+driver NVIDIA/CUDA nem o arquivo do X da NVIDIA; o `atualizar.sh` desativa esse arquivo se uma instalação antiga o deixou sem haver placa NVIDIA).
+Gerador de imagens e de vídeo ainda usam só a CPU na AMD.
+
+## Pedir e instalar outras IAs pela conversa
+
+Escreva do seu jeito, por exemplo: "bota o qwen coder de 14b pra eu testar", "quero testar o deepseek r1", "volta pro modelo rápido",
+"que modelos eu tenho?". A IA entende o pedido, acha o modelo no Hugging Face, escolhe a versão que cabe no PC, baixa e, ao terminar,
+**deixa selecionado e reinicia o modelo** para você testar. Também dá para colar o link do Hugging Face ou `dono/repo:Q5_K_M`.
+
+## Meu perfil e foto
+
+⚙ › **Meu perfil e foto**: envie seu nome e uma foto. Um modelo que enxerga (Qwen2.5-VL 3B, baixado na primeira vez, ~2,8 GB) descreve a foto
+uma vez, na CPU, e a descrição vai para o contexto das conversas para a IA saber como você é. Você pode corrigir o texto ou apagar tudo.
+Tudo fica só neste PC (`~/localai/perfil`).
+
+## Aprender sozinha (limitado e visível)
+
+Opção **🧠 Aprender sozinha** (ligada por padrão; desligue na tela quando quiser). Depois de cada resposta, a IA local extrai só **fatos
+duráveis que você mesmo disse sobre você** (nome, projeto, equipamento, preferências) e guarda em 🧠 Memória com a etiqueta "aprendi sozinha";
+a tela mostra o que ela aprendeu e você apaga o que quiser. Nunca guarda senhas, chaves, cartão, documentos nem dados sensíveis, descarta o que
+o modelo inventar (o fato precisa se apoiar no que você escreveu), pula se uma resposta estiver em andamento e guarda no máximo 200 itens.
+Ela **não** altera o próprio código nem os próprios comandos.
+
+## Testes
+
+`cd server && python3 -m unittest discover -s tests` (precisa de fastapi, httpx e pillow instalados).
+
 ## SSD como parte rápida
 
 Se o sistema está num HD e há um SSD à parte (partição ext4/btrfs/xfs), o `atualizar.sh` move para ele os modelos de IA, Gradle, Android SDK e núcleo ESP32 (as pastas antigas viram links). `SEM_SSD=1` pula; `SSD_DESTINO=/caminho` escolhe a pasta.

@@ -3,6 +3,7 @@ import json
 import os
 import subprocess
 
+import placa
 import recursos
 import time
 from pathlib import Path
@@ -18,6 +19,9 @@ def _num(s: str):
 
 
 def _gpu() -> dict | None:
+    amd = placa.acha_amd()
+    if amd:   # placa AMD (ex.: RX 580): lê pelo /sys
+        return amd.resumo()
     try:
         r = subprocess.run(
             ["nvidia-smi", "--query-gpu=temperature.gpu,utilization.gpu,memory.used,memory.total,fan.speed,power.draw,name",
