@@ -116,15 +116,48 @@ async def melhora_prompt(texto: str, realista: bool = False, video: bool = False
 
 
 # ------------------------------------------------------------------ geração
-async def _roda_worker(cfg: dict, emit) -> tuple[bool, str]:
-    """Roda o gerador numa sub-rotina com prioridade baixa. Devolve (ok, mensagem_de_erro)."""
-    cmd = recursos.baixa_prioridade([sys.executable, str(Path(__file__).with_name("imggen.py"))])
+def explica_falha(erro: str, registro: list[str]) -> tuple[str, str]:
+    """Transforma o erro do motor de imagem/vídeo numa explicação. Devolve (tipo, mensagem).
+
+    tipo: "modelo" (o arquivo não serve / está estragado: não adianta tentar de novo),
+          "memoria" (faltou memória na placa: repetir na CPU resolve) ou "outro".
+    """
+    txt = (erro + "\n" + "\n".join(registro)).lower()
+    if "código -9" in txt or "killed" in txt:
+        return "ram", ("O sistema encerrou o gerador por falta de memória RAM (ela é dividida com a IA de texto). "
+                       "Tente de novo em instantes; se repetir, feche programas pesados ou use o perfil Rápido da IA de texto.")
+    if "get sd version from file failed" in txt or "unknown model" in txt or "not support" in txt and "model" in txt:
+        return "modelo", ("O motor não reconhece esse arquivo como um modelo de imagem Stable Diffusion completo. Alguns modelos "
+                          "(Flux, SD3.5, Z-Image, Qwen-Image…) vêm em partes separadas (VAE e codificador de texto à parte) e não "
+                          "funcionam sozinhos aqui. Escolha outro (o Rápido e o Realista funcionam) ou apague esse.")
+    if "model path does not exist" in txt or "no such file" in txt:
+        return "modelo", "O arquivo do modelo não está mais na pasta. Baixe de novo (Mais › Modelos de IA)."
+    if "out of memory" in txt or "cudamalloc" in txt or "failed to allocate" in txt or "cuda error" in txt:
+        return "memoria", "Faltou memória na placa de vídeo."
+    if ("load tensors" in txt and "fail" in txt) or "read error" in txt or "unexpected end" in txt or "invalid magic" in txt:
+        return "modelo", "O arquivo do modelo está incompleto ou estragado. Apague e baixe de novo (Mais › Modelos de IA)."
+    if "modelo_nao_carregou" in txt or "null pointer" in txt:
+        return "outro", "O motor não conseguiu abrir o modelo."
+    return "outro", ""
+
+
+async def _roda_worker(cfg: dict, emit, script: str = "imggen.py") -> tuple[bool, str, list[str]]:
+    """Roda o gerador numa sub-rotina com prioridade baixa. Devolve (ok, erro, últimas linhas do registro do motor)."""
+    import collections
+    cmd = recursos.baixa_prioridade([sys.executable, str(Path(__file__).with_name(script))])
     proc = await asyncio.create_subprocess_exec(
-        *cmd, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        *cmd, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         start_new_session=True)
     proc.stdin.write(json.dumps(cfg).encode())
     await proc.stdin.drain()
     proc.stdin.close()
+    registro: collections.deque = collections.deque(maxlen=200)
+
+    async def le_registro():
+        async for linha in proc.stderr:
+            registro.append(linha.decode(errors="replace").rstrip())
+
+    leitor = asyncio.create_task(le_registro())
     erro = ""
     try:
         async for linha in proc.stdout:
@@ -133,10 +166,11 @@ async def _roda_worker(cfg: dict, emit) -> tuple[bool, str]:
             except ValueError:
                 continue
             if ev.get("tipo") == "passo":
-                await emit({"type": "passo", "passo": ev["passo"], "total": ev["total"]})
+                await emit({"type": "passo", "passo": ev["passo"], "total": ev["total"], "seg": ev.get("seg", 0)})
             elif ev.get("tipo") == "erro":
                 erro = ev.get("msg", "")
         await proc.wait()
+        await asyncio.wait_for(leitor, 5)
     except asyncio.CancelledError:  # o usuário clicou em Parar
         import os
         import signal
@@ -144,8 +178,14 @@ async def _roda_worker(cfg: dict, emit) -> tuple[bool, str]:
             os.killpg(proc.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
+        leitor.cancel()
         raise
-    return proc.returncode == 0, erro
+    except asyncio.TimeoutError:
+        leitor.cancel()
+    if proc.returncode != 0 and not erro:
+        erro = f"o motor parou (código {proc.returncode})"
+    relevantes = [ln for ln in registro if any(k in ln.lower() for k in ("error", "fail", "out of memory", "not support", "unknown", "exist"))]
+    return proc.returncode == 0, erro, relevantes[-12:]
 
 
 async def gera_imagem(descricao: str, init_id: str | None, tamanho: str, passos: int, forca: float,
@@ -201,14 +241,17 @@ async def gera_imagem(descricao: str, init_id: str | None, tamanho: str, passos:
                       "cpu": "na CPU"}[modo]
             motivo = (f" (a placa está ocupada: só {vram} MB livres)" if modo == "cpu" and vram is not None and vram < 600 else "")
             await emit({"type": "status", "msg": f"Gerando a imagem {rotulo}{motivo}…{' (leva cerca de 1 minuto)' if modo == 'cpu' else ''}"})
-            ok, erro = await _roda_worker({**base, "modo": modo}, emit)
-            if modo != "cpu":
+            ok, erro, registro = await _roda_worker({**base, "modo": modo}, emit)
+            tipo, explicacao = ("", "") if ok else explica_falha(erro, registro)
+            if modo != "cpu" and tipo not in ("modelo", "ram"):   # culpa do arquivo ou da RAM não conta contra a placa
                 recursos.anota_gpu("imagem", ok)
-            if not ok and modo != "cpu":
+            if not ok and modo != "cpu" and tipo not in ("modelo", "ram"):
                 await emit({"type": "status", "msg": "A placa de vídeo não deu conta; tentando só pela CPU…"})
-                ok, erro = await _roda_worker({**base, "modo": "cpu"}, emit)
+                ok, erro, registro = await _roda_worker({**base, "modo": "cpu"}, emit)
+                tipo, explicacao = ("", "") if ok else explica_falha(erro, registro)
             if not ok or not saida.exists():
-                await emit({"type": "error", "msg": "Não consegui gerar a imagem.", "log": erro})
+                await emit({"type": "error", "msg": "Não consegui gerar a imagem. " + (explicacao or ""),
+                            "log": "\n".join([erro] + registro)[-1500:]})
                 return
             slug = androidgen.slugify(descricao) or "imagem"
             nome = (descricao[:40] or "Imagem").strip()

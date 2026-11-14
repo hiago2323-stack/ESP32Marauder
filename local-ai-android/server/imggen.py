@@ -28,6 +28,9 @@ def main():
         elif modo == "gpu":
             kw.update(keep_clip_on_cpu=False, keep_vae_on_cpu=False)
         sd = StableDiffusion(**kw)
+        if not getattr(getattr(sd, "_model", None), "model", True):   # o motor não conseguiu abrir o modelo
+            evento(tipo="erro", msg="MODELO_NAO_CARREGOU")
+            sys.exit(1)
         evento(tipo="carregado", modo=modo)
 
         def passo(i, total, tempo):

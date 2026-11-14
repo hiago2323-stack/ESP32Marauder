@@ -110,7 +110,7 @@ Se o sistema está num HD e há um SSD à parte (partição ext4/btrfs/xfs), o `
 
 ## Biblioteca no disco grande
 
-O `atualizar.sh` escolhe sozinho o disco grande (>= 100 GB, que não seja o do sistema; se estiver desmontado ele monta, só leitura/escrita, sem formatar, e deixa montado em todo boot com `nofail`), cria `~/biblioteca` apontando para ele e baixa em segundo plano (`tail -f ~/localai/biblioteca.log`): exemplos e bibliotecas ESP32/Arduino, exemplos de apps Android, documentação do Python, Arduino e MDN (web) e a Wikipedia em português offline. O servidor indexa tudo (SQLite FTS5, devagar e em segundo plano) e a IA recebe os trechos relevantes ao responder e ao criar apps/firmware. Joguei seus arquivos em `~/biblioteca/meus` e eles entram na busca também. Tela: engrenagem > Biblioteca. Para escolher outro lugar: `BIBLIOTECA_DESTINO=/caminho bash atualizar.sh`; para pular: `SEM_BIBLIOTECA=1`.
+O `atualizar.sh` escolhe sozinho o disco grande (>= 100 GB, que não seja o do sistema; se estiver desmontado ele monta, só leitura/escrita, sem formatar, e deixa montado em todo boot com `nofail`), cria `~/biblioteca` apontando para ele e baixa em segundo plano (`tail -f ~/localai/biblioteca.log`): exemplos e bibliotecas ESP32/Arduino, exemplos de apps Android, documentação do Python, Arduino e MDN (web) e, em português e offline, a Wikipédia completa, o Wikilivros, a Wikiversidade e o Wikcionário (psicologia, comunicação, relacionamentos, comportamento, saúde e educação sexual, ciência, história...). Em toda conversa a IA consulta os verbetes cujo título aparece na pergunta; sem internet, os mais parecidos. O servidor indexa tudo (SQLite FTS5, devagar e em segundo plano) e a IA recebe os trechos relevantes ao responder e ao criar apps/firmware. Joguei seus arquivos em `~/biblioteca/meus` e eles entram na busca também. Tela: engrenagem > Biblioteca. Para escolher outro lugar: `BIBLIOTECA_DESTINO=/caminho bash atualizar.sh`; para pular: `SEM_BIBLIOTECA=1`.
 
 ## App do celular (acesso de qualquer lugar)
 
@@ -143,6 +143,28 @@ compila e a conversa mostra os `.bin` para baixar (o `-completo.bin` é gravado 
 Todos os arquivos ficam também em **📁 Arquivos**.
 O botão **⏹ Parar** (ou Esc) cancela a escrita e a compilação. A primeira compilação baixa as
 ferramentas do Android (algumas centenas de MB) e demora mais.
+
+## Gerador de código mais esperto (apps e firmware)
+
+`gerador.py` deixa o modelo local acertar mais e mais rápido:
+- **Correções automáticas, sem gastar a IA**: imports que faltam no Java (Android/Java e, no app avançado, AndroidX/Material),
+  `@Override` indevido, AndroidX no app simples, `Servo.h` → `ESP32Servo.h`, PWM antigo (`ledcSetup/ledcAttachPin`) convertido
+  para o núcleo ESP32 3.x e **bibliotecas do Arduino instaladas sozinhas** (o servidor descobre qual biblioteca fornece cada `#include`).
+- **Correções da IA com a conversa limpa**: o código numerado + cada erro com a linha exata + uma dica específica (antes as versões
+  antigas iam se empilhando e estouravam o contexto de 8192 já na 2ª correção). Até 4 rodadas.
+- **Instruções e exemplos melhores** (exemplos que compilam de verdade), API do núcleo ESP32 3.x ensinada, bibliotecas comuns
+  liberadas (DHT, MQTT, displays, NeoPixel...), dados dos apps salvos no celular, resposta cortada continua sozinha.
+- **Compilação rápida**: o Gradle fica carregado entre compilações (2 s em vez de ~20 s) e o núcleo do ESP32 compilado é
+  reaproveitado (8 s em vez de ~70 s). Com pouca RAM o Gradle é descarregado antes de gerar imagem/vídeo.
+- **Modelo certo**: para criar código o servidor passa a usar o Qwen2.5-Coder (perfil Código) se ele estiver no PC
+  (`CODIGO_AUTO=0` desliga).
+- No app avançado e em web/Python, as correções mantêm **todos** os arquivos da última versão (antes os não reenviados se perdiam).
+- **Revisão depois de compilar**: uma conferência exata (pinos, intervalos, página que se atualiza, dados salvos, toque longo,
+  endereços citados) e uma revisão pela IA (sem os "defeitos" que ela costuma inventar) completam o que faltou do pedido.
+- **Bateria de teste com o modelo real** (Qwen2.5-Coder 7B em 4 núcleos de CPU, compilação de verdade): 8 de 8 compilaram,
+  4 apps (lista de tarefas, IMC, cronômetro com voltas, bloco de notas) e 4 firmwares (DHT22 com página web, PWM, MQTT,
+  OLED com hora da internet), de 3 a 15 minutos cada. A revisão completou o botão de volta do cronômetro, o apagar/salvar do
+  bloco de notas e a atualização automática da página do DHT22.
 
 ## Anexar, modificar e criar
 

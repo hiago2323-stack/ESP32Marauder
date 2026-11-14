@@ -98,43 +98,25 @@ def _estimativa_min(largura: int, altura: int, quadros: int, passos: int) -> int
     return max(1, round(seg / 60))
 
 
-async def _roda_worker(cfg: dict, emit) -> tuple[bool, str]:
-    cmd = recursos.baixa_prioridade([sys.executable, str(Path(__file__).with_name("vidgen.py"))])
-    proc = await asyncio.create_subprocess_exec(
-        *cmd, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
-        start_new_session=True)
-    proc.stdin.write(json.dumps(cfg).encode())
-    await proc.stdin.drain()
-    proc.stdin.close()
-    erro, fase, fixo_dec = "", 1, 270 * (cfg["largura"] * cfg["altura"] * cfg["quadros"]) / (320 * 192 * 17)
-    try:
-        async for linha in proc.stdout:
-            try:
-                ev = json.loads(linha)
-            except ValueError:
-                continue
-            if ev.get("tipo") == "passo":
-                i, n, seg = ev["passo"], ev["total"], ev.get("seg", 0)
-                if fase == 1 and i == n and n == cfg["passos"]:
-                    fase = 2                      # terminou a difusão; os próximos "passos" são a decodificação
-                    await emit({"type": "status", "msg": "Montando os quadros do vídeo (decodificação)…"})
-                    continue
-                if fase == 1:
-                    resta = (n - i) * seg + fixo_dec if seg else None
-                    txt = f"Gerando o vídeo… passo {i} de {n}"
-                    if resta:
-                        txt += f" · faltam uns {max(1, round(resta / 60))} min"
-                    await emit({"type": "passo", "passo": i, "total": n, "msg": txt})
-            elif ev.get("tipo") == "erro":
-                erro = ev.get("msg", "")
-        await proc.wait()
-    except asyncio.CancelledError:  # o usuário clicou em Parar
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        raise
-    return proc.returncode == 0, erro
+async def _roda_worker(cfg: dict, emit) -> tuple[bool, str, list[str]]:
+    """Roda o vidgen.py e transforma os passos em mensagens com o tempo que falta."""
+    fase, fixo_dec = [1], 270 * (cfg["largura"] * cfg["altura"] * cfg["quadros"]) / (320 * 192 * 17)
+
+    async def traduz(ev: dict):
+        if ev.get("type") != "passo":
+            return await emit(ev)
+        i, n = ev["passo"], ev["total"]
+        if fase[0] == 1 and i == n and n == cfg["passos"]:
+            fase[0] = 2                      # terminou a difusão; os próximos "passos" são a decodificação
+            return await emit({"type": "status", "msg": "Montando os quadros do vídeo (decodificação)…"})
+        if fase[0] == 1:
+            seg = ev.get("seg") or 0
+            txt = f"Gerando o vídeo… passo {i} de {n}"
+            if seg:
+                txt += f" · faltam uns {max(1, round(((n - i) * seg + fixo_dec) / 60))} min"
+            await emit({"type": "passo", "passo": i, "total": n, "msg": txt})
+
+    return await imagens._roda_worker(cfg, traduz, script="vidgen.py")
 
 
 def _junta_mp4(pasta: Path, saida: Path) -> bool:
@@ -193,14 +175,17 @@ async def gera_video(descricao: str, tamanho: str, quadros: int, passos: int, me
             minutos = _estimativa_min(largura, altura, quadros, passos)
             await emit({"type": "status", "msg": f"Gerando o vídeo ({quadros} quadros, {largura}×{altura}). Leva uns "
                                                  f"{minutos} minutos; pode fechar o app, ele continua no PC."})
-            ok, erro = await _roda_worker({**base, "modo": modo}, emit)
-            if modo != "cpu":
+            ok, erro, registro = await _roda_worker({**base, "modo": modo}, emit)
+            tipo, explicacao = ("", "") if ok else imagens.explica_falha(erro, registro)
+            if modo != "cpu" and tipo not in ("modelo", "ram"):
                 recursos.anota_gpu("video", ok)
-            if not ok and modo != "cpu":
+            if not ok and modo != "cpu" and tipo not in ("modelo", "ram"):
                 await emit({"type": "status", "msg": "A placa de vídeo não deu conta; tentando só pela CPU…"})
-                ok, erro = await _roda_worker({**base, "modo": "cpu"}, emit)
+                ok, erro, registro = await _roda_worker({**base, "modo": "cpu"}, emit)
+                tipo, explicacao = ("", "") if ok else imagens.explica_falha(erro, registro)
             if not ok:
-                await emit({"type": "error", "msg": "Não consegui gerar o vídeo.", "log": erro})
+                await emit({"type": "error", "msg": "Não consegui gerar o vídeo. " + (explicacao or ""),
+                            "log": "\n".join([erro] + registro)[-1500:]})
                 return
             await emit({"type": "status", "msg": "Juntando os quadros num arquivo .mp4…"})
             mp4 = pasta / "video.mp4"

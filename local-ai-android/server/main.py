@@ -255,13 +255,15 @@ async def _build_messages(req: ChatRequest) -> tuple[list[dict], int]:
             partes.append("Pesquisa na web:\n" + "\n".join(
                 f"[{i+1}] {r['title']} - {r['url']}\n{(r['snippet'] or '')[:260]}" for i, r in enumerate(results)))
 
-    if req.web and n_web == 0:  # sem internet (ou sem resultados): a Wikipedia offline do disco grande ajuda
+    # Enciclopédias offline do disco grande (Wikipédia, Wikilivros, Wikiversidade, Wikcionário): em toda conversa
+    # entram os verbetes cujo título aparece na pergunta; sem internet (ou sem resultado na web), os mais parecidos.
+    if not n_web and len(pergunta) < 600:
         try:
-            wiki = await asyncio.to_thread(biblioteca.wikipedia, pergunta)
+            wiki = await asyncio.to_thread(biblioteca.wikipedia, pergunta, 2, 700, not req.web)
         except Exception:
             wiki = []
         if wiki:
-            partes.append("Wikipedia (offline):\n" + "\n".join(f"- {w['titulo']}: {w['texto']}" for w in wiki))
+            partes.append("Enciclopédia offline:\n" + "\n".join(f"- {w['titulo']}: {w['texto']}" for w in wiki))
 
     if partes:
         msgs[ultimo]["content"] = "[CONTEXTO]\n" + "\n\n".join(partes) + "\n[FIM DO CONTEXTO]\n\n" + pergunta

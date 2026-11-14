@@ -190,30 +190,115 @@ def _zims() -> list[Path]:
     return sorted(d.glob("*.zim")) if d.is_dir() else []
 
 
-def wikipedia(consulta: str, k: int = 2, max_chars: int = 700) -> list[dict]:
-    """Busca nos arquivos .zim (Wikipedia offline). Precisa do pacote libzim; sem ele, devolve vazio."""
+def _norm(t: str) -> list[str]:
+    import unicodedata
+    t = unicodedata.normalize("NFKD", t.lower()).encode("ascii", "ignore").decode()
+    return re.findall(r"[a-z0-9]+", t)
+
+
+def titulo_bate(titulo: str, consulta: str) -> bool:
+    """O título do verbete aparece na pergunta? (ex.: "Consentimento sexual" em "o que é consentimento sexual?")"""
+    pal_t = [w for w in _norm(re.sub(r"\(.*?\)", " ", titulo)) if len(w) > 2 or w.isdigit()]
+    q = set(_norm(consulta))
+    return bool(pal_t) and all(w in q or (w.endswith("s") and w[:-1] in q) or w + "s" in q for w in pal_t)
+
+
+PARADAS_Q = {"o", "a", "os", "as", "um", "uma", "de", "do", "da", "dos", "das", "e", "é", "que", "qual", "quais", "como", "me",
+             "eu", "você", "voce", "no", "na", "em", "por", "para", "pra", "com", "sobre", "mais", "minha", "meu", "ter",
+             "fazer", "explica", "explique", "fale", "conta", "diga", "dicas", "ajuda", "ajude", "isso", "ser", "se", "ao",
+             "à", "the", "of", "what", "is", "how", "praticar", "quero", "saber", "entender", "significa", "pode", "seria"}
+
+
+def _ngramas(consulta: str, maximo: int = 4) -> list[str]:
+    """Sequências de palavras da pergunta (as maiores primeiro), sem palavras vazias nas pontas: candidatas a título."""
+    pal = re.findall(r"[\wÀ-ÿ-]+", consulta)
+    out = []
+    for n in range(min(maximo, len(pal)), 0, -1):
+        for i in range(len(pal) - n + 1):
+            g = pal[i:i + n]
+            if g[0].lower() in PARADAS_Q or g[-1].lower() in PARADAS_Q or (n == 1 and len(g[0]) < 4):
+                continue
+            out.append(" ".join(g))
+    return list(dict.fromkeys(out))
+
+
+def _texto_do_verbete(e, max_chars: int) -> str:
+    item = e.get_item()
+    if "html" not in item.mimetype:
+        return ""
+    t = html.unescape(re.sub(r"<[^>]+>", " ", re.sub(r"(?is)<(script|style).*?</\1>", " ",
+                                                      bytes(item.content).decode("utf-8", "ignore"))))
+    t = re.sub(r"\s+", " ", t).strip()
+    if t.startswith(e.title):
+        t = t[len(e.title):].strip()
+    return t[:max_chars]
+
+
+def _por_titulo(arq, consulta: str) -> list:
+    """Verbetes cujo título é um pedaço da pergunta (busca exata pelo título, rápida e precisa)."""
+    achados = []
+    for g in _ngramas(consulta):
+        for cand in dict.fromkeys([g[:1].upper() + g[1:], g, g.lower(), g.title()]):
+            try:
+                e = arq.get_entry_by_title(cand)
+            except (KeyError, RuntimeError):
+                continue
+            if e.is_redirect:
+                e = e.get_redirect_entry()
+            if e.path not in [x.path for x in achados]:
+                achados.append(e)
+            break
+        if len(achados) >= 3:
+            break
+    return achados
+
+
+def _por_busca(arq, consulta: str, n: int) -> list:
+    """Busca de texto completo (o índice exige TODAS as palavras: tenta as palavras-chave juntas e depois uma a uma)."""
+    from libzim.search import Query, Searcher
+    chaves = [w for w in re.findall(r"[\wÀ-ÿ-]+", consulta.lower()) if w not in PARADAS_Q and len(w) > 2]
+    tentativas = ([" ".join(chaves)] if chaves else []) + sorted(chaves, key=len, reverse=True)
+    for q in tentativas[:5]:
+        res = Searcher(arq).search(Query().set_query(q))
+        pega = getattr(res, "get_results", None) or getattr(res, "getResults")   # o nome mudou nas versões novas
+        caminhos = [getattr(r, "path", r) for r in pega(0, n)]
+        if caminhos:
+            out = []
+            for c in caminhos:
+                e = arq.get_entry_by_path(c)
+                out.append(e.get_redirect_entry() if e.is_redirect else e)
+            return out
+    return []
+
+
+def wikipedia(consulta: str, k: int = 2, max_chars: int = 700, exigir_titulo: bool = False) -> list[dict]:
+    """Busca nos arquivos .zim do disco grande (Wikipédia, Wikilivros, Wikiversidade, Wikcionário). Precisa do
+    pacote libzim; sem ele, devolve vazio. exigir_titulo=True: só verbetes cujo título aparece na pergunta
+    (usado nas conversas comuns, para não encher o contexto com coisas que não têm a ver)."""
     zims = _zims()
     if not zims or not _palavras(consulta):
         return []
     try:
         from libzim.reader import Archive
-        from libzim.search import Query, Searcher
     except ImportError:
         return []
+    # a Wikipédia primeiro; dicionário por último
+    zims = sorted(zims, key=lambda z: (0 if "wikipedia" in z.name else 2 if "wiktionary" in z.name else 1, z.name))
     saida = []
     for z in zims:
         try:
             arq = Archive(str(z))
-            res = Searcher(arq).search(Query().set_query(consulta))
-            for caminho in res.getResults(0, k):
-                e = arq.get_entry_by_path(caminho)
-                item = e.get_item()
-                if "html" not in item.mimetype:
+            entradas = _por_titulo(arq, consulta)
+            if not exigir_titulo and not entradas:
+                entradas = _por_busca(arq, consulta, k)
+            for e in entradas:
+                if exigir_titulo and not titulo_bate(e.title, consulta):
                     continue
-                t = html.unescape(re.sub(r"<[^>]+>", " ", re.sub(r"(?is)<(script|style).*?</\1>", " ",
-                                                                  bytes(item.content).decode("utf-8", "ignore"))))
-                t = re.sub(r"\s+", " ", t).strip()
-                saida.append({"titulo": e.title, "texto": t[:max_chars], "fonte": z.name})
+                t = _texto_do_verbete(e, max_chars)
+                if t and e.title not in [x["titulo"] for x in saida]:
+                    saida.append({"titulo": e.title, "texto": t, "fonte": z.name})
+                if len(saida) >= k:
+                    break
         except Exception:
             continue
         if len(saida) >= k:

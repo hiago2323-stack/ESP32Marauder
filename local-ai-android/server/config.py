@@ -72,9 +72,15 @@ MEMORY_DB = Path(os.environ.get("MEMORY_DB", str(HOME / "localai" / "memory.db")
 APPS_DIR = Path(os.environ.get("APPS_DIR", str(HOME / "localai" / "apps")))
 GRADLE_BIN = os.environ.get("GRADLE_BIN", str(HOME / "gradle" / "gradle-8.7" / "bin" / "gradle"))
 # Quantas vezes a IA tenta corrigir o código quando a compilação falha
-MAX_FIX_ATTEMPTS = int(os.environ.get("MAX_FIX_ATTEMPTS", "2"))
+MAX_FIX_ATTEMPTS = int(os.environ.get("MAX_FIX_ATTEMPTS", "4"))
 # Limite de palavras (tokens) que a IA pode escrever por tentativa
-GEN_MAX_TOKENS = int(os.environ.get("GEN_MAX_TOKENS", "2500"))
+GEN_MAX_TOKENS = int(os.environ.get("GEN_MAX_TOKENS", "3500"))
+# Contexto do modelo (o mesmo -c do start_llm.sh): limita o tamanho de cada pedido à IA
+CTX = int(os.environ.get("CTX", "8192"))
+# Mantém o Gradle carregado por 15 min entre compilações (as correções ficam bem mais rápidas)
+GRADLE_DAEMON = os.environ.get("GRADLE_DAEMON", "1") != "0"
+# Depois de compilar, a IA confere o código contra o pedido e completa o que faltar (REVISAO=0 desliga)
+REVISAO = os.environ.get("REVISAO", "1") != "0"
 
 # arduino-cli (compila firmware ESP32)
 ARDUINO_CLI = os.environ.get("ARDUINO_CLI", str(HOME / "bin" / "arduino-cli"))

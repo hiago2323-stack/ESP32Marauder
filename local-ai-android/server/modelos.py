@@ -58,11 +58,74 @@ def _id(repo: str, arquivo: str) -> str:
     return hashlib.sha1(f"{repo}/{arquivo}".encode()).hexdigest()[:10]
 
 
+def _nomes_tensores(arquivo: Path, limite: int = 4000) -> list[str]:
+    """Nomes dos tensores de um .gguf (lidos do cabeçalho, sem carregar o modelo)."""
+    with open(arquivo, "rb") as f:
+        if f.read(4) != b"GGUF":
+            raise ValueError("não é um arquivo GGUF")
+        _ver, nt, nkv = struct.unpack("<IQQ", f.read(20))
+
+        def le_str():
+            (n,) = struct.unpack("<Q", f.read(8))
+            return f.read(n).decode("utf-8", "ignore")
+
+        tam = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
+
+        def pula(t):
+            if t == 8:
+                le_str()
+            elif t == 9:
+                (et,) = struct.unpack("<I", f.read(4))
+                (n,) = struct.unpack("<Q", f.read(8))
+                if et in tam:
+                    f.seek(tam[et] * n, 1)
+                else:
+                    for _ in range(n):
+                        pula(et)
+            else:
+                f.seek(tam[t], 1)
+
+        for _ in range(nkv):
+            le_str()
+            (t,) = struct.unpack("<I", f.read(4))
+            pula(t)
+        nomes = []
+        for _ in range(min(nt, limite)):
+            nomes.append(le_str())
+            (nd,) = struct.unpack("<I", f.read(4))
+            f.seek(8 * nd + 12, 1)
+        return nomes
+
+
+def sd_completo(arquivo: Path) -> tuple[bool, str]:
+    """O modelo de imagem funciona sozinho no motor? (precisa ter difusão + codificador de texto + VAE no mesmo arquivo)"""
+    try:
+        nomes = _nomes_tensores(arquivo)
+    except (OSError, ValueError, struct.error, KeyError) as e:
+        return False, f"Arquivo ilegível ou incompleto ({e})."
+    tem = lambda *pref: any(n.startswith(pref) for n in nomes)
+    difusao = tem("model.diffusion_model.", "unet.")
+    vae = tem("first_stage_model.", "vae.")
+    texto = tem("cond_stage_model.", "conditioner.", "text_encoder", "te.", "text_encoders.")
+    if difusao and vae and texto:
+        return True, ""
+    falta = [n for n, ok in (("VAE", vae), ("codificador de texto", texto), ("modelo de difusão", difusao)) if not ok]
+    return False, ("Este arquivo não é um Stable Diffusion completo: falta " + ", ".join(falta) +
+                   " no mesmo arquivo (modelos como Flux, SD3.5 e Z-Image vêm em partes separadas). Não funciona sozinho aqui.")
+
+
 def extras_imagem() -> dict:
-    """Modelos de imagem adicionados, no mesmo formato de config.IMG_MODELOS (usado pelo gerador de imagens)."""
+    """Modelos de imagem adicionados e COMPATÍVEIS, no formato de config.IMG_MODELOS (usado pelo gerador de imagens)."""
     out = {}
-    for m in lista():
-        if m.get("tipo") != "imagem":
+    itens, mudou = lista(), False
+    for m in itens:
+        if m.get("tipo") == "imagem" and "compativel" not in m and Path(m["caminho"]).exists():
+            m["compativel"], m["motivo"] = sd_completo(Path(m["caminho"]))
+            mudou = True
+    if mudou:
+        _salva(itens)
+    for m in itens:
+        if m.get("tipo") != "imagem" or m.get("compativel") is False:
             continue
         rapido = bool(re.search(r"(?i)turbo|lcm|lightning|hyper|distill", m["nome"] + m["arquivo"]))
         out["x" + m["id"]] = {"nome": m["nome"], "arquivo": Path(m["caminho"]), "tam": m["tam"],
@@ -165,9 +228,13 @@ async def arquivos(repo: str, tipo: str = "texto") -> list[dict]:
         g["arquivos"] = [n for n, _ in usados]
         g["tam"] = sum(t for _, t in usados)
     itens = sorted(grupos.values(), key=lambda g: g["tam"])
+    partes = re.search(r"(?i)flux|sd3|sd-?3\.5|z-?image|qwen-?image|hidream|chroma|wan2|lumina|cosmos|kontext", repo)
     for g in itens:
         g["arquivos"].sort()
         g["aviso"] = aviso_tamanho(g["tam"], tipo)
+        if tipo == "imagem" and partes:
+            g["aviso"] = ("Atenção: este tipo de modelo costuma vir em partes (VAE e codificador de texto separados) e "
+                          "provavelmente NÃO funciona sozinho aqui. " + g["aviso"]).strip()
     # recomendado: a quantização preferida que cabe bem na RAM (texto) / o menor completo (imagem)
     limite = min(_ram_gb() * 0.40, 8.0) * 1e9
     rec = None
@@ -247,9 +314,12 @@ async def _baixa(job: dict, repo: str, tipo: str, nome: str, arquivos_: list[str
         primeiro = pasta / Path(arquivos_[0]).name
         total = sum((pasta / Path(n).name).stat().st_size for n in arquivos_)
         itens = [m for m in lista() if m["id"] != job["id"]]
-        itens.append({"id": job["id"], "nome": nome, "repo": repo, "tipo": tipo, "arquivo": primeiro.name,
-                      "caminho": str(primeiro), "tam": total, "quant": _quant(primeiro.name),
-                      "camadas": _camadas(primeiro) if tipo == "texto" else None})
+        item = {"id": job["id"], "nome": nome, "repo": repo, "tipo": tipo, "arquivo": primeiro.name,
+                "caminho": str(primeiro), "tam": total, "quant": _quant(primeiro.name),
+                "camadas": _camadas(primeiro) if tipo == "texto" else None}
+        if tipo == "imagem":
+            item["compativel"], item["motivo"] = await asyncio.to_thread(sd_completo, primeiro)
+        itens.append(item)
         _salva(itens)
         if job.get("usar_depois") and tipo == "texto":   # pediram "instala e já deixa selecionado"
             try:

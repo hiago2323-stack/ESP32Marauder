@@ -218,9 +218,15 @@ MEMORY_DB = Path(os.environ.get("MEMORY_DB", str(HOME / "localai" / "memory.db")
 APPS_DIR = Path(os.environ.get("APPS_DIR", str(HOME / "localai" / "apps")))
 GRADLE_BIN = os.environ.get("GRADLE_BIN", str(HOME / "gradle" / "gradle-8.7" / "bin" / "gradle"))
 # Quantas vezes a IA tenta corrigir o código quando a compilação falha
-MAX_FIX_ATTEMPTS = int(os.environ.get("MAX_FIX_ATTEMPTS", "2"))
+MAX_FIX_ATTEMPTS = int(os.environ.get("MAX_FIX_ATTEMPTS", "4"))
 # Limite de palavras (tokens) que a IA pode escrever por tentativa
-GEN_MAX_TOKENS = int(os.environ.get("GEN_MAX_TOKENS", "2500"))
+GEN_MAX_TOKENS = int(os.environ.get("GEN_MAX_TOKENS", "3500"))
+# Contexto do modelo (o mesmo -c do start_llm.sh): limita o tamanho de cada pedido à IA
+CTX = int(os.environ.get("CTX", "8192"))
+# Mantém o Gradle carregado por 15 min entre compilações (as correções ficam bem mais rápidas)
+GRADLE_DAEMON = os.environ.get("GRADLE_DAEMON", "1") != "0"
+# Depois de compilar, a IA confere o código contra o pedido e completa o que faltar (REVISAO=0 desliga)
+REVISAO = os.environ.get("REVISAO", "1") != "0"
 
 # arduino-cli (compila firmware ESP32)
 ARDUINO_CLI = os.environ.get("ARDUINO_CLI", str(HOME / "bin" / "arduino-cli"))
@@ -533,13 +539,15 @@ async def _build_messages(req: ChatRequest) -> tuple[list[dict], int]:
             partes.append("Pesquisa na web:\n" + "\n".join(
                 f"[{i+1}] {r['title']} - {r['url']}\n{(r['snippet'] or '')[:260]}" for i, r in enumerate(results)))
 
-    if req.web and n_web == 0:  # sem internet (ou sem resultados): a Wikipedia offline do disco grande ajuda
+    # Enciclopédias offline do disco grande (Wikipédia, Wikilivros, Wikiversidade, Wikcionário): em toda conversa
+    # entram os verbetes cujo título aparece na pergunta; sem internet (ou sem resultado na web), os mais parecidos.
+    if not n_web and len(pergunta) < 600:
         try:
-            wiki = await asyncio.to_thread(biblioteca.wikipedia, pergunta)
+            wiki = await asyncio.to_thread(biblioteca.wikipedia, pergunta, 2, 700, not req.web)
         except Exception:
             wiki = []
         if wiki:
-            partes.append("Wikipedia (offline):\n" + "\n".join(f"- {w['titulo']}: {w['texto']}" for w in wiki))
+            partes.append("Enciclopédia offline:\n" + "\n".join(f"- {w['titulo']}: {w['texto']}" for w in wiki))
 
     if partes:
         msgs[ultimo]["content"] = "[CONTEXTO]\n" + "\n\n".join(partes) + "\n[FIM DO CONTEXTO]\n\n" + pergunta
@@ -1463,90 +1471,16 @@ from pathlib import Path
 import httpx
 
 import config
+import gerador
 import entregas
 import recursos
 
 PACKAGE = "com.localai.app"
 
-SYSTEM_PROMPT = """Você é um programador Android experiente. Escreva UM aplicativo Android completo em UM único arquivo Java.
+SYSTEM_PROMPT = 'Você é um desenvolvedor Android sênior. Escreva UM aplicativo Android COMPLETO, funcional e bonito em UM único arquivo Java.\n\nO projeto Gradle já existe; você escreve só o MainActivity.java. REGRAS:\n1. Primeira linha: package com.localai.app;\n2. public class MainActivity extends Activity (android.app.Activity). NÃO use AppCompatActivity, AndroidX, Kotlin, Compose nem bibliotecas externas.\n3. Use só android.*, java.* e org.json. NÃO existem layouts XML nem R.layout/R.id/R.drawable: monte a interface toda por código (LinearLayout, ScrollView, TextView, EditText, Button, ListView + ArrayAdapter...) e chame setContentView(...).\n4. Coloque TODOS os imports (inclusive android.view.View e cada android.widget usado).\n5. Logo depois do package, escreva um comentário /* O QUE O APP FAZ: ... */ listando em tópicos as funções que você vai implementar. Depois implemente TODAS de verdade (nada de "TODO" ou funções vazias).\n6. O que o usuário cria (listas, notas, configurações, pontuações) deve ser SALVO com SharedPreferences (JSON com org.json) e carregado no onCreate.\n7. Variáveis usadas dentro de listeners/lambdas e que mudam: declare como CAMPOS da classe (private), não como variáveis locais.\n8. Rede: HttpURLConnection dentro de new Thread(...) e atualize a tela com runOnUiThread(...). Repetição/tempo: android.os.Handler + postDelayed (não use AsyncTask nem Timer para mexer na tela).\n9. Visual caprichado: margens com um método dp(int), fonte legível, cores com Color.parseColor("#..."), botões com GradientDrawable arredondado.\n10. Textos da interface em português do Brasil. Diálogos: android.app.AlertDialog.Builder. Avisos curtos: Toast.\n\nFORMATO DA RESPOSTA (exatamente assim, sem explicação fora do bloco):\nNOME: <nome curto do app>\n```java\n<código completo>\n```'
 
-REGRAS OBRIGATÓRIAS:
-1. Primeira linha do arquivo: package com.localai.app;
-2. Classe principal: public class MainActivity extends android.app.Activity (NÃO use AppCompatActivity, NÃO use AndroidX, NÃO use Kotlin).
-3. Use SOMENTE classes do Android (android.*) e do Java (java.*). Nenhuma biblioteca externa.
-4. NÃO use arquivos XML nem R.layout/R.id. Monte toda a interface por código Java (LinearLayout, TextView, Button, EditText, ScrollView, ListView com ArrayAdapter, etc.) e chame setContentView(view).
-5. Inclua TODOS os imports necessários. O código precisa compilar na primeira tentativa.
-6. Converta dp para pixels com um método auxiliar (ex.: (int) (valor * getResources().getDisplayMetrics().density)).
-7. Rede (se precisar): HttpURLConnection dentro de uma Thread e atualize a tela com runOnUiThread.
-8. Todos os textos da interface em português do Brasil.
-9. Classes auxiliares podem existir no mesmo arquivo (sem "public").
-
-FORMATO DA RESPOSTA (siga exatamente, sem explicações):
-NOME: <nome curto do app>
-```java
-<código completo>
-```"""
-
-EXEMPLO_PEDIDO = "um contador com botões de mais e menos"
-EXEMPLO_RESPOSTA = """NOME: Contador
-```java
-package com.localai.app;
-
-import android.app.Activity;
-import android.os.Bundle;
-import android.view.Gravity;
-import android.view.View;
-import android.widget.Button;
-import android.widget.LinearLayout;
-import android.widget.TextView;
-
-public class MainActivity extends Activity {
-    private int valor = 0;
-
-    private int dp(int v) {
-        return (int) (v * getResources().getDisplayMetrics().density);
-    }
-
-    @Override
-    protected void onCreate(Bundle savedInstanceState) {
-        super.onCreate(savedInstanceState);
-        LinearLayout raiz = new LinearLayout(this);
-        raiz.setOrientation(LinearLayout.VERTICAL);
-        raiz.setGravity(Gravity.CENTER);
-        raiz.setPadding(dp(24), dp(24), dp(24), dp(24));
-
-        final TextView texto = new TextView(this);
-        texto.setTextSize(48);
-        texto.setGravity(Gravity.CENTER);
-        texto.setText("0");
-
-        Button mais = new Button(this);
-        mais.setText("+1");
-        mais.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                valor++;
-                texto.setText(String.valueOf(valor));
-            }
-        });
-
-        Button menos = new Button(this);
-        menos.setText("-1");
-        menos.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                valor--;
-                texto.setText(String.valueOf(valor));
-            }
-        });
-
-        raiz.addView(texto);
-        raiz.addView(mais);
-        raiz.addView(menos);
-        setContentView(raiz);
-    }
-}
-```"""
+EXEMPLO_PEDIDO = 'um conversor de temperatura de Celsius para Fahrenheit que guarda o histórico'
+EXEMPLO_RESPOSTA = 'NOME: Conversor de Temperatura\n```java\npackage com.localai.app;\n\n/* O QUE O APP FAZ:\n * - Campo para digitar a temperatura em Celsius e botão Converter\n * - Mostra o resultado em Fahrenheit\n * - Guarda o histórico das conversões (salvo no celular) e mostra numa lista\n * - Botão para limpar o histórico\n */\n\nimport android.app.Activity;\nimport android.app.AlertDialog;\nimport android.content.SharedPreferences;\nimport android.graphics.Color;\nimport android.graphics.drawable.GradientDrawable;\nimport android.os.Bundle;\nimport android.text.InputType;\nimport android.view.Gravity;\nimport android.view.View;\nimport android.widget.ArrayAdapter;\nimport android.widget.Button;\nimport android.widget.EditText;\nimport android.widget.LinearLayout;\nimport android.widget.ListView;\nimport android.widget.TextView;\nimport android.widget.Toast;\n\nimport org.json.JSONArray;\n\nimport java.util.ArrayList;\nimport java.util.Locale;\n\npublic class MainActivity extends Activity {\n    private final ArrayList<String> historico = new ArrayList<>();\n    private ArrayAdapter<String> adaptador;\n    private EditText campo;\n    private TextView resultado;\n    private SharedPreferences prefs;\n\n    private int dp(int v) {\n        return (int) (v * getResources().getDisplayMetrics().density);\n    }\n\n    private Button botao(String texto, String cor) {\n        Button b = new Button(this);\n        b.setText(texto);\n        b.setTextColor(Color.WHITE);\n        b.setAllCaps(false);\n        GradientDrawable fundo = new GradientDrawable();\n        fundo.setColor(Color.parseColor(cor));\n        fundo.setCornerRadius(dp(12));\n        b.setBackground(fundo);\n        return b;\n    }\n\n    @Override\n    protected void onCreate(Bundle savedInstanceState) {\n        super.onCreate(savedInstanceState);\n        prefs = getSharedPreferences("dados", MODE_PRIVATE);\n\n        LinearLayout raiz = new LinearLayout(this);\n        raiz.setOrientation(LinearLayout.VERTICAL);\n        raiz.setPadding(dp(20), dp(20), dp(20), dp(20));\n        raiz.setBackgroundColor(Color.parseColor("#F4F6FA"));\n\n        TextView titulo = new TextView(this);\n        titulo.setText("Celsius → Fahrenheit");\n        titulo.setTextSize(24);\n        titulo.setTextColor(Color.parseColor("#1F2A44"));\n        raiz.addView(titulo);\n\n        campo = new EditText(this);\n        campo.setHint("Temperatura em °C");\n        campo.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL | InputType.TYPE_NUMBER_FLAG_SIGNED);\n        raiz.addView(campo);\n\n        Button converter = botao("Converter", "#2E7D32");\n        converter.setOnClickListener(v -> converte());\n        raiz.addView(converter);\n\n        resultado = new TextView(this);\n        resultado.setTextSize(28);\n        resultado.setGravity(Gravity.CENTER);\n        resultado.setPadding(0, dp(16), 0, dp(16));\n        raiz.addView(resultado);\n\n        Button limpar = botao("Limpar histórico", "#C62828");\n        limpar.setOnClickListener(v -> new AlertDialog.Builder(this)\n                .setTitle("Limpar histórico?")\n                .setPositiveButton("Sim", (d, w) -> {\n                    historico.clear();\n                    adaptador.notifyDataSetChanged();\n                    salva();\n                })\n                .setNegativeButton("Não", null)\n                .show());\n        raiz.addView(limpar);\n\n        ListView lista = new ListView(this);\n        adaptador = new ArrayAdapter<>(this, android.R.layout.simple_list_item_1, historico);\n        lista.setAdapter(adaptador);\n        raiz.addView(lista, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));\n\n        carrega();\n        setContentView(raiz);\n    }\n\n    private void converte() {\n        String texto = campo.getText().toString().trim().replace(\',\', \'.\');\n        if (texto.isEmpty()) {\n            Toast.makeText(this, "Digite uma temperatura", Toast.LENGTH_SHORT).show();\n            return;\n        }\n        try {\n            double c = Double.parseDouble(texto);\n            double f = c * 9 / 5 + 32;\n            String linha = String.format(Locale.US, "%.1f °C = %.1f °F", c, f);\n            resultado.setText(linha);\n            historico.add(0, linha);\n            adaptador.notifyDataSetChanged();\n            salva();\n        } catch (NumberFormatException e) {\n            Toast.makeText(this, "Número inválido", Toast.LENGTH_SHORT).show();\n        }\n    }\n\n    private void salva() {\n        prefs.edit().putString("historico", new JSONArray(historico).toString()).apply();\n    }\n\n    private void carrega() {\n        try {\n            JSONArray a = new JSONArray(prefs.getString("historico", "[]"));\n            for (int i = 0; i < a.length(); i++) {\n                historico.add(a.getString(i));\n            }\n            adaptador.notifyDataSetChanged();\n        } catch (Exception e) {\n            historico.clear();\n        }\n    }\n}\n```'
 
 # ------------------------------------------------------------------ projeto Gradle
 SETTINGS_GRADLE = """pluginManagement {
@@ -1572,7 +1506,8 @@ ROOT_BUILD_GRADLE = """plugins {
 }
 """
 
-GRADLE_PROPERTIES = """org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+GRADLE_PROPERTIES = """org.gradle.jvmargs=-Xmx1536m -Dfile.encoding=UTF-8
+org.gradle.daemon.idletimeout=900000
 android.useAndroidX=false
 android.nonTransitiveRClass=true
 """
@@ -1656,7 +1591,7 @@ def extrai_resposta(texto: str) -> tuple[str, str]:
     m = re.search(r"```(?:java)?\s*\n(.*?)(?:```|$)", texto, re.S)
     if not m:
         raise ValueError("A IA não devolveu um bloco de código.")
-    codigo = m.group(1).strip()
+    codigo = tira_numeros(m.group(1).strip())
     if "class MainActivity" not in codigo:
         raise ValueError("O código não define a classe MainActivity.")
     if not re.match(r"\s*package\s+com\.localai\.app\s*;", codigo):
@@ -1665,6 +1600,23 @@ def extrai_resposta(texto: str) -> tuple[str, str]:
     n = re.search(r"NOME:\s*(.+)", texto)
     nome = (n.group(1).strip() if n else "App IA")[:40] or "App IA"
     return nome, codigo + "\n"
+
+
+def tira_numeros(codigo: str) -> str:
+    """Se a IA devolveu o código com os números de linha da correção ("  12| ..."), tira os números."""
+    ls = codigo.split("\n")
+    if ls and sum(1 for ln in ls if re.match(r"^\s*\d+\|", ln)) > len(ls) * 0.6:
+        return "\n".join(re.sub(r"^\s*\d+\|\s?", "", ln) for ln in ls)
+    return codigo
+
+
+def cortado(texto: str) -> bool:
+    """A resposta acabou no meio do código (o modelo atingiu o limite de palavras)?"""
+    m = re.search(r"```\w*\s*\n(.*)", texto, re.S)
+    if not m or "```" in m.group(1):
+        return False
+    corpo = gerador._sem_comentarios_e_textos(m.group(1))
+    return corpo.count("{") > corpo.count("}")
 
 
 def resumo_erros(log: str, limite: int = 1600) -> str:
@@ -1683,11 +1635,10 @@ def resumo_erros(log: str, limite: int = 1600) -> str:
 
 
 # ------------------------------------------------------------------ chamadas externas
-async def pede_codigo(messages: list[dict], emit) -> str:
-    """Chama o llama-server em streaming e junta o texto, avisando o progresso."""
-    payload = {"messages": messages, "stream": True, "temperature": 0.2, "top_p": 0.9,
-               "cache_prompt": True,  # o exemplo e as regras são sempre iguais: reaproveita o cálculo
-               "max_tokens": config.GEN_MAX_TOKENS}
+async def _uma_chamada(messages: list[dict], emit, temperatura: float, max_tokens: int) -> str:
+    payload = {"messages": messages, "stream": True, "temperature": temperatura, "top_p": 0.9,
+               "cache_prompt": True,  # as regras e o exemplo são sempre iguais: reaproveita o cálculo
+               "max_tokens": max_tokens}
     texto, n, ultimo = "", 0, time.time()
     async with httpx.AsyncClient(timeout=None) as client:
         try:
@@ -1715,6 +1666,25 @@ async def pede_codigo(messages: list[dict], emit) -> str:
     return texto
 
 
+async def pede_codigo(messages: list[dict], emit, temperatura: float = 0.2) -> str:
+    """Chama o llama-server em streaming. Se a resposta for cortada no meio do código, pede para continuar."""
+    tamanho = sum(len(m["content"]) for m in messages) // 3      # ~3 letras por "palavra" do modelo
+    limite = max(1024, min(config.GEN_MAX_TOKENS, config.CTX - tamanho - 200))
+    texto = await _uma_chamada(messages, emit, temperatura, limite)
+    for _ in range(2):
+        if not cortado(texto):
+            break
+        resto = config.CTX - (tamanho + len(texto) // 3) - 200
+        if resto < 400:
+            break
+        mais = await _uma_chamada(messages + [{"role": "assistant", "content": texto},
+                                              {"role": "user", "content": "A resposta foi cortada. Continue EXATAMENTE de onde parou, sem repetir nada e sem explicações."}],
+                                  emit, temperatura, min(resto, config.GEN_MAX_TOKENS))
+        mais = re.sub(r"^\s*```\w*\s*\n", "", mais)   # se ela reabrir o bloco, ignora a abertura
+        texto += mais
+    return texto
+
+
 async def compila(pasta: Path) -> tuple[bool, str, Path | None]:
     gradle = config.GRADLE_BIN
     env = dict(os.environ)
@@ -1725,8 +1695,8 @@ async def compila(pasta: Path) -> tuple[bool, str, Path | None]:
     # start_new_session: o Gradle e os processos que ele cria ficam num grupo próprio,
     # para podermos matar tudo de uma vez ao cancelar (senão sobra Java rodando escondido)
     proc = await asyncio.create_subprocess_exec(
-        *recursos.baixa_prioridade([gradle, "assembleDebug", "--no-daemon", "--console=plain", "-q",
-                                    "-Dorg.gradle.workers.max=2"]),
+        *recursos.baixa_prioridade([gradle, "assembleDebug", "--console=plain", "-q", "-Dorg.gradle.workers.max=2"]
+                                   + ([] if config.GRADLE_DAEMON else ["--no-daemon"])),
         cwd=pasta, env=env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
         start_new_session=True,
     )
@@ -1758,12 +1728,65 @@ async def compila(pasta: Path) -> tuple[bool, str, Path | None]:
 _trava = recursos.pesado   # uma tarefa pesada por vez (RAM/CPU compartilhadas)
 
 
+def _pedido_limpo(descricao: str) -> str:
+    """O pedido sem as referências da biblioteca (nas correções elas só ocupariam espaço)."""
+    return descricao.split("\n\nReferências da biblioteca local")[0].split("\n\n(Pedido curto:")[0].strip()
+
+
+async def _pede_revisao(mensagens, temperatura, max_tokens):
+    async def mudo(_ev):
+        return None
+    return await _uma_chamada(mensagens, mudo, temperatura, max_tokens)
+
+
+async def _compila_e_corrige(codigo: str, nome: str, app_id: str, pedido: str, pasta: Path, emit,
+                             rodadas: int) -> tuple[bool, str, Path | None, str]:
+    """Compila; corrige sozinho o que é mecânico; chama a IA (conversa limpa) para o resto.
+    Devolve (ok, código final, apk, relatório de erros)."""
+    erros, log, anteriores, relatorio = [], "", set(), ""
+    for rodada in range(rodadas + 1):
+        for _auto in range(3):
+            codigo, feito = gerador.normaliza_java(codigo, PACKAGE)
+            if feito:
+                await emit({"type": "status", "msg": "Ajuste automático: " + "; ".join(feito) + "."})
+            await emit({"type": "code", "text": codigo})
+            if pasta.exists():
+                shutil.rmtree(pasta)
+            escreve_projeto(pasta, nome, app_id, codigo)
+            await emit({"type": "status", "msg": "Compilando o app… (a primeira vez baixa as ferramentas e demora mais)"})
+            ok, log, apk = await compila(pasta)
+            if ok:
+                return True, codigo, apk, ""
+            erros = gerador.erros_java(log)
+            codigo2, feito2 = gerador.corrige_java_por_erros(codigo, erros)
+            if not feito2:
+                break
+            codigo = codigo2
+            await emit({"type": "status", "msg": "Corrigi sozinho: " + "; ".join(feito2) + ". Compilando de novo…"})
+        relatorio = gerador.relatorio_erros(erros, codigo, gerador.dica_java, log=log)
+        assinatura = gerador.assinatura_erros(erros, codigo)
+        if assinatura and assinatura <= anteriores:
+            relatorio += gerador.AVISO_REPETIDO
+        anteriores = assinatura
+        if rodada >= rodadas:
+            break
+        await emit({"type": "status", "msg": f"A IA está corrigindo {len(erros) or 1} erro(s) (rodada {rodada + 1} de {rodadas})…"})
+        msgs = gerador.mensagens_correcao(SYSTEM_PROMPT, pedido, codigo, relatorio, "java", nome)
+        texto = await pede_codigo(msgs, emit, temperatura=0.4 if gerador.AVISO_REPETIDO in relatorio else 0.1)
+        try:
+            _n, codigo = extrai_resposta(texto)
+        except ValueError:
+            continue   # resposta inútil: tenta outra rodada com o mesmo código
+    return False, codigo, None, relatorio
+
+
 async def gera_app(descricao: str, emit, base_codigo: str | None = None, base_nome: str | None = None) -> None:
     """Executa o fluxo completo, mandando eventos por emit(dict)."""
     if _trava.locked():
         await emit({"type": "error", "msg": "Ainda estou criando outro app. Espere ele terminar ou clique em Parar."})
         return
     async with _trava:
+        await gerador.garante_modelo_codigo(emit)
         mensagens = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": f"Crie: {EXEMPLO_PEDIDO}"},
@@ -1773,54 +1796,61 @@ async def gera_app(descricao: str, emit, base_codigo: str | None = None, base_no
                 f"devolva o arquivo COMPLETO no mesmo formato. Pedido: {descricao}") if base_codigo
              else f"Crie: {descricao}"},
         ]
+        pedido = _pedido_limpo(descricao)
         id_ = uuid.uuid4().hex[:10]
         pasta = config.WORK_DIR / f"app-{id_}"
+        pasta2 = config.WORK_DIR / f"app-{id_}-rev"
         try:
-            for tentativa in range(config.MAX_FIX_ATTEMPTS + 1):
-                if tentativa == 0:
-                    await emit({"type": "status", "msg": "A IA está escrevendo o código do app… (pode levar alguns minutos)"})
-                else:
-                    await emit({"type": "status",
-                                "msg": f"Deu erro ao compilar. A IA está corrigindo (tentativa {tentativa} de {config.MAX_FIX_ATTEMPTS})…"})
-                texto = await pede_codigo(mensagens, emit)
+            await emit({"type": "status", "msg": "A IA está escrevendo o código do app… (pode levar alguns minutos)"})
+            texto = await pede_codigo(mensagens, emit)
+            try:
+                nome, codigo = extrai_resposta(texto)
+            except ValueError:   # fora do formato: pede de novo, lembrando o formato
+                texto = await pede_codigo(mensagens + [{"role": "assistant", "content": texto[:3000]}, {"role": "user", "content":
+                        "Responda SÓ no formato pedido: a linha NOME: e o código completo dentro de ```java ... ```."}], emit)
                 try:
                     nome, codigo = extrai_resposta(texto)
-                    if base_nome and nome == "App IA":
-                        nome = base_nome
                 except ValueError as e:
                     await emit({"type": "error", "msg": str(e), "log": texto[-1500:]})
                     return
-                await emit({"type": "code", "text": codigo})
-
-                if pasta.exists():
-                    shutil.rmtree(pasta)
-                app_id = f"com.localai.{slugify(nome)}{id_[:4]}"
-                escreve_projeto(pasta, nome, app_id, codigo)
-                await emit({"type": "status", "msg": "Compilando o app… (a primeira vez baixa as ferramentas e demora mais)"})
-                ok, log, apk = await compila(pasta)
-                if ok:
-                    meta = entregas.salva(
-                        id_, nome, descricao, "apk",
-                        [(apk, f"{slugify(nome)}.apk", "App Android (.apk)")],
-                        {"code": codigo, "app_id": app_id})
-                    shutil.rmtree(pasta, ignore_errors=True)
-                    await emit({"type": "done", "id": id_, "name": nome, "kind": "apk", "files": meta["files"],
-                                "note": "Passe o arquivo para o celular e abra-o para instalar. Se o Android pedir, permita instalar de fontes desconhecidas."})
-                    return
-                erros = resumo_erros(log)
-                if tentativa >= config.MAX_FIX_ATTEMPTS:
-                    await emit({"type": "error", "msg": "Não consegui compilar o app depois das correções.", "log": erros})
-                    return
-                mensagens += [
-                    {"role": "assistant", "content": texto},
-                    {"role": "user", "content": (
-                        "O código NÃO compilou. ERROS DE COMPILAÇÃO:\n" + erros +
-                        "\n\nCorrija e devolva o arquivo COMPLETO no mesmo formato (NOME: e bloco ```java).")},
-                ]
+            if base_nome and nome == "App IA":
+                nome = base_nome
+            app_id = f"com.localai.{slugify(nome)}{id_[:4]}"
+            ok, codigo, apk, relatorio = await _compila_e_corrige(codigo, nome, app_id, pedido, pasta, emit, config.MAX_FIX_ATTEMPTS)
+            if not ok:
+                await emit({"type": "error", "msg": "Não consegui compilar o app depois das correções.", "log": relatorio})
+                return
+            nota_rev = ""
+            if config.REVISAO:
+                await emit({"type": "status", "msg": "Compilou! A IA está conferindo se o app faz tudo o que você pediu…"})
+                faltando = gerador.confere_pedido(pedido, codigo, "java")
+                faltando += [f for f in await gerador.revisa(pedido, codigo, "java", _pede_revisao) if f not in faltando]
+                faltando = faltando[:4]
+                if faltando:
+                    await emit({"type": "status", "msg": "Faltou: " + "; ".join(faltando) + ". A IA está completando…"})
+                    texto = await pede_codigo(gerador.mensagens_melhoria(SYSTEM_PROMPT, pedido, codigo, faltando, "java", nome), emit)
+                    try:
+                        _n, codigo2 = extrai_resposta(texto)
+                        ok2, codigo2, apk2, _r = await _compila_e_corrige(codigo2, nome, app_id, pedido, pasta2, emit, 2)
+                    except ValueError:
+                        ok2 = False
+                    if ok2:
+                        codigo, apk = codigo2, apk2
+                        nota_rev = " A revisão completou: " + "; ".join(faltando) + "."
+                    else:
+                        await emit({"type": "code", "text": codigo})
+                        nota_rev = " (A revisão sugeriu completar: " + "; ".join(faltando) + ", mas essa versão não compilou; entreguei a que funciona.)"
+            meta = entregas.salva(
+                id_, nome, descricao, "apk",
+                [(apk, f"{slugify(nome)}.apk", "App Android (.apk)")],
+                {"code": codigo, "app_id": app_id})
+            await emit({"type": "done", "id": id_, "name": nome, "kind": "apk", "files": meta["files"],
+                        "note": "Toque para baixar no celular e instalar. Se o Android pedir, permita instalar de fontes desconhecidas." + nota_rev})
         except RuntimeError as e:
             await emit({"type": "error", "msg": str(e)})
         finally:
             shutil.rmtree(pasta, ignore_errors=True)
+            shutil.rmtree(pasta2, ignore_errors=True)
 EOF
   cat > entregas.py <<'EOF'
 """Arquivos entregues ao usuário (.apk, .bin...): guarda no disco e lista para download.
@@ -1918,6 +1948,7 @@ from pathlib import Path
 
 import androidgen
 import config
+import gerador
 import entregas
 import recursos
 
@@ -1930,49 +1961,17 @@ PLACAS = {
     "esp32c6": ("ESP32-C6", "esp32:esp32:esp32c6"),
 }
 
-SYSTEM_PROMPT = """Você é um programador de firmware experiente em Arduino para ESP32. Escreva UM sketch Arduino completo em UM único arquivo .ino.
+SYSTEM_PROMPT = 'Você é um engenheiro de firmware sênior em Arduino para ESP32 (núcleo Arduino-ESP32 versão 3.x). Escreva UM sketch .ino COMPLETO e funcional.\n\nREGRAS:\n1. Defina setup() e loop(). Serial.begin(115200) no setup e mensagens úteis na serial, em português.\n2. No topo, um comentário /* O QUE FAZ: ... LIGAÇÕES: ... */ dizendo o que o firmware faz e quais pinos/sensores usa.\n3. Bibliotecas permitidas: as do núcleo (WiFi.h, WebServer.h, HTTPClient.h, WiFiClientSecure.h, Wire.h, SPI.h, Preferences.h, ESPmDNS.h, BLEDevice.h, esp_now.h...) e estas, que o servidor instala sozinho: DHT.h (DHT sensor library), PubSubClient.h, ArduinoJson.h (versão 7: JsonDocument doc;), Adafruit_SSD1306.h + Adafruit_GFX.h, Adafruit_NeoPixel.h, FastLED.h, OneWire.h + DallasTemperature.h, LiquidCrystal_I2C.h, ESP32Servo.h, Adafruit_BME280.h, WiFiManager.h, NTPClient.h.\n4. API do núcleo 3.x (a antiga NÃO compila):\n   - PWM: ledcAttach(PINO, FREQUENCIA, BITS); depois ledcWrite(PINO, duty);   (NUNCA ledcSetup nem ledcAttachPin)\n   - Timer: hw_timer_t *t = timerBegin(1000000); timerAttachInterrupt(t, &funcao); timerAlarm(t, MICROSSEGUNDOS, true, 0);\n   - Temperatura interna do chip: temperatureRead() (em °C)\n   - Servo: #include <ESP32Servo.h> (Servo.h não existe no ESP32)\n5. Declare variáveis globais, objetos e funções ANTES de usar. Com WiFi/servidor web/MQTT não use delay() longo: use millis().\n6. WiFi: credenciais em constantes no topo (const char* WIFI_SSID = "SUA_REDE"; const char* WIFI_SENHA = "SUA_SENHA";) e reconexão automática no loop.\n7. LED da placa: pino 2 (salvo outro pedido). Leitura analógica com WiFi ligado: use pinos do ADC1 (32 a 39).\n\nFORMATO DA RESPOSTA (exatamente assim, sem explicação fora do bloco):\nNOME: <nome curto do firmware>\n```cpp\n<código completo>\n```'
 
-REGRAS OBRIGATÓRIAS:
-1. Use SOMENTE bibliotecas que já vêm no núcleo ESP32 do Arduino (WiFi.h, WebServer.h, HTTPClient.h, Wire.h, SPI.h, Preferences.h, BluetoothSerial.h etc.). NENHUMA biblioteca externa (nada de Adafruit, FastLED, PubSubClient...).
-2. Defina setup() e loop(). Inicie a serial com Serial.begin(115200).
-3. Inclua TODOS os #include necessários. O código precisa compilar na primeira tentativa.
-4. Para o LED da placa use o pino 2 (const int LED = 2;), a menos que o usuário peça outro.
-5. Comentários e textos da serial em português do Brasil.
-6. Não use delay() longos que travem o programa quando houver servidor web; prefira millis().
-
-FORMATO DA RESPOSTA (siga exatamente, sem explicações):
-NOME: <nome curto do firmware>
-```cpp
-<código completo>
-```"""
-
-EXEMPLO_PEDIDO = "piscar o LED a cada segundo e escrever na serial"
-EXEMPLO_RESPOSTA = """NOME: Pisca LED
-```cpp
-// Pisca o LED a cada segundo e informa na serial
-const int LED = 2;
-bool ligado = false;
-
-void setup() {
-  Serial.begin(115200);
-  pinMode(LED, OUTPUT);
-  Serial.println("Pisca LED iniciado");
-}
-
-void loop() {
-  ligado = !ligado;
-  digitalWrite(LED, ligado ? HIGH : LOW);
-  Serial.println(ligado ? "LED ligado" : "LED desligado");
-  delay(1000);
-}
-```"""
+EXEMPLO_PEDIDO = 'uma página web para ligar e desligar o LED da placa e mostrar há quanto tempo ela está ligada'
+EXEMPLO_RESPOSTA = 'NOME: LED pela Web\n```cpp\n/* O QUE FAZ: cria uma página web (http://IP-da-placa/) com botões para ligar e desligar o LED\n * e mostra há quantos segundos a placa está ligada. Reconecta o WiFi sozinho.\n * LIGAÇÕES: LED da placa no pino 2 (nada externo).\n */\n#include <WiFi.h>\n#include <WebServer.h>\n\nconst char* WIFI_SSID = "SUA_REDE";\nconst char* WIFI_SENHA = "SUA_SENHA";\nconst int LED = 2;\n\nWebServer servidor(80);\nbool ledLigado = false;\nunsigned long ultimaTentativaWifi = 0;\n\nString pagina() {\n  String h = "<!DOCTYPE html><html><head><meta charset=\'utf-8\'><meta name=\'viewport\' content=\'width=device-width\'>";\n  h += "<title>LED</title></head><body style=\'font-family:sans-serif;text-align:center\'>";\n  h += "<h1>LED " + String(ledLigado ? "LIGADO" : "DESLIGADO") + "</h1>";\n  h += "<p><a href=\'/ligar\'><button>Ligar</button></a> <a href=\'/desligar\'><button>Desligar</button></a></p>";\n  h += "<p>Ligada há " + String(millis() / 1000) + " s</p></body></html>";\n  return h;\n}\n\nvoid mostraPagina() {\n  servidor.send(200, "text/html", pagina());\n}\n\nvoid ligar() {\n  ledLigado = true;\n  digitalWrite(LED, HIGH);\n  servidor.sendHeader("Location", "/");\n  servidor.send(303);\n}\n\nvoid desligar() {\n  ledLigado = false;\n  digitalWrite(LED, LOW);\n  servidor.sendHeader("Location", "/");\n  servidor.send(303);\n}\n\nvoid conectaWifi() {\n  Serial.print("Conectando ao WiFi ");\n  Serial.println(WIFI_SSID);\n  WiFi.mode(WIFI_STA);\n  WiFi.begin(WIFI_SSID, WIFI_SENHA);\n  unsigned long inicio = millis();\n  while (WiFi.status() != WL_CONNECTED && millis() - inicio < 15000) {\n    delay(250);\n    Serial.print(".");\n  }\n  Serial.println();\n  if (WiFi.status() == WL_CONNECTED) {\n    Serial.print("Conectado! Abra http://");\n    Serial.println(WiFi.localIP());\n  } else {\n    Serial.println("Não conectou; tento de novo depois.");\n  }\n}\n\nvoid setup() {\n  Serial.begin(115200);\n  pinMode(LED, OUTPUT);\n  digitalWrite(LED, LOW);\n  conectaWifi();\n  servidor.on("/", mostraPagina);\n  servidor.on("/ligar", ligar);\n  servidor.on("/desligar", desligar);\n  servidor.begin();\n  Serial.println("Servidor web iniciado");\n}\n\nvoid loop() {\n  servidor.handleClient();\n  if (WiFi.status() != WL_CONNECTED && millis() - ultimaTentativaWifi > 10000) {\n    ultimaTentativaWifi = millis();\n    conectaWifi();\n  }\n}\n```'
 
 
 def extrai_resposta(texto: str) -> tuple[str, str]:
     m = re.search(r"```(?:cpp|c\+\+|arduino|ino|c)?\s*\n(.*?)(?:```|$)", texto, re.S)
     if not m:
         raise ValueError("A IA não devolveu um bloco de código.")
-    codigo = m.group(1).strip()
+    codigo = androidgen.tira_numeros(m.group(1).strip())
     if "void setup" not in codigo or "void loop" not in codigo:
         raise ValueError("O código não tem as funções setup() e loop().")
     n = re.search(r"NOME:\s*(.+)", texto)
@@ -1980,12 +1979,20 @@ def extrai_resposta(texto: str) -> tuple[str, str]:
     return nome, codigo + "\n"
 
 
+def _build_path(fqbn: str) -> Path:
+    """Pasta de build fixa por placa: o núcleo do ESP32 compilado é reaproveitado (as correções ficam rápidas)."""
+    p = config.WORK_DIR / "esp-build" / fqbn.replace(":", "_")
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
 async def compila(pasta: Path, fqbn: str) -> tuple[bool, str, Path]:
     saida_dir = pasta / "out"
     cli = config.ARDUINO_CLI
     env = dict(os.environ)
     proc = await asyncio.create_subprocess_exec(
-        *recursos.baixa_prioridade([cli, "compile", "--fqbn", fqbn, "--output-dir", str(saida_dir), str(pasta / "sketch")]),
+        *recursos.baixa_prioridade([cli, "compile", "--fqbn", fqbn, "--build-path", str(_build_path(fqbn)),
+                                    "--output-dir", str(saida_dir), str(pasta / "sketch")]),
         cwd=pasta, env=env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
         start_new_session=True,
     )
@@ -2007,6 +2014,49 @@ async def compila(pasta: Path, fqbn: str) -> tuple[bool, str, Path]:
     return proc.returncode == 0, saida.decode(errors="replace"), saida_dir
 
 
+async def _compila_e_corrige(codigo: str, nome: str, pedido: str, pasta: Path, fqbn: str, nome_placa: str, placa: str,
+                             emit, rodadas: int) -> tuple[bool, str, Path | None, str]:
+    """Compila; instala bibliotecas e corrige o que é mecânico; chama a IA (conversa limpa) para o resto.
+    Devolve (ok, código final, pasta com os .bin, relatório de erros)."""
+    erros, log, anteriores, relatorio = [], "", set(), ""
+    for rodada in range(rodadas + 1):
+        for _auto in range(4):
+            codigo, feito = gerador.normaliza_ino(codigo)
+            if feito:
+                await emit({"type": "status", "msg": "Ajuste automático: " + "; ".join(feito) + "."})
+            await emit({"type": "code", "text": codigo})
+            if pasta.exists():
+                shutil.rmtree(pasta)
+            (pasta / "sketch").mkdir(parents=True)
+            (pasta / "sketch" / "sketch.ino").write_text(codigo)
+            await emit({"type": "status", "msg": f"Compilando para {nome_placa}… (a primeira vez é mais lenta)"})
+            ok, log, saida = await compila(pasta, fqbn)
+            if ok:
+                return True, codigo, saida, ""
+            erros = gerador.erros_gcc(log)
+            faltam = gerador.headers_faltando(erros)
+            if not faltam:
+                break
+            await emit({"type": "status", "msg": "Instalando no PC as bibliotecas que o código usa: " + ", ".join(faltam) + "…"})
+            if not await asyncio.to_thread(gerador.instala_bibliotecas, faltam):
+                break
+        relatorio = gerador.relatorio_erros(erros, codigo, lambda e, c: gerador.dica_esp32(e, c, placa), log=log)
+        assinatura = gerador.assinatura_erros(erros, codigo)
+        if assinatura and assinatura <= anteriores:
+            relatorio += gerador.AVISO_REPETIDO
+        anteriores = assinatura
+        if rodada >= rodadas:
+            break
+        await emit({"type": "status", "msg": f"A IA está corrigindo {len(erros) or 1} erro(s) (rodada {rodada + 1} de {rodadas})…"})
+        msgs = gerador.mensagens_correcao(SYSTEM_PROMPT, pedido, codigo, relatorio, "cpp", nome)
+        texto = await androidgen.pede_codigo(msgs, emit, temperatura=0.4 if gerador.AVISO_REPETIDO in relatorio else 0.1)
+        try:
+            _n, codigo = extrai_resposta(texto)
+        except ValueError:
+            continue
+    return False, codigo, None, relatorio
+
+
 async def gera_firmware(descricao: str, placa: str, emit, base_codigo: str | None = None,
                         base_nome: str | None = None) -> None:
     if placa not in PLACAS:
@@ -2026,6 +2076,8 @@ async def gera_firmware(descricao: str, placa: str, emit, base_codigo: str | Non
             await emit({"type": "error", "msg": str(e)})
             return
         so_compilar = bool(base_codigo) and not descricao.strip()
+        if not so_compilar:
+            await gerador.garante_modelo_codigo(emit)
         mensagens = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": f"Crie: {EXEMPLO_PEDIDO}"},
@@ -2035,64 +2087,73 @@ async def gera_firmware(descricao: str, placa: str, emit, base_codigo: str | Non
                 f"Modifique conforme o pedido e devolva o sketch COMPLETO no mesmo formato. Pedido: {descricao or 'corrigir os erros'}")
              if base_codigo else f"Placa: {nome_placa}. Crie: {descricao}"},
         ]
+        pedido = f"Placa: {nome_placa}. " + androidgen._pedido_limpo(descricao or "corrigir os erros e compilar")
         id_ = uuid.uuid4().hex[:10]
         pasta = config.WORK_DIR / f"esp-{id_}"
+        pasta2 = config.WORK_DIR / f"esp-{id_}-rev"
         try:
-            for tentativa in range(config.MAX_FIX_ATTEMPTS + 1):
-                if tentativa == 0:
-                    await emit({"type": "status", "msg": "A IA está escrevendo o código do firmware… (pode levar alguns minutos)"})
-                else:
-                    await emit({"type": "status",
-                                "msg": f"Deu erro ao compilar. A IA está corrigindo (tentativa {tentativa} de {config.MAX_FIX_ATTEMPTS})…"})
-                if tentativa == 0 and so_compilar:   # sem pedido de mudança: compila o sketch como está
-                    nome, codigo = base_nome or "Firmware", base_codigo
-                    texto = f"NOME: {nome}\n```cpp\n{codigo}\n```"
-                    await emit({"type": "status", "msg": "Compilando o seu sketch como ele está…"})
-                else:
-                    texto = await androidgen.pede_codigo(mensagens, emit)
+            if so_compilar:   # sem pedido de mudança: compila o sketch como está
+                nome, codigo = base_nome or "Firmware", base_codigo
+                await emit({"type": "status", "msg": "Compilando o seu sketch como ele está…"})
+            else:
+                await emit({"type": "status", "msg": "A IA está escrevendo o código do firmware… (pode levar alguns minutos)"})
+                texto = await androidgen.pede_codigo(mensagens, emit)
+                try:
+                    nome, codigo = extrai_resposta(texto)
+                except ValueError:
+                    texto = await androidgen.pede_codigo(mensagens + [{"role": "assistant", "content": texto[:3000]}, {"role": "user", "content":
+                            "Responda SÓ no formato pedido: a linha NOME: e o código completo dentro de ```cpp ... ```."}], emit)
                     try:
                         nome, codigo = extrai_resposta(texto)
                     except ValueError as e:
                         await emit({"type": "error", "msg": str(e), "log": texto[-1500:]})
                         return
-                await emit({"type": "code", "text": codigo})
-
-                if pasta.exists():
-                    shutil.rmtree(pasta)
-                (pasta / "sketch").mkdir(parents=True)
-                (pasta / "sketch" / "sketch.ino").write_text(codigo)
-                await emit({"type": "status", "msg": f"Compilando para {nome_placa}… (a primeira vez é mais lenta)"})
-                ok, log, saida = await compila(pasta, fqbn)
-                if ok:
-                    slug = androidgen.slugify(nome)
-                    arquivos = []
-                    merged = next(iter(sorted(saida.glob("*.merged.bin"))), None)
-                    app = next((p for p in sorted(saida.glob("*.ino.bin"))), None)
-                    if merged:
-                        arquivos.append((merged, f"{slug}-completo.bin", "Firmware completo (.bin): gravar no endereço 0x0"))
-                    if app:
-                        arquivos.append((app, f"{slug}-app.bin", "Só o aplicativo (.bin): para atualização OTA / endereço 0x10000"))
-                    if not arquivos:
-                        await emit({"type": "error", "msg": "Compilou, mas não encontrei o arquivo .bin.", "log": log[-1500:]})
-                        return
-                    meta = entregas.salva(id_, nome, descricao, "bin", arquivos, {"board": nome_placa, "code": codigo})
-                    await emit({"type": "done", "id": id_, "name": nome, "kind": "bin", "files": meta["files"],
-                                "note": f"Placa: {nome_placa}. Grave o '-completo.bin' no endereço 0x0 com o esptool ou com um gravador web (ex.: espressif.github.io/esptool-js)."})
-                    return
-                erros = androidgen.resumo_erros(log)
-                if tentativa >= config.MAX_FIX_ATTEMPTS:
-                    await emit({"type": "error", "msg": "Não consegui compilar o firmware depois das correções.", "log": erros})
-                    return
-                mensagens += [
-                    {"role": "assistant", "content": texto},
-                    {"role": "user", "content": (
-                        "O código NÃO compilou. ERROS DE COMPILAÇÃO:\n" + erros +
-                        "\n\nCorrija e devolva o arquivo COMPLETO no mesmo formato (NOME: e bloco ```cpp).")},
-                ]
+            ok, codigo, saida, relatorio = await _compila_e_corrige(codigo, nome, pedido, pasta, fqbn, nome_placa, placa, emit,
+                                                                     config.MAX_FIX_ATTEMPTS)
+            if not ok:
+                await emit({"type": "error", "msg": "Não consegui compilar o firmware depois das correções.", "log": relatorio})
+                return
+            nota_rev = ""
+            if config.REVISAO and not so_compilar:
+                await emit({"type": "status", "msg": "Compilou! A IA está conferindo se o firmware faz tudo o que você pediu…"})
+                faltando = gerador.confere_pedido(pedido, codigo, "cpp")
+                faltando += [f for f in await gerador.revisa(pedido, codigo, "cpp", androidgen._pede_revisao) if f not in faltando]
+                faltando = faltando[:4]
+                if faltando:
+                    await emit({"type": "status", "msg": "Faltou: " + "; ".join(faltando) + ". A IA está completando…"})
+                    texto = await androidgen.pede_codigo(gerador.mensagens_melhoria(SYSTEM_PROMPT, pedido, codigo, faltando, "cpp", nome), emit)
+                    try:
+                        _n, codigo2 = extrai_resposta(texto)
+                        ok2, codigo2, saida2, _r = await _compila_e_corrige(codigo2, nome, pedido, pasta2, fqbn, nome_placa,
+                                                                            placa, emit, 2)
+                    except ValueError:
+                        ok2 = False
+                    if ok2:
+                        codigo, saida = codigo2, saida2
+                        nota_rev = " A revisão completou: " + "; ".join(faltando) + "."
+                    else:
+                        await emit({"type": "code", "text": codigo})
+                        nota_rev = " (A revisão sugeriu completar: " + "; ".join(faltando) + ", mas essa versão não compilou; entreguei a que funciona.)"
+            slug = androidgen.slugify(nome)
+            arquivos = []
+            merged = next(iter(sorted(saida.glob("*.merged.bin"))), None)
+            app = next((p for p in sorted(saida.glob("*.ino.bin"))), None)
+            if merged:
+                arquivos.append((merged, f"{slug}-completo.bin", "Firmware completo (.bin): gravar no endereço 0x0"))
+            if app:
+                arquivos.append((app, f"{slug}-app.bin", "Só o aplicativo (.bin): para atualização OTA / endereço 0x10000"))
+            if not arquivos:
+                await emit({"type": "error", "msg": "Compilou, mas não encontrei o arquivo .bin."})
+                return
+            meta = entregas.salva(id_, nome, descricao, "bin", arquivos, {"board": nome_placa, "code": codigo})
+            await emit({"type": "done", "id": id_, "name": nome, "kind": "bin", "files": meta["files"],
+                        "note": f"Placa: {nome_placa}. Grave o '-completo.bin' no endereço 0x0 com o esptool ou com um gravador web "
+                                f"(ex.: espressif.github.io/esptool-js). Troque SUA_REDE/SUA_SENHA no código se ele usar WiFi." + nota_rev})
         except RuntimeError as e:
             await emit({"type": "error", "msg": str(e)})
         finally:
             shutil.rmtree(pasta, ignore_errors=True)
+            shutil.rmtree(pasta2, ignore_errors=True)
 EOF
   cat > perfis.py <<'EOF'
 """Perfis de modelo de linguagem: trocar entre rápido, preciso e código pela própria tela.
@@ -2864,6 +2925,15 @@ def baixa_prioridade(cmd: list[str]) -> list[str]:
     return (["nice", "-n", "10"] + cmd) if shutil.which("nice") else cmd
 
 
+def para_gradle() -> None:
+    """Descarrega o Gradle que fica na memória entre compilações (devolve 1 a 2 GB de RAM)."""
+    try:
+        if Path(config.GRADLE_BIN).exists():
+            subprocess.run([config.GRADLE_BIN, "--stop"], capture_output=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
 # ------------------------------------------------------------ modelos ociosos
 _modelos: dict[str, dict] = {}
 
@@ -2909,6 +2979,8 @@ def garante_ram(minimo_mb: int, o_que: str) -> None:
     if ram_livre_mb() >= minimo_mb:
         return
     libera_ociosos(forcar=True)
+    if ram_livre_mb() < minimo_mb:
+        para_gradle()
     livre = ram_livre_mb()
     if livre < minimo_mb:
         raise RuntimeError(
@@ -3346,15 +3418,48 @@ async def melhora_prompt(texto: str, realista: bool = False, video: bool = False
 
 
 # ------------------------------------------------------------------ geração
-async def _roda_worker(cfg: dict, emit) -> tuple[bool, str]:
-    """Roda o gerador numa sub-rotina com prioridade baixa. Devolve (ok, mensagem_de_erro)."""
-    cmd = recursos.baixa_prioridade([sys.executable, str(Path(__file__).with_name("imggen.py"))])
+def explica_falha(erro: str, registro: list[str]) -> tuple[str, str]:
+    """Transforma o erro do motor de imagem/vídeo numa explicação. Devolve (tipo, mensagem).
+
+    tipo: "modelo" (o arquivo não serve / está estragado: não adianta tentar de novo),
+          "memoria" (faltou memória na placa: repetir na CPU resolve) ou "outro".
+    """
+    txt = (erro + "\n" + "\n".join(registro)).lower()
+    if "código -9" in txt or "killed" in txt:
+        return "ram", ("O sistema encerrou o gerador por falta de memória RAM (ela é dividida com a IA de texto). "
+                       "Tente de novo em instantes; se repetir, feche programas pesados ou use o perfil Rápido da IA de texto.")
+    if "get sd version from file failed" in txt or "unknown model" in txt or "not support" in txt and "model" in txt:
+        return "modelo", ("O motor não reconhece esse arquivo como um modelo de imagem Stable Diffusion completo. Alguns modelos "
+                          "(Flux, SD3.5, Z-Image, Qwen-Image…) vêm em partes separadas (VAE e codificador de texto à parte) e não "
+                          "funcionam sozinhos aqui. Escolha outro (o Rápido e o Realista funcionam) ou apague esse.")
+    if "model path does not exist" in txt or "no such file" in txt:
+        return "modelo", "O arquivo do modelo não está mais na pasta. Baixe de novo (Mais › Modelos de IA)."
+    if "out of memory" in txt or "cudamalloc" in txt or "failed to allocate" in txt or "cuda error" in txt:
+        return "memoria", "Faltou memória na placa de vídeo."
+    if ("load tensors" in txt and "fail" in txt) or "read error" in txt or "unexpected end" in txt or "invalid magic" in txt:
+        return "modelo", "O arquivo do modelo está incompleto ou estragado. Apague e baixe de novo (Mais › Modelos de IA)."
+    if "modelo_nao_carregou" in txt or "null pointer" in txt:
+        return "outro", "O motor não conseguiu abrir o modelo."
+    return "outro", ""
+
+
+async def _roda_worker(cfg: dict, emit, script: str = "imggen.py") -> tuple[bool, str, list[str]]:
+    """Roda o gerador numa sub-rotina com prioridade baixa. Devolve (ok, erro, últimas linhas do registro do motor)."""
+    import collections
+    cmd = recursos.baixa_prioridade([sys.executable, str(Path(__file__).with_name(script))])
     proc = await asyncio.create_subprocess_exec(
-        *cmd, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        *cmd, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         start_new_session=True)
     proc.stdin.write(json.dumps(cfg).encode())
     await proc.stdin.drain()
     proc.stdin.close()
+    registro: collections.deque = collections.deque(maxlen=200)
+
+    async def le_registro():
+        async for linha in proc.stderr:
+            registro.append(linha.decode(errors="replace").rstrip())
+
+    leitor = asyncio.create_task(le_registro())
     erro = ""
     try:
         async for linha in proc.stdout:
@@ -3363,10 +3468,11 @@ async def _roda_worker(cfg: dict, emit) -> tuple[bool, str]:
             except ValueError:
                 continue
             if ev.get("tipo") == "passo":
-                await emit({"type": "passo", "passo": ev["passo"], "total": ev["total"]})
+                await emit({"type": "passo", "passo": ev["passo"], "total": ev["total"], "seg": ev.get("seg", 0)})
             elif ev.get("tipo") == "erro":
                 erro = ev.get("msg", "")
         await proc.wait()
+        await asyncio.wait_for(leitor, 5)
     except asyncio.CancelledError:  # o usuário clicou em Parar
         import os
         import signal
@@ -3374,8 +3480,14 @@ async def _roda_worker(cfg: dict, emit) -> tuple[bool, str]:
             os.killpg(proc.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
+        leitor.cancel()
         raise
-    return proc.returncode == 0, erro
+    except asyncio.TimeoutError:
+        leitor.cancel()
+    if proc.returncode != 0 and not erro:
+        erro = f"o motor parou (código {proc.returncode})"
+    relevantes = [ln for ln in registro if any(k in ln.lower() for k in ("error", "fail", "out of memory", "not support", "unknown", "exist"))]
+    return proc.returncode == 0, erro, relevantes[-12:]
 
 
 async def gera_imagem(descricao: str, init_id: str | None, tamanho: str, passos: int, forca: float,
@@ -3431,14 +3543,17 @@ async def gera_imagem(descricao: str, init_id: str | None, tamanho: str, passos:
                       "cpu": "na CPU"}[modo]
             motivo = (f" (a placa está ocupada: só {vram} MB livres)" if modo == "cpu" and vram is not None and vram < 600 else "")
             await emit({"type": "status", "msg": f"Gerando a imagem {rotulo}{motivo}…{' (leva cerca de 1 minuto)' if modo == 'cpu' else ''}"})
-            ok, erro = await _roda_worker({**base, "modo": modo}, emit)
-            if modo != "cpu":
+            ok, erro, registro = await _roda_worker({**base, "modo": modo}, emit)
+            tipo, explicacao = ("", "") if ok else explica_falha(erro, registro)
+            if modo != "cpu" and tipo not in ("modelo", "ram"):   # culpa do arquivo ou da RAM não conta contra a placa
                 recursos.anota_gpu("imagem", ok)
-            if not ok and modo != "cpu":
+            if not ok and modo != "cpu" and tipo not in ("modelo", "ram"):
                 await emit({"type": "status", "msg": "A placa de vídeo não deu conta; tentando só pela CPU…"})
-                ok, erro = await _roda_worker({**base, "modo": "cpu"}, emit)
+                ok, erro, registro = await _roda_worker({**base, "modo": "cpu"}, emit)
+                tipo, explicacao = ("", "") if ok else explica_falha(erro, registro)
             if not ok or not saida.exists():
-                await emit({"type": "error", "msg": "Não consegui gerar a imagem.", "log": erro})
+                await emit({"type": "error", "msg": "Não consegui gerar a imagem. " + (explicacao or ""),
+                            "log": "\n".join([erro] + registro)[-1500:]})
                 return
             slug = androidgen.slugify(descricao) or "imagem"
             nome = (descricao[:40] or "Imagem").strip()
@@ -3482,6 +3597,9 @@ def main():
         elif modo == "gpu":
             kw.update(keep_clip_on_cpu=False, keep_vae_on_cpu=False)
         sd = StableDiffusion(**kw)
+        if not getattr(getattr(sd, "_model", None), "model", True):   # o motor não conseguiu abrir o modelo
+            evento(tipo="erro", msg="MODELO_NAO_CARREGOU")
+            sys.exit(1)
         evento(tipo="carregado", modo=modo)
 
         def passo(i, total, tempo):
@@ -3528,6 +3646,7 @@ from pathlib import Path
 
 import androidgen
 import config
+import gerador
 import entregas
 import recursos
 
@@ -3771,6 +3890,28 @@ def escreve_projeto_avancado(pasta: Path, nome: str, app_id: str, arqs: dict[str
         f.write_text(t)
 
 
+def _arquivo_do_erro(arqs: dict[str, str], e: dict) -> str | None:
+    """Acha no projeto o arquivo citado num erro do compilador (pelo caminho ou pelo nome)."""
+    cam = e.get("caminho", "")
+    for c in arqs:
+        if cam.endswith(c) or c.endswith("/" + e.get("arquivo", "\0")):
+            return c
+    return None
+
+
+def _mensagens_correcao_projeto(system: str, pedido: str, arqs: dict[str, str], com_erro: list[str], relatorio: str) -> list[dict]:
+    """Conversa LIMPA: pedido + lista de arquivos + os arquivos com erro (numerados) + erros com dicas."""
+    blocos = "\n".join(f"### {c}\n```\n{gerador.numera(arqs[c])}\n```" for c in com_erro[:3])
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": (
+            f"Pedido original: {pedido}\n\nArquivos do projeto: {', '.join(arqs)}\n\nArquivos com erro (os números à "
+            f"esquerda são só referência de linha, NÃO fazem parte do código):\n{blocos}\n\nO compilador encontrou:\n{relatorio}\n\n"
+            "Corrija TODOS os erros. Devolva SOMENTE os arquivos que precisam mudar (pode criar arquivos que faltam), cada um "
+            "COMPLETO e sem os números de linha, no formato:\nNOME: <nome>\n### caminho/do/arquivo\n```linguagem\n<conteúdo>\n```")},
+    ]
+
+
 async def gera_app_avancado(descricao: str, base: dict[str, str] | None, base_nome: str | None, emit) -> None:
     if androidgen._trava.locked():
         await emit({"type": "error", "msg": "Ainda estou criando outra coisa. Espere terminar ou clique em Parar."})
@@ -3781,6 +3922,7 @@ async def gera_app_avancado(descricao: str, base: dict[str, str] | None, base_no
         except RuntimeError as e:
             await emit({"type": "error", "msg": str(e)})
             return
+        await gerador.garante_modelo_codigo(emit)
         if base:
             pedido = (f"Estes são os arquivos ATUAIS do app:\n{formata_base(base)}\n\n"
                       f"Modifique o app conforme o pedido e devolva SOMENTE os arquivos que mudaram ou são novos, "
@@ -3791,47 +3933,69 @@ async def gera_app_avancado(descricao: str, base: dict[str, str] | None, base_no
                      {"role": "user", "content": f"Crie: {EX_PEDIDO_AND}"},
                      {"role": "assistant", "content": EX_RESP_AND},
                      {"role": "user", "content": pedido}]
+        pedido_curto = androidgen._pedido_limpo(descricao)
         id_ = uuid.uuid4().hex[:10]
         pasta = config.WORK_DIR / f"appx-{id_}"
         try:
-            for tentativa in range(config.MAX_FIX_ATTEMPTS + 1):
-                if tentativa == 0:
-                    await emit({"type": "status", "msg": "A IA está escrevendo os arquivos do app… (pode levar vários minutos)"})
-                else:
-                    await emit({"type": "status", "msg": f"Deu erro ao compilar. A IA está corrigindo (tentativa {tentativa} de {config.MAX_FIX_ATTEMPTS})…"})
-                texto = await androidgen.pede_codigo(mensagens, emit)
-                novos = extrai_arquivos(texto)
-                erro = valida_android(novos)
-                if erro:
-                    await emit({"type": "error", "msg": erro, "log": texto[-1500:]})
+            await emit({"type": "status", "msg": "A IA está escrevendo os arquivos do app… (pode levar vários minutos)"})
+            texto = await androidgen.pede_codigo(mensagens, emit)
+            novos = extrai_arquivos(texto)
+            erro = valida_android(novos)
+            if erro:
+                await emit({"type": "error", "msg": erro, "log": texto[-1500:]})
+                return
+            atuais = {**(base or {}), **novos}       # SEMPRE a última versão de cada arquivo
+            if not any(c.endswith("MainActivity.java") for c in atuais):
+                await emit({"type": "error", "msg": "Faltou a MainActivity.java.", "log": texto[-800:]})
+                return
+            nome = extrai_nome(texto, base_nome or "App IA")
+            app_id = f"com.localai.{androidgen.slugify(nome)}{id_[:4]}"
+            for rodada in range(config.MAX_FIX_ATTEMPTS + 1):
+                for _auto in range(3):
+                    feitos = []
+                    for c in list(atuais):
+                        if c.endswith(".java"):
+                            atuais[c], f = gerador.corrige_imports(atuais[c], gerador.IMPORTS_ANDROIDX, "com.localai.app")
+                            feitos += f
+                    if feitos:
+                        await emit({"type": "status", "msg": f"Ajuste automático: adicionei {len(feitos)} import(s) que faltavam."})
+                    await emit({"type": "code", "text": "\n\n".join(f"// {c}\n{t}" for c, t in atuais.items())})
+                    if pasta.exists():
+                        shutil.rmtree(pasta)
+                    escreve_projeto_avancado(pasta, nome, app_id, atuais)
+                    await emit({"type": "status", "msg": "Compilando o app… (a primeira vez baixa as bibliotecas e demora mais)"})
+                    ok, log, apk = await androidgen.compila(pasta)
+                    if ok:
+                        meta = entregas.salva(id_, nome, descricao, "apk",
+                                              [(apk, f"{androidgen.slugify(nome)}.apk", "App Android (.apk)")],
+                                              {"app_id": app_id, "modo": "avancado", "arquivos_fonte": atuais})
+                        await emit({"type": "done", "id": id_, "name": nome, "kind": "apk", "files": meta["files"],
+                                    "note": "Toque para baixar no celular e instalar. Para mudar o app, use ✏ Modificar."})
+                        return
+                    erros = gerador.erros_java(log)
+                    mudou = []
+                    for c in {(_arquivo_do_erro(atuais, e) or "") for e in erros} - {""}:
+                        if c.endswith(".java"):
+                            atuais[c], f = gerador.corrige_java_por_erros(
+                                atuais[c], [e for e in erros if _arquivo_do_erro(atuais, e) == c], gerador.IMPORTS_ANDROIDX)
+                            mudou += f
+                    if not mudou:
+                        break
+                    await emit({"type": "status", "msg": "Corrigi sozinho: " + "; ".join(mudou) + ". Compilando de novo…"})
+                com_erro = [c for c in dict.fromkeys(_arquivo_do_erro(atuais, e) for e in erros) if c]
+                principal = com_erro[0] if com_erro else next(c for c in atuais if c.endswith("MainActivity.java"))
+                relatorio = gerador.relatorio_erros(
+                    [dict(e, linha=e["linha"] if _arquivo_do_erro(atuais, e) == principal else 0) for e in erros],
+                    atuais[principal], gerador.dica_java, log=log)
+                if rodada >= config.MAX_FIX_ATTEMPTS:
+                    await emit({"type": "error", "msg": "Não consegui compilar o app depois das correções.", "log": relatorio})
                     return
-                arqs = {**(base or {}), **novos}
-                if not any(c.endswith("MainActivity.java") for c in arqs):
-                    await emit({"type": "error", "msg": "Faltou a MainActivity.java.", "log": texto[-800:]})
-                    return
-                nome = extrai_nome(texto, base_nome or "App IA")
-                await emit({"type": "code", "text": "\n\n".join(f"// {c}\n{t}" for c, t in novos.items())})
-                if pasta.exists():
-                    shutil.rmtree(pasta)
-                app_id = f"com.localai.{androidgen.slugify(nome)}{id_[:4]}"
-                escreve_projeto_avancado(pasta, nome, app_id, arqs)
-                await emit({"type": "status", "msg": "Compilando o app… (a primeira vez baixa as bibliotecas e demora mais)"})
-                ok, log, apk = await androidgen.compila(pasta)
-                if ok:
-                    meta = entregas.salva(id_, nome, descricao, "apk",
-                                          [(apk, f"{androidgen.slugify(nome)}.apk", "App Android (.apk)")],
-                                          {"app_id": app_id, "modo": "avancado", "arquivos_fonte": arqs})
-                    await emit({"type": "done", "id": id_, "name": nome, "kind": "apk", "files": meta["files"],
-                                "note": "Passe o arquivo para o celular e abra-o para instalar. Para mudar o app, use ✏ Modificar."})
-                    return
-                erros = androidgen.resumo_erros(log)
-                if tentativa >= config.MAX_FIX_ATTEMPTS:
-                    await emit({"type": "error", "msg": "Não consegui compilar o app depois das correções.", "log": erros})
-                    return
-                mensagens += [{"role": "assistant", "content": texto},
-                              {"role": "user", "content": (
-                                  "O código NÃO compilou. ERROS DE COMPILAÇÃO:\n" + erros +
-                                  "\n\nCorrija e devolva SOMENTE os arquivos que precisam mudar, completos, no mesmo formato.")}]
+                await emit({"type": "status", "msg": f"A IA está corrigindo {len(erros) or 1} erro(s) (rodada {rodada + 1} de {config.MAX_FIX_ATTEMPTS})…"})
+                msgs = _mensagens_correcao_projeto(SYS_ANDROID, pedido_curto, atuais, com_erro or [principal], relatorio)
+                texto = await androidgen.pede_codigo(msgs, emit, temperatura=0.1)
+                novos = {c: androidgen.tira_numeros(t) for c, t in extrai_arquivos(texto).items()}
+                if novos and not valida_android(novos):
+                    atuais.update(novos)
         except RuntimeError as e:
             await emit({"type": "error", "msg": str(e)})
         finally:
@@ -3914,16 +4078,20 @@ async def gera_codigo(alvo: str, descricao: str, base: dict[str, str] | None, ba
                      {"role": "assistant", "content": a["ex"][1]}, {"role": "user", "content": pedido}]
         id_ = uuid.uuid4().hex[:10]
         pasta = config.WORK_DIR / f"cod-{id_}"
+        arqs: dict[str, str] = {}
+        pedido_curto = androidgen._pedido_limpo(descricao)
         try:
             for tentativa in range(config.MAX_FIX_ATTEMPTS + 1):
                 await emit({"type": "status", "msg": (f"A IA está escrevendo o {a['rotulo']}…" if tentativa == 0 else
                             f"Achei um erro. A IA está corrigindo (tentativa {tentativa} de {config.MAX_FIX_ATTEMPTS})…")})
-                texto = await androidgen.pede_codigo(mensagens, emit)
-                novos = extrai_arquivos(texto)
+                texto = await androidgen.pede_codigo(mensagens, emit, temperatura=0.2 if tentativa == 0 else 0.1)
+                novos = {c: androidgen.tira_numeros(t) for c, t in extrai_arquivos(texto).items()}
                 if not novos or not all(caminho_seguro(c) for c in novos) or len(novos) > MAX_ARQUIVOS:
+                    if tentativa > 0 and arqs:
+                        continue     # correção fora do formato: tenta de novo com a versão anterior
                     await emit({"type": "error", "msg": "A IA não devolveu os arquivos no formato pedido.", "log": texto[-1200:]})
                     return
-                arqs = {**(base or {}), **novos}
+                arqs = {**(arqs or base or {}), **novos}    # SEMPRE a última versão de cada arquivo
                 if a["principal"] not in arqs:
                     await emit({"type": "error", "msg": f"Faltou o arquivo {a['principal']}.", "log": texto[-800:]})
                     return
@@ -3942,9 +4110,8 @@ async def gera_codigo(alvo: str, descricao: str, base: dict[str, str] | None, ba
                     if tentativa >= config.MAX_FIX_ATTEMPTS:
                         await emit({"type": "error", "msg": "O código continua com erros de sintaxe.", "log": erros})
                         return
-                    mensagens += [{"role": "assistant", "content": texto},
-                                  {"role": "user", "content": "O código tem erros:\n" + erros +
-                                   "\n\nCorrija e devolva SOMENTE os arquivos que precisam mudar, completos, no mesmo formato."}]
+                    com_erro = [c for c in arqs if c.endswith(".py") and c in erros] or [a["principal"]]
+                    mensagens = _mensagens_correcao_projeto(a["sys"], pedido_curto, arqs, com_erro, erros)
                     continue
                 slug = androidgen.slugify(nome)
                 pasta.mkdir(parents=True, exist_ok=True)
@@ -3966,6 +4133,670 @@ async def gera_codigo(alvo: str, descricao: str, base: dict[str, str] | None, ba
             await emit({"type": "error", "msg": str(e)})
         finally:
             shutil.rmtree(pasta, ignore_errors=True)
+EOF
+  cat > gerador.py <<'EOF'
+"""Núcleo comum dos geradores de código (apps Android e firmware ESP32): deixa a IA local mais esperta.
+
+O modelo local (7 bilhões de parâmetros) erra coisas bobas e repetitivas. Em vez de gastar uma rodada inteira da IA
+(minutos) com cada uma, o servidor:
+  1. corrige SOZINHO o que é mecânico: imports que faltam no Java, @Override no lugar errado, AndroidX,
+     bibliotecas do Arduino que faltam (instala pelo arduino-cli) e a API antiga de PWM do ESP32;
+  2. só chama a IA para o que exige raciocínio, mostrando o código NUMERADO, cada erro com a linha exata e uma
+     dica específica para aquele tipo de erro;
+  3. começa cada correção com a conversa limpa (antes as versões antigas iam se empilhando e estouravam o
+     contexto de 8192 palavras do modelo; a partir da 2ª correção a IA corrigia praticamente às cegas);
+  4. usa o modelo de código (Qwen2.5-Coder) automaticamente quando ele está no PC.
+"""
+import asyncio
+import json
+import re
+import subprocess
+from pathlib import Path
+
+import config
+
+# ======================================================================= Java (apps Android)
+IMPORTS_JAVA = {}
+for _pkg, _nomes in {
+    "android.app": "Activity AlertDialog Dialog ProgressDialog Notification NotificationManager NotificationChannel "
+                   "PendingIntent DatePickerDialog TimePickerDialog AlarmManager Service Application ActionBar",
+    "android.content": "Context Intent SharedPreferences ContentValues DialogInterface IntentFilter BroadcastReceiver "
+                       "ClipboardManager ClipData ComponentName ActivityNotFoundException ContentResolver",
+    "android.content.res": "Configuration Resources ColorStateList",
+    "android.content.pm": "PackageManager",
+    "android.database": "Cursor",
+    "android.database.sqlite": "SQLiteDatabase SQLiteOpenHelper",
+    "android.graphics": "Color Canvas Paint Path Bitmap BitmapFactory Typeface Rect RectF Point PointF PorterDuff "
+                        "LinearGradient RadialGradient Shader Matrix",
+    "android.graphics.drawable": "GradientDrawable Drawable ColorDrawable ShapeDrawable StateListDrawable",
+    "android.hardware": "Sensor SensorEvent SensorEventListener SensorManager",
+    "android.location": "Location LocationManager LocationListener",
+    "android.media": "MediaPlayer AudioManager ToneGenerator SoundPool MediaRecorder RingtoneManager",
+    "android.net": "Uri ConnectivityManager NetworkInfo",
+    "android.os": "Bundle Handler Looper Build Environment CountDownTimer SystemClock Vibrator VibrationEffect "
+                  "AsyncTask Message PowerManager",
+    "android.provider": "Settings MediaStore",
+    "android.speech.tts": "TextToSpeech",
+    "android.speech": "RecognizerIntent",
+    "android.text": "TextWatcher Editable InputType TextUtils Html SpannableString InputFilter",
+    "android.text.method": "ScrollingMovementMethod LinkMovementMethod PasswordTransformationMethod",
+    "android.util": "Log TypedValue DisplayMetrics AttributeSet SparseArray Base64",
+    "android.view": "View ViewGroup Gravity MotionEvent KeyEvent Menu MenuItem LayoutInflater Window WindowManager",
+    "android.view.inputmethod": "InputMethodManager EditorInfo",
+    "android.view.animation": "AlphaAnimation Animation RotateAnimation ScaleAnimation TranslateAnimation "
+                              "AnimationUtils LinearInterpolator AccelerateDecelerateInterpolator",
+    "android.animation": "ValueAnimator ObjectAnimator AnimatorSet",
+    "android.widget": "Button TextView EditText LinearLayout RelativeLayout FrameLayout ScrollView HorizontalScrollView "
+                      "ListView GridView ArrayAdapter BaseAdapter AdapterView ImageView ImageButton CheckBox RadioButton "
+                      "RadioGroup Switch ToggleButton SeekBar ProgressBar Spinner Toast TableLayout TableRow "
+                      "CompoundButton NumberPicker DatePicker TimePicker CalendarView Chronometer RatingBar PopupMenu "
+                      "AutoCompleteTextView SimpleAdapter Space GridLayout VideoView MediaController",
+    "android.webkit": "WebView WebViewClient WebSettings WebChromeClient",
+    "java.util": "ArrayList List HashMap Map HashSet Set Collections Arrays Random Date Calendar Locale Timer TimerTask "
+                 "Iterator LinkedList Comparator UUID Objects Stack Queue Deque ArrayDeque TreeMap LinkedHashMap "
+                 "Collection",
+    "java.util.concurrent": "Executors ExecutorService TimeUnit",
+    "java.text": "SimpleDateFormat DecimalFormat NumberFormat",
+    "java.io": "File FileInputStream FileOutputStream InputStream OutputStream BufferedReader InputStreamReader "
+               "IOException BufferedWriter OutputStreamWriter FileReader FileWriter PrintWriter ByteArrayOutputStream",
+    "java.net": "URL HttpURLConnection URLEncoder MalformedURLException Socket InetAddress",
+    "java.nio.charset": "StandardCharsets",
+    "java.math": "BigDecimal BigInteger RoundingMode",
+    "org.json": "JSONObject JSONArray JSONException",
+}.items():
+    for _n in _nomes.split():
+        IMPORTS_JAVA[_n] = f"{_pkg}.{_n}"
+
+
+def _sem_comentarios_e_textos(codigo: str) -> str:
+    codigo = re.sub(r"/\*.*?\*/", " ", codigo, flags=re.S)
+    codigo = re.sub(r"//[^\n]*", " ", codigo)
+    return re.sub(r'"(?:\\.|[^"\\])*"', '""', codigo)
+
+
+def _imports(codigo: str) -> list[str]:
+    return re.findall(r"^\s*import\s+([\w.]+(?:\.\*)?)\s*;", codigo, re.M)
+
+
+def _adiciona_imports(codigo: str, fqns: list[str]) -> str:
+    if not fqns:
+        return codigo
+    linhas = "".join(f"import {f};\n" for f in sorted(set(fqns)))
+    primeiro = re.search(r"^import\s", codigo, re.M)       # junto dos imports que já existem
+    if primeiro:
+        return codigo[:primeiro.start()] + linhas + codigo[primeiro.start():]
+    m = re.search(r"^\s*package\s+[\w.]+\s*;\s*\n", codigo, re.M)
+    pos = m.end() if m else 0
+    return codigo[:pos] + ("\n" if m else "") + linhas + codigo[pos:]
+
+
+IMPORTS_ANDROIDX = dict(IMPORTS_JAVA)
+for _pkg, _nomes in {
+    "androidx.appcompat.app": "AppCompatActivity AlertDialog",
+    "androidx.appcompat.widget": "Toolbar SearchView",
+    "androidx.recyclerview.widget": "RecyclerView LinearLayoutManager GridLayoutManager DividerItemDecoration ItemTouchHelper",
+    "androidx.cardview.widget": "CardView",
+    "androidx.constraintlayout.widget": "ConstraintLayout",
+    "androidx.fragment.app": "Fragment FragmentManager FragmentTransaction",
+    "androidx.viewpager2.widget": "ViewPager2",
+    "androidx.swiperefreshlayout.widget": "SwipeRefreshLayout",
+    "androidx.annotation": "NonNull Nullable",
+    "androidx.core.content": "ContextCompat",
+    "com.google.android.material.floatingactionbutton": "FloatingActionButton",
+    "com.google.android.material.button": "MaterialButton",
+    "com.google.android.material.textfield": "TextInputEditText TextInputLayout",
+    "com.google.android.material.snackbar": "Snackbar",
+    "com.google.android.material.bottomnavigation": "BottomNavigationView",
+    "com.google.android.material.tabs": "TabLayout TabLayoutMediator",
+    "com.google.android.material.card": "MaterialCardView",
+    "com.google.android.material.switchmaterial": "SwitchMaterial",
+}.items():
+    for _n in _nomes.split():
+        IMPORTS_ANDROIDX[_n] = f"{_pkg}.{_n}"
+
+
+def corrige_imports(codigo: str, mapa: dict | None = None, pacote_r: str = "") -> tuple[str, list[str]]:
+    """Adiciona os imports de classes do Android/Java usadas no código e esquecidas pela IA."""
+    mapa = mapa or IMPORTS_JAVA
+    limpo = _sem_comentarios_e_textos(codigo)
+    existentes = _imports(codigo)
+    simples = {i.rsplit(".", 1)[1] for i in existentes if not i.endswith("*")}
+    curingas = {i[:-2] for i in existentes if i.endswith("*")}
+    declaradas = set(re.findall(r"\b(?:class|interface|enum)\s+(\w+)", limpo))
+    faltam = []
+    for nome in set(re.findall(r"\b([A-Z][A-Za-z0-9_]*)\b", limpo)):
+        fq = mapa.get(nome)
+        if not fq or nome in simples or nome in declaradas or fq.rsplit(".", 1)[0] in curingas:
+            continue
+        if re.search(r"[\w.]\." + nome + r"\b", limpo) and not re.search(r"(?<![\w.])" + nome + r"\b", limpo):
+            continue  # só aparece qualificado (android.widget.Button): não precisa de import
+        faltam.append(fq)
+    # classe num subpacote (com.localai.app.ui...) usando R precisa importar o R do app
+    pk = re.search(r"^\s*package\s+([\w.]+)\s*;", codigo, re.M)
+    if pacote_r and pk and pk.group(1) != pacote_r and re.search(r"\bR\.", limpo) and "R" not in simples:
+        faltam.append(f"{pacote_r}.R")
+    return _adiciona_imports(codigo, faltam), faltam
+
+
+def normaliza_java(codigo: str, pacote: str) -> tuple[str, list[str]]:
+    """Ajustes mecânicos antes de compilar. Devolve (código, o_que_foi_feito)."""
+    feito = []
+    if not re.match(r"\s*package\s+" + re.escape(pacote) + r"\s*;", codigo):
+        codigo = re.sub(r"^\s*package\s+[\w.]+\s*;\s*", "", codigo)
+        codigo = f"package {pacote};\n\n" + codigo
+    if "AppCompatActivity" in codigo or "androidx." in codigo:
+        antes = codigo
+        codigo = re.sub(r"^\s*import\s+androidx\.appcompat\.app\.AppCompatActivity\s*;\s*\n", "", codigo, flags=re.M)
+        codigo = codigo.replace("extends AppCompatActivity", "extends Activity")
+        codigo = codigo.replace("getSupportActionBar()", "getActionBar()")
+        codigo = re.sub(r"^\s*import\s+androidx\.appcompat\.app\.AlertDialog\s*;\s*\n", "", codigo, flags=re.M)
+        codigo = re.sub(r"^\s*import\s+androidx\.annotation\.\w+\s*;\s*\n", "", codigo, flags=re.M)
+        codigo = re.sub(r"@(NonNull|Nullable)\s+", "", codigo)
+        if codigo != antes:
+            feito.append("troquei AndroidX por classes do Android puro")
+    codigo, imps = corrige_imports(codigo)
+    if imps:
+        feito.append(f"adicionei {len(imps)} import(s) que faltavam")
+    return codigo, feito
+
+
+def erros_java(log: str) -> list[dict]:
+    """Erros do javac (Gradle) com a linha, a mensagem e o símbolo (e erros de recursos XML do AAPT)."""
+    linhas = log.splitlines()
+    saida, vistos = [], set()
+    for ln in linhas:
+        a = re.match(r"^(?:ERROR:\s*)?(?P<arq>\S+\.xml):(?P<l>\d+):(?:\d+:)?\s*(?:AAPT:\s*)?error:\s*(?P<msg>.+)$", ln.strip())
+        if a and (a["arq"], a["l"]) not in vistos:
+            vistos.add((a["arq"], a["l"]))
+            saida.append({"arquivo": Path(a["arq"]).name, "caminho": a["arq"], "linha": int(a["l"]), "msg": a["msg"].strip(), "simbolo": ""})
+    for i, ln in enumerate(linhas):
+        m = re.match(r"^(?P<arq>\S+\.java):(?P<l>\d+): error: (?P<msg>.+)$", ln.strip())
+        if not m:
+            continue
+        simbolo, local = "", ""
+        for extra in linhas[i + 1:i + 7]:
+            s = re.match(r"\s*symbol:\s+(\w+)\s+(.+)$", extra)
+            if s and not simbolo:
+                simbolo = f"{s.group(1)} {s.group(2).strip()}"
+            lo = re.match(r"\s*location:\s+(.+)$", extra)
+            if lo:
+                local = lo.group(1).strip()
+                break
+        chave = (m["l"], m["msg"], simbolo)
+        if chave in vistos:
+            continue
+        vistos.add(chave)
+        saida.append({"arquivo": Path(m["arq"]).name, "caminho": m["arq"], "linha": int(m["l"]), "msg": m["msg"].strip(),
+                      "simbolo": simbolo, "local": local})
+    return saida
+
+
+def dica_java(e: dict, codigo: str) -> str:
+    msg, sim = e["msg"], e.get("simbolo", "")
+    nome = sim.split()[-1].split("(")[0] if sim else ""
+    if "cannot find symbol" in msg:
+        if nome == "R" or "R." in _linha(codigo, e["linha"]):
+            return "Este projeto NÃO tem layouts XML nem R.id/R.layout: monte a interface por código Java."
+        if sim.startswith("class") and nome not in IMPORTS_JAVA:
+            return (f"A classe {nome} não existe no Android padrão (sem bibliotecas). Use uma classe do Android "
+                    "(android.*) ou do Java (java.*), ou crie a classe no próprio arquivo.")
+        if sim.startswith("method"):
+            lo = re.match(r"variable (\w+) of type ([\w.<>\[\]]+)", e.get("local", ""))
+            if lo:
+                var, tipo = lo.group(1), lo.group(2)
+                campo = _tipo_do_campo(codigo, var, tipo)
+                if campo:
+                    return (f"Aqui '{var}' é uma {tipo} (variável local) com o MESMO nome do campo {campo} '{var}'. "
+                            f"Renomeie a variável local (ex.: texto{var[:1].upper()}{var[1:]}) ou use this.{var}.{nome}(...).")
+                return f"'{var}' é do tipo {tipo}, e {tipo} não tem o método {nome}(...). Use o objeto certo ou outro método."
+            return f"O método {nome} não existe nesse objeto/classe. Confira o nome e os parâmetros, ou crie o método."
+        if sim.startswith("variable"):
+            return f"A variável {nome} não foi declarada neste ponto. Declare-a como campo da classe (antes de usar)."
+    if "resource" in msg and "not found" in msg:
+        return ("Esse recurso não existe: crie-o (em res/values/colors.xml, strings.xml ou res/drawable) ou use um que "
+                "exista, como @android:color/white ou um valor direto (#FF5722, 16sp).")
+    if "attribute" in msg and "not found" in msg:
+        return "Esse atributo XML não existe nesse componente/tema: remova-o ou use o nome certo (android:… ou app:…)."
+    if "effectively final" in msg or "must be final" in msg:
+        return ("Variáveis locais usadas dentro de lambdas/classes anônimas não podem mudar. "
+                "Transforme essa variável em um CAMPO da classe (private) ou crie uma cópia final.")
+    if "unreported exception" in msg:
+        return "Envolva essa chamada em try { ... } catch (Exception e) { ... }."
+    if "incompatible types" in msg:
+        return "Os tipos não batem: converta (ex.: Integer.parseInt, String.valueOf, (int)) ou ajuste a declaração."
+    if "missing return statement" in msg:
+        return "Todo caminho do método precisa de return."
+    if "already defined" in msg:
+        return "Esse nome já foi declarado: remova a duplicata ou renomeie."
+    if "non-static" in msg and "static context" in msg:
+        return "Você está usando algo da instância dentro de um método static: tire o static ou use a instância."
+    if "does not override" in msg:
+        return "Remova o @Override desse método (ou corrija a assinatura para a do método original)."
+    if "class, interface, enum, or record expected" in msg or "reached end of file" in msg:
+        return "As chaves { } estão desbalanceadas ou há código fora da classe. Confira a estrutura do arquivo inteiro."
+    if "is not abstract and does not override abstract method" in msg:
+        return "A classe precisa implementar todos os métodos da interface (ex.: onClick, onItemClick, getView...)."
+    return ""
+
+
+def _tipo_do_campo(codigo: str, var: str, tipo_local: str) -> str:
+    """Tipo de um CAMPO da classe com esse nome, se for diferente do tipo da variável local (nome repetido)."""
+    padrao = (r"^\s{2,8}(?:(?:private|public|protected|static|final)\s+)*([A-Z][\w.]*(?:<[^;=()]*?>)?(?:\[\])?)\s+"
+              r"([A-Za-z_][^;()]*?);")
+    for m in re.finditer(padrao, codigo, re.M):
+        nomes = [d.split("=")[0].strip() for d in m.group(2).split(",")]
+        if var in nomes and m.group(1) != tipo_local:
+            return m.group(1)
+    return ""
+
+
+def corrige_java_por_erros(codigo: str, erros: list[dict], mapa: dict | None = None) -> tuple[str, list[str]]:
+    """Correções automáticas a partir dos erros (sem a IA)."""
+    mapa = mapa or IMPORTS_JAVA
+    feito = []
+    linhas = codigo.split("\n")
+    remover = set()
+    novos = []
+    for e in erros:
+        if "does not override" in e["msg"]:
+            idx = e["linha"] - 1
+            for j in (idx, idx - 1):
+                if 0 <= j < len(linhas) and linhas[j].strip() == "@Override":
+                    remover.add(j)
+                    break
+        lo = re.match(r"variable (\w+) of type ([\w.<>\[\]]+)", e.get("local", ""))
+        if "cannot find symbol" in e["msg"] and e.get("simbolo", "").startswith("method") and lo:
+            var, tipo = lo.group(1), lo.group(2)
+            idx = e["linha"] - 1
+            if _tipo_do_campo(codigo, var, tipo) and 0 <= idx < len(linhas):
+                nova = re.sub(r"(?<![\w.])" + re.escape(var) + r"\.", f"this.{var}.", linhas[idx], count=1)
+                if nova != linhas[idx]:
+                    linhas[idx] = nova
+                    feito.append(f"'{var}' tinha o nome de um campo; usei this.{var}")
+        if "cannot find symbol" in e["msg"] and e.get("simbolo", "").startswith("class"):
+            nome = e["simbolo"].split()[-1]
+            if nome in mapa and f"import {mapa[nome]};" not in codigo:
+                novos.append(mapa[nome])
+    if remover:
+        linhas = [ln for i, ln in enumerate(linhas) if i not in remover]
+        feito.append(f"removi {len(remover)} @Override indevido(s)")
+    codigo = "\n".join(linhas)
+    if novos:
+        codigo = _adiciona_imports(codigo, novos)
+        feito.append(f"adicionei {len(set(novos))} import(s)")
+    return codigo, feito
+
+
+# ======================================================================= Arduino (firmware ESP32)
+# cabeçalho -> nome da biblioteca no gerenciador do Arduino (o resto é procurado pelo arduino-cli)
+HEADERS_LIBS = {
+    "DHT.h": "DHT sensor library", "DHT_U.h": "DHT sensor library", "Adafruit_Sensor.h": "Adafruit Unified Sensor",
+    "Adafruit_SSD1306.h": "Adafruit SSD1306", "Adafruit_GFX.h": "Adafruit GFX Library",
+    "Adafruit_NeoPixel.h": "Adafruit NeoPixel", "FastLED.h": "FastLED", "PubSubClient.h": "PubSubClient",
+    "ArduinoJson.h": "ArduinoJson", "OneWire.h": "OneWire", "DallasTemperature.h": "DallasTemperature",
+    "LiquidCrystal_I2C.h": "LiquidCrystal I2C", "Adafruit_BME280.h": "Adafruit BME280 Library",
+    "Adafruit_BMP280.h": "Adafruit BMP280 Library", "Adafruit_MPU6050.h": "Adafruit MPU6050",
+    "TFT_eSPI.h": "TFT_eSPI", "WiFiManager.h": "WiFiManager", "NTPClient.h": "NTPClient",
+    "ESP32Servo.h": "ESP32Servo", "MFRC522.h": "MFRC522", "U8g2lib.h": "U8g2", "IRremoteESP8266.h": "IRremoteESP8266",
+    "IRrecv.h": "IRremoteESP8266", "IRsend.h": "IRremoteESP8266", "Keypad.h": "Keypad", "RTClib.h": "RTClib",
+    "TinyGPS++.h": "TinyGPSPlus", "TinyGPSPlus.h": "TinyGPSPlus", "HX711.h": "HX711 Arduino Library",
+    "AccelStepper.h": "AccelStepper", "BH1750.h": "BH1750", "NewPing.h": "NewPing", "Bounce2.h": "Bounce2",
+    "ESPAsyncWebServer.h": "ESPAsyncWebServer", "AsyncTCP.h": "Async TCP", "UniversalTelegramBot.h": "UniversalTelegramBot",
+    "MAX30105.h": "SparkFun MAX3010x Pulse and Proximity Sensor Library", "Adafruit_ADS1X15.h": "Adafruit ADS1X15",
+    "Adafruit_INA219.h": "Adafruit INA219", "SHT31.h": "SHT31", "Adafruit_SHT31.h": "Adafruit SHT31 Library",
+}
+
+DICAS_CORE3 = {
+    "ledcSetup": "No núcleo ESP32 3.x NÃO existem ledcSetup/ledcAttachPin. Use: ledcAttach(PINO, FREQ, BITS); e ledcWrite(PINO, duty);",
+    "ledcAttachPin": "No núcleo ESP32 3.x use ledcAttach(PINO, FREQ, BITS) (não existe ledcAttachPin) e ledcWrite(PINO, duty).",
+    "ledcDetachPin": "No núcleo ESP32 3.x use ledcDetach(PINO).",
+    "timerAlarmWrite": "No núcleo ESP32 3.x: hw_timer_t *t = timerBegin(1000000); timerAttachInterrupt(t, &funcao); timerAlarm(t, microssegundos, true, 0);",
+    "timerAlarmEnable": "No núcleo ESP32 3.x o timerAlarm(t, us, true, 0) já liga o alarme; não existe timerAlarmEnable.",
+    "timerBegin": "No núcleo ESP32 3.x timerBegin recebe só a frequência: hw_timer_t *t = timerBegin(1000000);",
+    "timerAttachInterrupt": "No núcleo ESP32 3.x: timerAttachInterrupt(t, &funcao); (sem o terceiro parâmetro).",
+    "analogWriteResolution": "Para PWM no ESP32 prefira ledcAttach(PINO, FREQ, BITS) e ledcWrite(PINO, duty).",
+}
+
+
+def porta_ledc(codigo: str) -> tuple[str, list[str]]:
+    """Converte a API antiga de PWM (ledcSetup + ledcAttachPin + ledcWrite(canal)) para a do núcleo 3.x."""
+    if "ledcSetup" not in codigo and "ledcAttachPin" not in codigo:
+        return codigo, []
+    setups = {m.group(1).strip(): (m.group(2).strip(), m.group(3).strip(), m.group(0))
+              for m in re.finditer(r"ledcSetup\s*\(\s*([^,()]+?)\s*,\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)\s*;", codigo)}
+    anexos = [(m.group(1).strip(), m.group(2).strip(), m.group(0))
+              for m in re.finditer(r"ledcAttachPin\s*\(\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)\s*;", codigo)]
+    canal_pino = {}
+    for pino, canal, _ in anexos:
+        if canal in canal_pino and canal_pino[canal] != pino:
+            return codigo, []        # um canal para vários pinos: deixa a IA resolver (com a dica)
+        canal_pino[canal] = pino
+    if not anexos or any(c not in setups for c in canal_pino):
+        return codigo, []
+    for canal, pino in canal_pino.items():
+        freq, bits, txt = setups[canal]
+        codigo = codigo.replace(txt, f"ledcAttach({pino}, {freq}, {bits});", 1)
+        codigo = re.sub(r"ledc(Write|WriteTone|Read)\s*\(\s*" + re.escape(canal) + r"\s*([,)])",
+                        lambda m: f"ledc{m.group(1)}({pino}{m.group(2)}", codigo)
+    for _, _, txt in anexos:
+        codigo = codigo.replace(txt, "", 1)
+    return codigo, ["converti o PWM para a API do núcleo ESP32 3.x (ledcAttach/ledcWrite por pino)"]
+
+
+def normaliza_ino(codigo: str) -> tuple[str, list[str]]:
+    feito = []
+    if re.search(r"#include\s*[<\"]Servo\.h[>\"]", codigo):
+        codigo = re.sub(r"#include\s*[<\"]Servo\.h[>\"]", "#include <ESP32Servo.h>", codigo)
+        feito.append("troquei Servo.h por ESP32Servo.h (a do ESP32)")
+    codigo, f = porta_ledc(codigo)
+    return codigo, feito + f
+
+
+def erros_gcc(log: str) -> list[dict]:
+    saida, vistos = [], set()
+    for ln in log.splitlines():
+        m = re.match(r"^(?P<arq>\S+?\.(?:ino|cpp|c|h|hpp)):(?P<l>\d+):(?:\d+:)?\s*(?P<tipo>fatal error|error):\s*(?P<msg>.+)$", ln.strip())
+        if m:
+            chave = (Path(m["arq"]).name, m["l"], m["msg"])
+            if chave not in vistos:
+                vistos.add(chave)
+                saida.append({"arquivo": Path(m["arq"]).name, "linha": int(m["l"]), "msg": m["msg"].strip(),
+                              "do_sketch": m["arq"].endswith(".ino")})
+            continue
+        u = re.search(r"undefined reference to `([^']+)'", ln)
+        if u and ("ref", u.group(1)) not in vistos:
+            vistos.add(("ref", u.group(1)))
+            saida.append({"arquivo": "", "linha": 0, "msg": f"undefined reference to {u.group(1)}", "do_sketch": False})
+    saida.sort(key=lambda e: not e["do_sketch"])
+    return saida
+
+
+def headers_faltando(erros: list[dict]) -> list[str]:
+    out = []
+    for e in erros:
+        m = re.match(r"([\w+./-]+\.h(?:pp)?): No such file or directory", e["msg"])
+        if m:
+            out.append(Path(m.group(1)).name)
+    return out
+
+
+def dica_esp32(e: dict, codigo: str, placa: str = "esp32") -> str:
+    msg = e["msg"]
+    for nome, dica in DICAS_CORE3.items():
+        if f"'{nome}'" in msg or f"`{nome}" in msg:
+            return dica
+    if "BluetoothSerial" in msg or ("Bluetooth" in msg and placa != "esp32"):
+        return "Esta placa não tem Bluetooth clássico (BluetoothSerial). Use BLE (BLEDevice.h) ou WiFi."
+    if "No such file or directory" in msg:
+        return "Biblioteca que não existe/não foi encontrada: troque por uma biblioteca comum ou faça sem ela."
+    if "was not declared in this scope" in msg:
+        nome = re.search(r"'(\w+)'", msg)
+        n = nome.group(1) if nome else "esse nome"
+        return (f"{n} não foi declarado: declare a variável/função ANTES de usar (no topo do arquivo) "
+                "ou inclua a biblioteca certa.")
+    if "does not name a type" in msg:
+        return "Esse tipo não existe: falta o #include da biblioteca dele, ou o nome está errado."
+    if "invalid conversion" in msg or "cannot convert" in msg:
+        return "Tipos incompatíveis: converta explicitamente (ex.: String(x), x.c_str(), (int)x)."
+    if "redefinition" in msg or "previously declared" in msg:
+        return "Nome declarado duas vezes: remova a duplicata."
+    if "expected" in msg and ("before" in msg or "at end of input" in msg):
+        return "Erro de sintaxe: falta ; ou } ou ) perto desta linha (veja também a linha anterior)."
+    if "undefined reference" in msg:
+        return "A função foi declarada mas não implementada (ou falta a biblioteca). Implemente a função."
+    return ""
+
+
+def _arduino_env() -> dict:
+    import os
+    return dict(os.environ)
+
+
+def instala_bibliotecas(headers: list[str]) -> list[str]:
+    """Instala pelo arduino-cli as bibliotecas que fornecem esses .h. Devolve os nomes instalados."""
+    cli = config.ARDUINO_CLI
+    instaladas = []
+    for h in dict.fromkeys(headers):
+        nome = HEADERS_LIBS.get(h) or _procura_lib(h)
+        if not nome:
+            continue
+        try:
+            r = subprocess.run([cli, "lib", "install", nome], capture_output=True, text=True, timeout=300,
+                               env=_arduino_env())
+            if r.returncode == 0:
+                instaladas.append(nome)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    return instaladas
+
+
+def _procura_lib(header: str) -> str | None:
+    """Pergunta ao índice do Arduino qual biblioteca fornece esse cabeçalho."""
+    stem = Path(header).stem
+    try:
+        r = subprocess.run([config.ARDUINO_CLI, "lib", "search", stem, "--format", "json"],
+                           capture_output=True, text=True, timeout=120, env=_arduino_env())
+        libs = json.loads(r.stdout or "{}").get("libraries", [])
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+    cands = [l["name"] for l in libs if header in ((l.get("latest") or {}).get("provides_includes") or [])]
+    if not cands:
+        return None
+    norm = lambda s: re.sub(r"[^a-z0-9]", "", s.lower())
+    exato = [c for c in cands if norm(c) == norm(stem)]
+    return (exato or sorted(cands, key=len))[0]
+
+
+# ======================================================================= prompts para a IA
+def numera(codigo: str) -> str:
+    return "\n".join(f"{i:>4}| {ln}" for i, ln in enumerate(codigo.split("\n"), 1))
+
+
+def _linha(codigo: str, n: int) -> str:
+    ls = codigo.split("\n")
+    return ls[n - 1].strip() if 0 < n <= len(ls) else ""
+
+
+def relatorio_erros(erros: list[dict], codigo: str, dica, limite: int = 8, log: str = "") -> str:
+    """Texto curto para a IA: cada erro com a linha, o código daquela linha e uma dica."""
+    if not erros:
+        m = re.search(r"\* What went wrong:\n(.*?)(?:\n\* |\Z)", log, re.S)
+        return (m.group(1) if m else log[-1500:]).strip()[:1500]
+    partes = []
+    for e in erros[:limite]:
+        txt = f"- Linha {e['linha']}: {e['msg']}" if e.get("linha") else f"- {e['msg']}"
+        if e.get("simbolo"):
+            txt += f" [{e['simbolo']}" + (f" em {e['local']}" if e.get("local") else "") + "]"
+        if e.get("arquivo") and e.get("do_sketch") is False and e["arquivo"]:
+            txt += f" (no arquivo {e['arquivo']})"
+        lc = _linha(codigo, e["linha"]) if e.get("linha") and e.get("do_sketch", True) else ""
+        if lc:
+            txt += f"\n    código: {lc}"
+        d = dica(e, codigo)
+        if d:
+            txt += f"\n    dica: {d}"
+        partes.append(txt)
+    if len(erros) > limite:
+        partes.append(f"(e mais {len(erros) - limite} erro(s) parecido(s))")
+    return "\n".join(partes)
+
+
+def assinatura_erros(erros: list[dict], codigo: str) -> set:
+    """Identifica os erros pelo conteúdo (não pelo número da linha, que muda), para saber se eles se repetem."""
+    return {(e["msg"][:80], e.get("simbolo", ""), _linha(codigo, e.get("linha", 0))[:80]) for e in erros}
+
+
+AVISO_REPETIDO = ("\n\nATENÇÃO: estes mesmos erros já apareceram na tentativa anterior, então a correção anterior NÃO "
+                  "funcionou. Não repita a mesma solução: reescreva o trecho com problema de OUTRO jeito, mais simples "
+                  "(por exemplo, renomeie variáveis, separe em métodos, use outra classe/função mais comum).")
+
+
+def mensagens_correcao(system: str, pedido: str, codigo: str, relatorio: str, linguagem: str, rotulo: str) -> list[dict]:
+    """Conversa LIMPA para a correção: regras + pedido original + código numerado + erros com dicas."""
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": (
+            f"Pedido original: {pedido}\n\nEste é o código atual (os números à esquerda são só referência de linha, "
+            f"NÃO fazem parte do código):\n```\n{numera(codigo)}\n```\n\nO compilador encontrou estes erros:\n{relatorio}\n\n"
+            f"Corrija TODOS os erros mantendo o que já funciona e o que o pedido exige. Devolva o arquivo COMPLETO, sem os "
+            f"números de linha, no formato:\nNOME: {rotulo}\n```{linguagem}\n<código completo>\n```")},
+    ]
+
+
+# ======================================================================= modelo de código
+def _modelo_atual_e_codigo() -> bool:
+    try:
+        for ln in config.MODELO_ENV.read_text().splitlines():
+            if ln.startswith("MODEL="):
+                return "coder" in ln.lower() or "code" in Path(ln[6:]).name.lower()
+    except OSError:
+        pass
+    return False
+
+
+async def garante_modelo_codigo(emit) -> None:
+    """Usa o modelo de código (Qwen2.5-Coder) para gerar apps/firmware: troca sozinho se ele estiver no PC."""
+    import os
+    import perfis
+    if os.environ.get("CODIGO_AUTO", "1") == "0" or _modelo_atual_e_codigo():
+        return
+    p = perfis.PERFIS["codigo"]
+    if not perfis.presente(p):
+        try:
+            perfis.baixar("codigo")
+            await emit({"type": "status", "msg": "Dica: estou baixando NO PC o modelo de código (Qwen2.5-Coder, ~4,7 GB), "
+                                                 "que escreve apps e firmware bem melhor. Desta vez uso o modelo atual."})
+        except ValueError:
+            pass
+        return
+    await emit({"type": "status", "msg": "Trocando para o modelo de código (Qwen2.5-Coder)… leva 1 a 2 minutos só desta vez."})
+    try:
+        await asyncio.to_thread(perfis.seleciona, "codigo")
+    except (RuntimeError, ValueError) as e:
+        await emit({"type": "status", "msg": f"Não consegui trocar o modelo sozinho ({e}). Sigo com o atual."})
+        return
+    for _ in range(180):   # até ~6 min
+        await asyncio.sleep(2)
+        if await perfis.estado_llm() == "ok":
+            return
+    await emit({"type": "status", "msg": "O modelo de código está demorando para carregar; vou tentar mesmo assim."})
+
+
+# ======================================================================= revisão (o código faz TUDO o que foi pedido?)
+def _sem_coment_cpp(codigo: str) -> str:
+    codigo = re.sub(r"/\*.*?\*/", " ", codigo, flags=re.S)
+    return re.sub(r"//[^\n]*", " ", codigo)
+
+
+def confere_pedido(pedido: str, codigo: str, linguagem: str) -> list[str]:
+    """Conferência SEM IA das partes objetivas do pedido: pinos, intervalos de tempo, página que se atualiza,
+    dados salvos, toque longo e endereços citados. Devolve o que o código não faz (lista vazia = tudo certo)."""
+    p = pedido.lower()
+    c = _sem_coment_cpp(codigo)
+    cl = c.lower()
+    falta = []
+    # pinos citados ("pino 4", "GPIO 25", "no pino D5")
+    for n in dict.fromkeys(re.findall(r"\b(?:pino|gpio|pin)\s*(?:n[ºo°.]?\s*)?(?:d|gpio)?\s*(\d{1,2})\b", p)):
+        if not re.search(r"(?<![\w.])(?:GPIO_NUM_)?" + n + r"(?![\w.])", c):
+            falta.append(f"usar o pino {n}, como o pedido diz")
+    # intervalos de tempo ("a cada 5 segundos", "10 s", "2 minutos", "500 ms")
+    for num, uni in re.findall(r"(\d+(?:[.,]\d+)?)\s*(milissegundos?|ms|segundos?|seg|s|minutos?|min|horas?|h)\b", p):
+        v = float(num.replace(",", "."))
+        mult = 1 if uni.startswith(("mili", "ms")) else 3600000 if uni.startswith("h") else 60000 if uni.startswith("min") else 1000
+        ms = int(v * mult)
+        seg = ms / 1000
+        seg_txt = str(int(seg)) if seg == int(seg) else str(seg)
+        opcoes = [rf"(?<![\w.]){ms}(?:UL|L|u|l)?(?![\w.])", rf"(?<![\w.]){seg_txt}\s*\*\s*1000\b", rf"\b1000\s*\*\s*{seg_txt}(?![\w.])",
+                  rf"content\s*=\s*\\?['\"]{seg_txt}\b"]
+        if mult == 60000 and v == int(v):
+            opcoes += [rf"(?<![\w.]){int(v)}\s*\*\s*60\s*\*\s*1000", rf"(?<![\w.]){int(v)}\s*\*\s*60000"]
+        if mult == 3600000 and v == int(v):
+            opcoes += [rf"(?<![\w.]){int(v)}\s*\*\s*3600\s*\*\s*1000", rf"(?<![\w.]){int(v)}\s*\*\s*60\s*\*\s*60\s*\*\s*1000"]
+        if ms >= 1000 and not any(re.search(o, c) for o in opcoes):
+            falta.append(f"o intervalo de {num} {uni} pedido (= {ms} ms) não aparece no código")
+    # página web que se atualiza sozinha
+    web = re.search(r"p[aá]gina|web|site|navegador|html", p)
+    atualiza = re.search(r"atualiz|tempo real|ao vivo|sozinh|autom[aá]tic", p)
+    if linguagem == "cpp" and web and atualiza and re.search(r"webserver|asyncwebserver|server\.send|request->send", cl):
+        if not re.search(r"http-equiv|setinterval|settimeout|fetch\s*\(|xmlhttprequest|eventsource|websocket", cl):
+            falta.append("a página web não se atualiza sozinha: use <meta http-equiv='refresh' content='N'> ou JavaScript "
+                         "(setInterval + fetch de uma rota que devolve os valores)")
+    # dados que o usuário cria precisam ficar salvos (app Android)
+    if linguagem == "java" and re.search(r"\bsalv|\bguard|lembrar|persist|não perder|nao perder|hist[oó]rico|anota|notas?\b|tarefas?\b", p):
+        if not re.search(r"sharedpreferences|sqlite|openfileoutput|fileoutputstream", cl):
+            falta.append("salvar os dados no celular (SharedPreferences) e carregá-los ao abrir o app")
+    # toque longo
+    if linguagem == "java" and re.search(r"segur|toque longo|pressionar e segurar|long[ -]?press", p):
+        if not re.search(r"setonitemlongclicklistener|setonlongclicklistener|onlongclick", cl):
+            falta.append("a ação ao tocar e SEGURAR (setOnItemLongClickListener / setOnLongClickListener)")
+    # endereços citados (broker MQTT, sites)
+    for host in dict.fromkeys(re.findall(r"\b((?:[a-z0-9-]+\.)+(?:org|com|net|io|br|cloud))\b", p)):
+        if host not in cl:
+            falta.append(f"usar o endereço {host} citado no pedido")
+    return falta[:4]
+
+
+async def revisa(pedido: str, codigo: str, linguagem: str, pede) -> list[str]:
+    """Pede à IA uma checagem curta do código contra o pedido. Devolve o que falta (até 3 itens; vazio = tudo ok).
+
+    `pede(mensagens, temperatura, max_tokens)` é a função que chama o modelo (vem do androidgen, sem import circular).
+    """
+    msgs = [
+        {"role": "system", "content": "Você é um revisor de código rigoroso e objetivo. Responda só com JSON."},
+        {"role": "user", "content": (
+            f"Pedido do usuário: {pedido}\n\nCódigo:\n```{linguagem}\n{codigo}\n```\n\n"
+            "Este código JÁ COMPILOU: toda função que ele chama existe (inclusive as da plataforma, como temperatureRead(), "
+            "millis(), ledcAttach()). Valores equivalentes estão certos (10000 ms = 10 s). "
+            "Confira se o código faz TUDO o que o pedido exige (funções, comportamento, botões, o que deve ser salvo, o que deve "
+            "aparecer na tela). Ignore estilo, comentários e detalhes não pedidos. Responda SOMENTE com JSON no formato "
+            '{"faltando": ["..."]}, com no máximo 3 itens curtos do que o pedido exige e o código NÃO faz. '
+            'Se o código faz tudo, responda {"faltando": []}.')},
+    ]
+    try:
+        txt = await pede(msgs, 0.0, 220)
+    except RuntimeError:
+        return []
+    m = re.search(r"\{.*\}", txt, re.S)
+    if not m:
+        return []
+    try:
+        itens = json.loads(m.group(0)).get("faltando", [])
+    except (ValueError, AttributeError):
+        return []
+    if not isinstance(itens, list):
+        return []
+    return filtra_revisao([str(i).strip()[:160] for i in itens if str(i).strip()], pedido, codigo, linguagem)[:3]
+
+
+def filtra_revisao(itens: list[str], pedido: str, codigo: str, linguagem: str) -> list[str]:
+    """Descarta os "defeitos" que a IA revisora costuma inventar:
+    - função/variável "não definida" num código que COMPILOU (é impossível);
+    - pinos e intervalos de tempo quando a conferência exata (confere_pedido) não achou problema neles
+      (ela entende que 10000 ms = 10 s; a IA às vezes não)."""
+    det = " ".join(confere_pedido(pedido, codigo, linguagem)).lower()
+    saida = []
+    for it in itens:
+        t = it.lower()
+        if re.search(r"n[ãa]o (est[áa] |foi |é )?(definid|declarad|implementad)|n[ãa]o existe|undefined|not defined|não reconhecid", t):
+            continue
+        if re.search(r"intervalo|segundo|\bms\b|milissegundo|minuto", t) and "intervalo" not in det:
+            continue
+        if re.search(r"\bpino|\bgpio", t) and "pino" not in det:
+            continue
+        saida.append(it)
+    return saida
+
+
+def mensagens_melhoria(system: str, pedido: str, codigo: str, faltando: list[str], linguagem: str, rotulo: str) -> list[dict]:
+    lista = "\n".join(f"- {f}" for f in faltando)
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": (
+            f"Pedido original: {pedido}\n\nEste código já compila:\n```{linguagem}\n{codigo}\n```\n\n"
+            f"Mas a revisão encontrou o que ainda FALTA para cumprir o pedido:\n{lista}\n\n"
+            f"Implemente o que falta mantendo TUDO o que já funciona. Devolva o arquivo COMPLETO no formato:\n"
+            f"NOME: {rotulo}\n```{linguagem}\n<código completo>\n```")},
+    ]
 EOF
   cat > biblioteca.py <<'EOF'
 """Biblioteca local: documentação e código de referência guardados no disco grande.
@@ -4160,30 +4991,115 @@ def _zims() -> list[Path]:
     return sorted(d.glob("*.zim")) if d.is_dir() else []
 
 
-def wikipedia(consulta: str, k: int = 2, max_chars: int = 700) -> list[dict]:
-    """Busca nos arquivos .zim (Wikipedia offline). Precisa do pacote libzim; sem ele, devolve vazio."""
+def _norm(t: str) -> list[str]:
+    import unicodedata
+    t = unicodedata.normalize("NFKD", t.lower()).encode("ascii", "ignore").decode()
+    return re.findall(r"[a-z0-9]+", t)
+
+
+def titulo_bate(titulo: str, consulta: str) -> bool:
+    """O título do verbete aparece na pergunta? (ex.: "Consentimento sexual" em "o que é consentimento sexual?")"""
+    pal_t = [w for w in _norm(re.sub(r"\(.*?\)", " ", titulo)) if len(w) > 2 or w.isdigit()]
+    q = set(_norm(consulta))
+    return bool(pal_t) and all(w in q or (w.endswith("s") and w[:-1] in q) or w + "s" in q for w in pal_t)
+
+
+PARADAS_Q = {"o", "a", "os", "as", "um", "uma", "de", "do", "da", "dos", "das", "e", "é", "que", "qual", "quais", "como", "me",
+             "eu", "você", "voce", "no", "na", "em", "por", "para", "pra", "com", "sobre", "mais", "minha", "meu", "ter",
+             "fazer", "explica", "explique", "fale", "conta", "diga", "dicas", "ajuda", "ajude", "isso", "ser", "se", "ao",
+             "à", "the", "of", "what", "is", "how", "praticar", "quero", "saber", "entender", "significa", "pode", "seria"}
+
+
+def _ngramas(consulta: str, maximo: int = 4) -> list[str]:
+    """Sequências de palavras da pergunta (as maiores primeiro), sem palavras vazias nas pontas: candidatas a título."""
+    pal = re.findall(r"[\wÀ-ÿ-]+", consulta)
+    out = []
+    for n in range(min(maximo, len(pal)), 0, -1):
+        for i in range(len(pal) - n + 1):
+            g = pal[i:i + n]
+            if g[0].lower() in PARADAS_Q or g[-1].lower() in PARADAS_Q or (n == 1 and len(g[0]) < 4):
+                continue
+            out.append(" ".join(g))
+    return list(dict.fromkeys(out))
+
+
+def _texto_do_verbete(e, max_chars: int) -> str:
+    item = e.get_item()
+    if "html" not in item.mimetype:
+        return ""
+    t = html.unescape(re.sub(r"<[^>]+>", " ", re.sub(r"(?is)<(script|style).*?</\1>", " ",
+                                                      bytes(item.content).decode("utf-8", "ignore"))))
+    t = re.sub(r"\s+", " ", t).strip()
+    if t.startswith(e.title):
+        t = t[len(e.title):].strip()
+    return t[:max_chars]
+
+
+def _por_titulo(arq, consulta: str) -> list:
+    """Verbetes cujo título é um pedaço da pergunta (busca exata pelo título, rápida e precisa)."""
+    achados = []
+    for g in _ngramas(consulta):
+        for cand in dict.fromkeys([g[:1].upper() + g[1:], g, g.lower(), g.title()]):
+            try:
+                e = arq.get_entry_by_title(cand)
+            except (KeyError, RuntimeError):
+                continue
+            if e.is_redirect:
+                e = e.get_redirect_entry()
+            if e.path not in [x.path for x in achados]:
+                achados.append(e)
+            break
+        if len(achados) >= 3:
+            break
+    return achados
+
+
+def _por_busca(arq, consulta: str, n: int) -> list:
+    """Busca de texto completo (o índice exige TODAS as palavras: tenta as palavras-chave juntas e depois uma a uma)."""
+    from libzim.search import Query, Searcher
+    chaves = [w for w in re.findall(r"[\wÀ-ÿ-]+", consulta.lower()) if w not in PARADAS_Q and len(w) > 2]
+    tentativas = ([" ".join(chaves)] if chaves else []) + sorted(chaves, key=len, reverse=True)
+    for q in tentativas[:5]:
+        res = Searcher(arq).search(Query().set_query(q))
+        pega = getattr(res, "get_results", None) or getattr(res, "getResults")   # o nome mudou nas versões novas
+        caminhos = [getattr(r, "path", r) for r in pega(0, n)]
+        if caminhos:
+            out = []
+            for c in caminhos:
+                e = arq.get_entry_by_path(c)
+                out.append(e.get_redirect_entry() if e.is_redirect else e)
+            return out
+    return []
+
+
+def wikipedia(consulta: str, k: int = 2, max_chars: int = 700, exigir_titulo: bool = False) -> list[dict]:
+    """Busca nos arquivos .zim do disco grande (Wikipédia, Wikilivros, Wikiversidade, Wikcionário). Precisa do
+    pacote libzim; sem ele, devolve vazio. exigir_titulo=True: só verbetes cujo título aparece na pergunta
+    (usado nas conversas comuns, para não encher o contexto com coisas que não têm a ver)."""
     zims = _zims()
     if not zims or not _palavras(consulta):
         return []
     try:
         from libzim.reader import Archive
-        from libzim.search import Query, Searcher
     except ImportError:
         return []
+    # a Wikipédia primeiro; dicionário por último
+    zims = sorted(zims, key=lambda z: (0 if "wikipedia" in z.name else 2 if "wiktionary" in z.name else 1, z.name))
     saida = []
     for z in zims:
         try:
             arq = Archive(str(z))
-            res = Searcher(arq).search(Query().set_query(consulta))
-            for caminho in res.getResults(0, k):
-                e = arq.get_entry_by_path(caminho)
-                item = e.get_item()
-                if "html" not in item.mimetype:
+            entradas = _por_titulo(arq, consulta)
+            if not exigir_titulo and not entradas:
+                entradas = _por_busca(arq, consulta, k)
+            for e in entradas:
+                if exigir_titulo and not titulo_bate(e.title, consulta):
                     continue
-                t = html.unescape(re.sub(r"<[^>]+>", " ", re.sub(r"(?is)<(script|style).*?</\1>", " ",
-                                                                  bytes(item.content).decode("utf-8", "ignore"))))
-                t = re.sub(r"\s+", " ", t).strip()
-                saida.append({"titulo": e.title, "texto": t[:max_chars], "fonte": z.name})
+                t = _texto_do_verbete(e, max_chars)
+                if t and e.title not in [x["titulo"] for x in saida]:
+                    saida.append({"titulo": e.title, "texto": t, "fonte": z.name})
+                if len(saida) >= k:
+                    break
         except Exception:
             continue
         if len(saida) >= k:
@@ -4312,11 +5228,74 @@ def _id(repo: str, arquivo: str) -> str:
     return hashlib.sha1(f"{repo}/{arquivo}".encode()).hexdigest()[:10]
 
 
+def _nomes_tensores(arquivo: Path, limite: int = 4000) -> list[str]:
+    """Nomes dos tensores de um .gguf (lidos do cabeçalho, sem carregar o modelo)."""
+    with open(arquivo, "rb") as f:
+        if f.read(4) != b"GGUF":
+            raise ValueError("não é um arquivo GGUF")
+        _ver, nt, nkv = struct.unpack("<IQQ", f.read(20))
+
+        def le_str():
+            (n,) = struct.unpack("<Q", f.read(8))
+            return f.read(n).decode("utf-8", "ignore")
+
+        tam = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
+
+        def pula(t):
+            if t == 8:
+                le_str()
+            elif t == 9:
+                (et,) = struct.unpack("<I", f.read(4))
+                (n,) = struct.unpack("<Q", f.read(8))
+                if et in tam:
+                    f.seek(tam[et] * n, 1)
+                else:
+                    for _ in range(n):
+                        pula(et)
+            else:
+                f.seek(tam[t], 1)
+
+        for _ in range(nkv):
+            le_str()
+            (t,) = struct.unpack("<I", f.read(4))
+            pula(t)
+        nomes = []
+        for _ in range(min(nt, limite)):
+            nomes.append(le_str())
+            (nd,) = struct.unpack("<I", f.read(4))
+            f.seek(8 * nd + 12, 1)
+        return nomes
+
+
+def sd_completo(arquivo: Path) -> tuple[bool, str]:
+    """O modelo de imagem funciona sozinho no motor? (precisa ter difusão + codificador de texto + VAE no mesmo arquivo)"""
+    try:
+        nomes = _nomes_tensores(arquivo)
+    except (OSError, ValueError, struct.error, KeyError) as e:
+        return False, f"Arquivo ilegível ou incompleto ({e})."
+    tem = lambda *pref: any(n.startswith(pref) for n in nomes)
+    difusao = tem("model.diffusion_model.", "unet.")
+    vae = tem("first_stage_model.", "vae.")
+    texto = tem("cond_stage_model.", "conditioner.", "text_encoder", "te.", "text_encoders.")
+    if difusao and vae and texto:
+        return True, ""
+    falta = [n for n, ok in (("VAE", vae), ("codificador de texto", texto), ("modelo de difusão", difusao)) if not ok]
+    return False, ("Este arquivo não é um Stable Diffusion completo: falta " + ", ".join(falta) +
+                   " no mesmo arquivo (modelos como Flux, SD3.5 e Z-Image vêm em partes separadas). Não funciona sozinho aqui.")
+
+
 def extras_imagem() -> dict:
-    """Modelos de imagem adicionados, no mesmo formato de config.IMG_MODELOS (usado pelo gerador de imagens)."""
+    """Modelos de imagem adicionados e COMPATÍVEIS, no formato de config.IMG_MODELOS (usado pelo gerador de imagens)."""
     out = {}
-    for m in lista():
-        if m.get("tipo") != "imagem":
+    itens, mudou = lista(), False
+    for m in itens:
+        if m.get("tipo") == "imagem" and "compativel" not in m and Path(m["caminho"]).exists():
+            m["compativel"], m["motivo"] = sd_completo(Path(m["caminho"]))
+            mudou = True
+    if mudou:
+        _salva(itens)
+    for m in itens:
+        if m.get("tipo") != "imagem" or m.get("compativel") is False:
             continue
         rapido = bool(re.search(r"(?i)turbo|lcm|lightning|hyper|distill", m["nome"] + m["arquivo"]))
         out["x" + m["id"]] = {"nome": m["nome"], "arquivo": Path(m["caminho"]), "tam": m["tam"],
@@ -4419,9 +5398,13 @@ async def arquivos(repo: str, tipo: str = "texto") -> list[dict]:
         g["arquivos"] = [n for n, _ in usados]
         g["tam"] = sum(t for _, t in usados)
     itens = sorted(grupos.values(), key=lambda g: g["tam"])
+    partes = re.search(r"(?i)flux|sd3|sd-?3\.5|z-?image|qwen-?image|hidream|chroma|wan2|lumina|cosmos|kontext", repo)
     for g in itens:
         g["arquivos"].sort()
         g["aviso"] = aviso_tamanho(g["tam"], tipo)
+        if tipo == "imagem" and partes:
+            g["aviso"] = ("Atenção: este tipo de modelo costuma vir em partes (VAE e codificador de texto separados) e "
+                          "provavelmente NÃO funciona sozinho aqui. " + g["aviso"]).strip()
     # recomendado: a quantização preferida que cabe bem na RAM (texto) / o menor completo (imagem)
     limite = min(_ram_gb() * 0.40, 8.0) * 1e9
     rec = None
@@ -4501,9 +5484,12 @@ async def _baixa(job: dict, repo: str, tipo: str, nome: str, arquivos_: list[str
         primeiro = pasta / Path(arquivos_[0]).name
         total = sum((pasta / Path(n).name).stat().st_size for n in arquivos_)
         itens = [m for m in lista() if m["id"] != job["id"]]
-        itens.append({"id": job["id"], "nome": nome, "repo": repo, "tipo": tipo, "arquivo": primeiro.name,
-                      "caminho": str(primeiro), "tam": total, "quant": _quant(primeiro.name),
-                      "camadas": _camadas(primeiro) if tipo == "texto" else None})
+        item = {"id": job["id"], "nome": nome, "repo": repo, "tipo": tipo, "arquivo": primeiro.name,
+                "caminho": str(primeiro), "tam": total, "quant": _quant(primeiro.name),
+                "camadas": _camadas(primeiro) if tipo == "texto" else None}
+        if tipo == "imagem":
+            item["compativel"], item["motivo"] = await asyncio.to_thread(sd_completo, primeiro)
+        itens.append(item)
         _salva(itens)
         if job.get("usar_depois") and tipo == "texto":   # pediram "instala e já deixa selecionado"
             try:
@@ -5449,43 +6435,25 @@ def _estimativa_min(largura: int, altura: int, quadros: int, passos: int) -> int
     return max(1, round(seg / 60))
 
 
-async def _roda_worker(cfg: dict, emit) -> tuple[bool, str]:
-    cmd = recursos.baixa_prioridade([sys.executable, str(Path(__file__).with_name("vidgen.py"))])
-    proc = await asyncio.create_subprocess_exec(
-        *cmd, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
-        start_new_session=True)
-    proc.stdin.write(json.dumps(cfg).encode())
-    await proc.stdin.drain()
-    proc.stdin.close()
-    erro, fase, fixo_dec = "", 1, 270 * (cfg["largura"] * cfg["altura"] * cfg["quadros"]) / (320 * 192 * 17)
-    try:
-        async for linha in proc.stdout:
-            try:
-                ev = json.loads(linha)
-            except ValueError:
-                continue
-            if ev.get("tipo") == "passo":
-                i, n, seg = ev["passo"], ev["total"], ev.get("seg", 0)
-                if fase == 1 and i == n and n == cfg["passos"]:
-                    fase = 2                      # terminou a difusão; os próximos "passos" são a decodificação
-                    await emit({"type": "status", "msg": "Montando os quadros do vídeo (decodificação)…"})
-                    continue
-                if fase == 1:
-                    resta = (n - i) * seg + fixo_dec if seg else None
-                    txt = f"Gerando o vídeo… passo {i} de {n}"
-                    if resta:
-                        txt += f" · faltam uns {max(1, round(resta / 60))} min"
-                    await emit({"type": "passo", "passo": i, "total": n, "msg": txt})
-            elif ev.get("tipo") == "erro":
-                erro = ev.get("msg", "")
-        await proc.wait()
-    except asyncio.CancelledError:  # o usuário clicou em Parar
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        raise
-    return proc.returncode == 0, erro
+async def _roda_worker(cfg: dict, emit) -> tuple[bool, str, list[str]]:
+    """Roda o vidgen.py e transforma os passos em mensagens com o tempo que falta."""
+    fase, fixo_dec = [1], 270 * (cfg["largura"] * cfg["altura"] * cfg["quadros"]) / (320 * 192 * 17)
+
+    async def traduz(ev: dict):
+        if ev.get("type") != "passo":
+            return await emit(ev)
+        i, n = ev["passo"], ev["total"]
+        if fase[0] == 1 and i == n and n == cfg["passos"]:
+            fase[0] = 2                      # terminou a difusão; os próximos "passos" são a decodificação
+            return await emit({"type": "status", "msg": "Montando os quadros do vídeo (decodificação)…"})
+        if fase[0] == 1:
+            seg = ev.get("seg") or 0
+            txt = f"Gerando o vídeo… passo {i} de {n}"
+            if seg:
+                txt += f" · faltam uns {max(1, round(((n - i) * seg + fixo_dec) / 60))} min"
+            await emit({"type": "passo", "passo": i, "total": n, "msg": txt})
+
+    return await imagens._roda_worker(cfg, traduz, script="vidgen.py")
 
 
 def _junta_mp4(pasta: Path, saida: Path) -> bool:
@@ -5544,14 +6512,17 @@ async def gera_video(descricao: str, tamanho: str, quadros: int, passos: int, me
             minutos = _estimativa_min(largura, altura, quadros, passos)
             await emit({"type": "status", "msg": f"Gerando o vídeo ({quadros} quadros, {largura}×{altura}). Leva uns "
                                                  f"{minutos} minutos; pode fechar o app, ele continua no PC."})
-            ok, erro = await _roda_worker({**base, "modo": modo}, emit)
-            if modo != "cpu":
+            ok, erro, registro = await _roda_worker({**base, "modo": modo}, emit)
+            tipo, explicacao = ("", "") if ok else imagens.explica_falha(erro, registro)
+            if modo != "cpu" and tipo not in ("modelo", "ram"):
                 recursos.anota_gpu("video", ok)
-            if not ok and modo != "cpu":
+            if not ok and modo != "cpu" and tipo not in ("modelo", "ram"):
                 await emit({"type": "status", "msg": "A placa de vídeo não deu conta; tentando só pela CPU…"})
-                ok, erro = await _roda_worker({**base, "modo": "cpu"}, emit)
+                ok, erro, registro = await _roda_worker({**base, "modo": "cpu"}, emit)
+                tipo, explicacao = ("", "") if ok else imagens.explica_falha(erro, registro)
             if not ok:
-                await emit({"type": "error", "msg": "Não consegui gerar o vídeo.", "log": erro})
+                await emit({"type": "error", "msg": "Não consegui gerar o vídeo. " + (explicacao or ""),
+                            "log": "\n".join([erro] + registro)[-1500:]})
                 return
             await emit({"type": "status", "msg": "Juntando os quadros num arquivo .mp4…"})
             mp4 = pasta / "video.mp4"
@@ -5676,6 +6647,9 @@ def main():
         elif modo == "gpu":
             kw.update(keep_vae_on_cpu=False)
         sd = StableDiffusion(**kw)
+        if not getattr(getattr(sd, "_model", None), "model", True):   # o motor não conseguiu abrir o modelo
+            evento(tipo="erro", msg="MODELO_NAO_CARREGOU")
+            sys.exit(1)
         evento(tipo="carregado", modo=modo)
 
         def passo(i, total, tempo):
@@ -6031,7 +7005,7 @@ EOF
             <div class="linha-opt">Qualidade (passos) <input type="range" id="imgPassos" min="1" max="8" value="4"> <span id="imgPassosV">4</span></div>
             <div class="linha-opt" id="imgForcaLinha" hidden>Quanto mudar <input type="range" id="imgForca" min="0.2" max="0.95" step="0.05" value="0.6"> <span id="imgForcaV">0.60</span></div>
             <label title="A IA traduz o pedido para inglês e o detalha; os modelos de imagem entendem muito melhor"><input type="checkbox" id="imgMelhorar" checked> ✨ Melhorar o pedido com a IA</label>
-            <div class="sec-btn"><span id="imgModeloTxt">Modelo de imagens: verificando…</span><button class="bt-mini" id="imgBaixar" hidden>Baixar (2 GB)</button></div>
+            <div class="sec-btn"><span id="imgModeloTxt">Modelo de imagens: verificando…</span><button class="bt-mini" id="imgBaixar" hidden>Baixar no PC (2 GB)</button></div>
             <div class="barra-img" id="imgBaixarBarra" hidden><i></i></div>
           </div>
           <div id="vidOpts" hidden>
@@ -6040,7 +7014,7 @@ EOF
             <div class="linha-opt">Qualidade (passos) <input type="range" id="vidPassos" min="6" max="25" value="12"> <span id="vidPassosV">12</span></div>
             <label title="A IA traduz o pedido para inglês e descreve movimento e câmera; o modelo de vídeo entende muito melhor"><input type="checkbox" id="vidMelhorar" checked> ✨ Melhorar o pedido com a IA</label>
             <div class="dica">Roda na CPU: um clipe de ~1 s leva de 15 a 25 minutos. Pode fechar o app; ele continua no PC e o vídeo aparece em 📁 Arquivos criados.</div>
-            <div class="sec-btn"><span id="vidModeloTxt">Modelo de vídeo: verificando…</span><button class="bt-mini" id="vidBaixar" hidden>Baixar (5 GB)</button></div>
+            <div class="sec-btn"><span id="vidModeloTxt">Modelo de vídeo: verificando…</span><button class="bt-mini" id="vidBaixar" hidden>Baixar no PC (5 GB)</button></div>
             <div class="barra-img" id="vidBaixarBarra" hidden><i></i></div>
           </div>
           <div class="sec">Opções</div>
@@ -6106,7 +7080,7 @@ EOF
   <div class="lista" id="llmLista"></div>
   <div class="dica" id="llmMsg"></div>
   <h3 class="sub">➕ Adicionar outra IA</h3>
-  <div class="dica">Digite só o <b>nome</b> (ex.: “llama 3.2 3b”, “mistral 7b”, “gemma”, “stable diffusion”) ou o endereço do Hugging Face. A busca é online e <b>nada é filtrado</b>: aparece o que o Hugging Face tiver com esse nome. Os avisos de tamanho são só informação.</div>
+  <div class="dica">Digite só o <b>nome</b> (ex.: “llama 3.2 3b”, “mistral 7b”, “gemma”, “stable diffusion”) ou o endereço do Hugging Face. A busca é online e <b>nada é filtrado</b>: aparece o que o Hugging Face tiver com esse nome. Os avisos de tamanho são só informação. <b>Tudo é baixado no PC</b>, nunca no celular.</div>
   <div class="linha-bm"><select id="mdTipo"><option value="texto">💬 Conversa</option><option value="imagem">🎨 Imagem</option></select><input type="text" class="campo" id="mdQ" placeholder="Nome da IA…" autocomplete="off"><button class="bt pri" id="mdBusca">Buscar</button></div>
   <div class="lista" id="mdRes"></div>
   <h3 class="sub">Suas IAs adicionadas</h3>
@@ -6923,10 +7897,10 @@ async function mostraArquivos(repo, tipo, row, btn) {
       t.querySelector('span').textContent = g.nome; t.querySelector('small').textContent = (g.quant ? g.quant + ' · ' : '') + fmtGB(g.tam) + (g.arquivos.length > 1 ? ' · ' + g.arquivos.length + ' partes' : '');
       if (g.recomendado) { const rc = document.createElement('span'); rc.className = 'rec'; rc.textContent = ' ★ recomendado para o seu PC'; t.querySelector('small').after(rc); }
       t.querySelector('.aviso').textContent = g.aviso || '';
-      const bb = document.createElement('button'); bb.className = 'bt' + (g.recomendado ? ' pri' : ''); bb.textContent = 'Baixar';
+      const bb = document.createElement('button'); bb.className = 'bt' + (g.recomendado ? ' pri' : ''); bb.textContent = 'Baixar no PC';
       bb.onclick = async () => {
         bb.disabled = true; const rr = await fetch('/modelos/baixar', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({repo, arquivos: g.arquivos, tipo, tam: g.tam})});
-        if (!rr.ok) { $('llmMsg').textContent = '⚠ ' + (await rr.json()).detail; bb.disabled = false; } else { bb.textContent = 'Baixando…'; lerMeus(); }
+        if (!rr.ok) { $('llmMsg').textContent = '⚠ ' + (await rr.json()).detail; bb.disabled = false; } else { bb.textContent = 'Baixando no PC…'; lerMeus(); }
       };
       l.append(t, bb); row.appendChild(l);
     }
@@ -6940,7 +7914,7 @@ async function lerMeus() {
       const row = document.createElement('div'); row.className = 'item-l'; row.style.flexDirection = 'column';
       const topo = document.createElement('div'); topo.style.cssText = 'display:flex;gap:10px;align-items:center;width:100%';
       const t = document.createElement('div'); t.className = 't'; t.innerHTML = '<b></b><small></small>';
-      t.querySelector('b').textContent = d.repo; t.querySelector('small').textContent = d.erro ? '⚠ ' + d.erro : 'Baixando… ' + Math.round(d.progresso * 100) + '% (' + fmtGB(d.feito) + ' de ' + fmtGB(d.tam) + ')';
+      t.querySelector('b').textContent = d.repo; t.querySelector('small').textContent = d.erro ? '⚠ ' + d.erro : 'Baixando no PC… ' + Math.round(d.progresso * 100) + '% (' + fmtGB(d.feito) + ' de ' + fmtGB(d.tam) + ')';
       const b = document.createElement('button'); b.className = 'bt'; b.textContent = d.fim ? 'Ok' : 'Cancelar';
       b.onclick = async () => { await fetch('/modelos/cancelar', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({id: d.id})}); lerMeus(); };
       topo.append(t, b); row.appendChild(topo);
@@ -6956,6 +7930,7 @@ async function lerMeus() {
       const b = document.createElement('button'); b.className = 'bt' + (emUso ? '' : ' pri');
       if (emUso) { b.textContent = 'Em uso'; b.disabled = true; }
       else if (m.tipo === 'texto') { b.textContent = 'Usar'; b.onclick = async () => { $('llmMsg').textContent = 'Trocando o modelo… ele recarrega em alguns minutos.'; const r = await fetch('/modelos/usar', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({id: m.id})}); if (!r.ok) $('llmMsg').textContent = '⚠ ' + (await r.json()).detail; carregaLlm(); lerMeus(); }; }
+      else if (m.compativel === false) { b.textContent = 'Não funciona'; b.disabled = true; t.querySelector('small').textContent += ' · ⚠ ' + (m.motivo || 'incompatível'); }
       else { b.textContent = 'Usar nas imagens'; b.onclick = () => { $('llmDlg').close(); $('modo').value = 'img'; $('modo').onchange(); setTimeout(() => { $('imgModelo').value = 'x' + m.id; $('imgModelo').onchange(); }, 400); }; }
       const ap = document.createElement('button'); ap.className = 'bt'; ap.textContent = 'Apagar';
       ap.onclick = async () => { if (!confirm('Apagar ' + m.nome + ' do disco?')) return; await fetch('/modelos/apagar', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({id: m.id})}); lerMeus(); };
@@ -6966,6 +7941,20 @@ async function lerMeus() {
     if (!e.baixando.some(d => !d.fim) && mdTimer) { clearInterval(mdTimer); mdTimer = null; }
   } catch (e) {}
 }
+// Modelos de IA são SEMPRE baixados no PC: um link do Hugging Face (na conversa ou vindo do app) abre o gerenciador
+window.abreModeloNoPC = url => {
+  const m = String(url).match(/huggingface\.co\/(?!datasets\/|spaces\/|docs\/|blog\/)([\w.-]+\/[\w.-]+)/);
+  if (!m) return false;
+  $('llmBtn').click();
+  $('mdTipo').value = /diffusion|sdxl|\bsd[-_]|flux|turbo|image|realistic|vision/i.test(m[1]) && !/qwen|llama|mistral|gemma|phi|coder/i.test(m[1]) ? 'imagem' : 'texto';
+  $('mdQ').value = m[1]; buscaModelos();
+  $('llmMsg').textContent = 'Modelos de IA são baixados no PC (nunca no celular). Escolha o arquivo e toque em “Baixar no PC”.';
+  return true;
+};
+document.addEventListener('click', e => {
+  const a = e.target.closest('a[href]'); if (!a || a.classList.contains('dl')) return;
+  if (/huggingface\.co\//.test(a.href) && window.abreModeloNoPC(a.href)) e.preventDefault();
+});
 $('mdBusca').onclick = buscaModelos; $('mdQ').onkeydown = e => { if (e.key === 'Enter') buscaModelos(); };
 function atualizaEstadoLlm(estado) {
   $('bolinha').className = 'bolinha ' + estado;
@@ -7395,16 +8384,13 @@ if [ ! -f "$BIB/docs/python/.ok" ]; then
   curl -L --fail -s https://docs.python.org/3/archives/python-3.12-docs-text.tar.bz2 | tar xj -C "$BIB/docs/python" --strip-components=1 && touch "$BIB/docs/python/.ok" || log "AVISO: falhou a documentação do Python"
 fi
 [ -d "$BIB/docs/mdn/.git" ] || { log "baixando MDN (HTML/CSS/JavaScript; ~1 GB)"; git clone --depth 1 --quiet https://github.com/mdn/content "$BIB/docs/mdn" || { rm -rf "$BIB/docs/mdn"; log "AVISO: falhou o MDN"; }; }
-log "== Wikipedia em português (offline)"
-if ! ls "$BIB"/zim/wikipedia_pt*.zim >/dev/null 2>&1; then
-  ARQ=$(curl -s --max-time 30 https://download.kiwix.org/zim/wikipedia/ | grep -o 'wikipedia_pt_all_nopic_[0-9-]*\.zim' | sort -u | tail -1)
-  if [ -n "$ARQ" ]; then
-    log "baixando $ARQ (alguns GB; pode demorar e continua de onde parou se interromper)"
-    curl -L --fail -C - -o "$BIB/zim/$ARQ.part" "https://download.kiwix.org/zim/wikipedia/$ARQ" && mv "$BIB/zim/$ARQ.part" "$BIB/zim/$ARQ" || log "AVISO: a Wikipedia não terminou; rode este script de novo"
-  else
-    log "AVISO: não achei a Wikipedia em português no servidor do Kiwix agora."
-  fi
-fi
+log "== Enciclopédias e livros em português (offline): Wikipédia, Wikilivros, Wikiversidade e Wikcionário"
+# zim_baixa PASTA_NO_KIWIX PREFIXO DESCRICAO: baixa a versão mais nova (o site do Kiwix redireciona: por isso o -L)
+zim_baixa() { ls "$BIB"/zim/"$2"_*.zim >/dev/null 2>&1 && return 0; local arq; arq=$(curl -sL --max-time 60 "https://download.kiwix.org/zim/$1/" | grep -oE "$2_[0-9-]+\.zim" | sort -u | tail -1); [ -n "$arq" ] || { log "AVISO: não achei $3 no Kiwix agora."; return 0; }; log "baixando $3: $arq (continua de onde parou se interromper)"; curl -L --fail -C - -o "$BIB/zim/$arq.part" "https://download.kiwix.org/zim/$1/$arq" && mv "$BIB/zim/$arq.part" "$BIB/zim/$arq" || log "AVISO: $3 não terminou; rode este script de novo"; }
+zim_baixa wikibooks wikibooks_pt_all_nopic "Wikilivros (~55 MB)"
+zim_baixa wikiversity wikiversity_pt_all_nopic "Wikiversidade (~45 MB)"
+zim_baixa wiktionary wiktionary_pt_all_nopic "Wikcionário (~350 MB)"
+zim_baixa wikipedia wikipedia_pt_all_nopic "Wikipédia completa (~6,6 GB)"
 log "FIM. A IA já pode consultar tudo isso (o índice é atualizado sozinho a cada poucos minutos)."
 BIBEOF
   chmod +x "$BASE/biblioteca_baixar.sh"
