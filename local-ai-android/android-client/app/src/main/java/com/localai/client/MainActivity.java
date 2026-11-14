@@ -324,6 +324,16 @@ public class MainActivity extends Activity {
         v.loadDataWithBaseURL(null, html, "text/html", "utf-8", null);
     }
 
+    /** Link de modelo de IA (Hugging Face)? Esses são baixados no PC, nunca no celular. */
+    private static boolean ehModeloDeIa(String url) {
+        return url != null && url.contains("huggingface.co/") && !url.contains("/datasets/") && !url.contains("/spaces/");
+    }
+
+    private void mandaParaOPc(String url) {
+        Toast.makeText(this, "Modelos de IA são baixados no PC, não no celular.", Toast.LENGTH_LONG).show();
+        web.evaluateJavascript("window.abreModeloNoPC && window.abreModeloNoPC(" + JSONObject.quote(url) + ")", null);
+    }
+
     /** Abre o app Tailscale; se não estiver instalado, abre a página dele na loja. */
     private void abreTailscale() {
         Intent i = getPackageManager().getLaunchIntentForPackage("com.tailscale.ipn");
@@ -356,6 +366,10 @@ public class MainActivity extends Activity {
                 String meuHost = Uri.parse(servidor()).getHost();
                 if (destino.getHost() != null && destino.getHost().equals(meuHost)) {
                     return false; // links do próprio servidor ficam dentro do app
+                }
+                if (ehModeloDeIa(destino.toString())) {
+                    mandaParaOPc(destino.toString());   // modelos de IA são baixados no PC, nunca no celular
+                    return true;
                 }
                 try {
                     startActivity(new Intent(Intent.ACTION_VIEW, destino)); // o resto abre no navegador
@@ -401,6 +415,10 @@ public class MainActivity extends Activity {
         // Downloads (.apk, .bin...) vão para a pasta Downloads, com notificação
         web.setDownloadListener((url, userAgent, contentDisposition, mimetype, tamanho) -> {
             String nome = URLUtil.guessFileName(url, contentDisposition, mimetype);
+            if (ehModeloDeIa(url) || nome.matches("(?i).*\\.(gguf|safetensors|ckpt|pth|pt|onnx)$")) {
+                mandaParaOPc(url);   // nada de IA no celular: quem baixa é o PC
+                return;
+            }
             DownloadManager.Request rq = new DownloadManager.Request(Uri.parse(url));
             String cookie = CookieManager.getInstance().getCookie(url);
             if (cookie != null) {

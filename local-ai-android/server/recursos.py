@@ -67,6 +67,15 @@ def baixa_prioridade(cmd: list[str]) -> list[str]:
     return (["nice", "-n", "10"] + cmd) if shutil.which("nice") else cmd
 
 
+def para_gradle() -> None:
+    """Descarrega o Gradle que fica na memória entre compilações (devolve 1 a 2 GB de RAM)."""
+    try:
+        if Path(config.GRADLE_BIN).exists():
+            subprocess.run([config.GRADLE_BIN, "--stop"], capture_output=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
 # ------------------------------------------------------------ modelos ociosos
 _modelos: dict[str, dict] = {}
 
@@ -112,6 +121,8 @@ def garante_ram(minimo_mb: int, o_que: str) -> None:
     if ram_livre_mb() >= minimo_mb:
         return
     libera_ociosos(forcar=True)
+    if ram_livre_mb() < minimo_mb:
+        para_gradle()
     livre = ram_livre_mb()
     if livre < minimo_mb:
         raise RuntimeError(

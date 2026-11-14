@@ -21,6 +21,7 @@ from pathlib import Path
 
 import androidgen
 import config
+import gerador
 import entregas
 import recursos
 
@@ -264,6 +265,28 @@ def escreve_projeto_avancado(pasta: Path, nome: str, app_id: str, arqs: dict[str
         f.write_text(t)
 
 
+def _arquivo_do_erro(arqs: dict[str, str], e: dict) -> str | None:
+    """Acha no projeto o arquivo citado num erro do compilador (pelo caminho ou pelo nome)."""
+    cam = e.get("caminho", "")
+    for c in arqs:
+        if cam.endswith(c) or c.endswith("/" + e.get("arquivo", "\0")):
+            return c
+    return None
+
+
+def _mensagens_correcao_projeto(system: str, pedido: str, arqs: dict[str, str], com_erro: list[str], relatorio: str) -> list[dict]:
+    """Conversa LIMPA: pedido + lista de arquivos + os arquivos com erro (numerados) + erros com dicas."""
+    blocos = "\n".join(f"### {c}\n```\n{gerador.numera(arqs[c])}\n```" for c in com_erro[:3])
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": (
+            f"Pedido original: {pedido}\n\nArquivos do projeto: {', '.join(arqs)}\n\nArquivos com erro (os números à "
+            f"esquerda são só referência de linha, NÃO fazem parte do código):\n{blocos}\n\nO compilador encontrou:\n{relatorio}\n\n"
+            "Corrija TODOS os erros. Devolva SOMENTE os arquivos que precisam mudar (pode criar arquivos que faltam), cada um "
+            "COMPLETO e sem os números de linha, no formato:\nNOME: <nome>\n### caminho/do/arquivo\n```linguagem\n<conteúdo>\n```")},
+    ]
+
+
 async def gera_app_avancado(descricao: str, base: dict[str, str] | None, base_nome: str | None, emit) -> None:
     if androidgen._trava.locked():
         await emit({"type": "error", "msg": "Ainda estou criando outra coisa. Espere terminar ou clique em Parar."})
@@ -274,6 +297,7 @@ async def gera_app_avancado(descricao: str, base: dict[str, str] | None, base_no
         except RuntimeError as e:
             await emit({"type": "error", "msg": str(e)})
             return
+        await gerador.garante_modelo_codigo(emit)
         if base:
             pedido = (f"Estes são os arquivos ATUAIS do app:\n{formata_base(base)}\n\n"
                       f"Modifique o app conforme o pedido e devolva SOMENTE os arquivos que mudaram ou são novos, "
@@ -284,47 +308,69 @@ async def gera_app_avancado(descricao: str, base: dict[str, str] | None, base_no
                      {"role": "user", "content": f"Crie: {EX_PEDIDO_AND}"},
                      {"role": "assistant", "content": EX_RESP_AND},
                      {"role": "user", "content": pedido}]
+        pedido_curto = androidgen._pedido_limpo(descricao)
         id_ = uuid.uuid4().hex[:10]
         pasta = config.WORK_DIR / f"appx-{id_}"
         try:
-            for tentativa in range(config.MAX_FIX_ATTEMPTS + 1):
-                if tentativa == 0:
-                    await emit({"type": "status", "msg": "A IA está escrevendo os arquivos do app… (pode levar vários minutos)"})
-                else:
-                    await emit({"type": "status", "msg": f"Deu erro ao compilar. A IA está corrigindo (tentativa {tentativa} de {config.MAX_FIX_ATTEMPTS})…"})
-                texto = await androidgen.pede_codigo(mensagens, emit)
-                novos = extrai_arquivos(texto)
-                erro = valida_android(novos)
-                if erro:
-                    await emit({"type": "error", "msg": erro, "log": texto[-1500:]})
+            await emit({"type": "status", "msg": "A IA está escrevendo os arquivos do app… (pode levar vários minutos)"})
+            texto = await androidgen.pede_codigo(mensagens, emit)
+            novos = extrai_arquivos(texto)
+            erro = valida_android(novos)
+            if erro:
+                await emit({"type": "error", "msg": erro, "log": texto[-1500:]})
+                return
+            atuais = {**(base or {}), **novos}       # SEMPRE a última versão de cada arquivo
+            if not any(c.endswith("MainActivity.java") for c in atuais):
+                await emit({"type": "error", "msg": "Faltou a MainActivity.java.", "log": texto[-800:]})
+                return
+            nome = extrai_nome(texto, base_nome or "App IA")
+            app_id = f"com.localai.{androidgen.slugify(nome)}{id_[:4]}"
+            for rodada in range(config.MAX_FIX_ATTEMPTS + 1):
+                for _auto in range(3):
+                    feitos = []
+                    for c in list(atuais):
+                        if c.endswith(".java"):
+                            atuais[c], f = gerador.corrige_imports(atuais[c], gerador.IMPORTS_ANDROIDX, "com.localai.app")
+                            feitos += f
+                    if feitos:
+                        await emit({"type": "status", "msg": f"Ajuste automático: adicionei {len(feitos)} import(s) que faltavam."})
+                    await emit({"type": "code", "text": "\n\n".join(f"// {c}\n{t}" for c, t in atuais.items())})
+                    if pasta.exists():
+                        shutil.rmtree(pasta)
+                    escreve_projeto_avancado(pasta, nome, app_id, atuais)
+                    await emit({"type": "status", "msg": "Compilando o app… (a primeira vez baixa as bibliotecas e demora mais)"})
+                    ok, log, apk = await androidgen.compila(pasta)
+                    if ok:
+                        meta = entregas.salva(id_, nome, descricao, "apk",
+                                              [(apk, f"{androidgen.slugify(nome)}.apk", "App Android (.apk)")],
+                                              {"app_id": app_id, "modo": "avancado", "arquivos_fonte": atuais})
+                        await emit({"type": "done", "id": id_, "name": nome, "kind": "apk", "files": meta["files"],
+                                    "note": "Toque para baixar no celular e instalar. Para mudar o app, use ✏ Modificar."})
+                        return
+                    erros = gerador.erros_java(log)
+                    mudou = []
+                    for c in {(_arquivo_do_erro(atuais, e) or "") for e in erros} - {""}:
+                        if c.endswith(".java"):
+                            atuais[c], f = gerador.corrige_java_por_erros(
+                                atuais[c], [e for e in erros if _arquivo_do_erro(atuais, e) == c], gerador.IMPORTS_ANDROIDX)
+                            mudou += f
+                    if not mudou:
+                        break
+                    await emit({"type": "status", "msg": "Corrigi sozinho: " + "; ".join(mudou) + ". Compilando de novo…"})
+                com_erro = [c for c in dict.fromkeys(_arquivo_do_erro(atuais, e) for e in erros) if c]
+                principal = com_erro[0] if com_erro else next(c for c in atuais if c.endswith("MainActivity.java"))
+                relatorio = gerador.relatorio_erros(
+                    [dict(e, linha=e["linha"] if _arquivo_do_erro(atuais, e) == principal else 0) for e in erros],
+                    atuais[principal], gerador.dica_java, log=log)
+                if rodada >= config.MAX_FIX_ATTEMPTS:
+                    await emit({"type": "error", "msg": "Não consegui compilar o app depois das correções.", "log": relatorio})
                     return
-                arqs = {**(base or {}), **novos}
-                if not any(c.endswith("MainActivity.java") for c in arqs):
-                    await emit({"type": "error", "msg": "Faltou a MainActivity.java.", "log": texto[-800:]})
-                    return
-                nome = extrai_nome(texto, base_nome or "App IA")
-                await emit({"type": "code", "text": "\n\n".join(f"// {c}\n{t}" for c, t in novos.items())})
-                if pasta.exists():
-                    shutil.rmtree(pasta)
-                app_id = f"com.localai.{androidgen.slugify(nome)}{id_[:4]}"
-                escreve_projeto_avancado(pasta, nome, app_id, arqs)
-                await emit({"type": "status", "msg": "Compilando o app… (a primeira vez baixa as bibliotecas e demora mais)"})
-                ok, log, apk = await androidgen.compila(pasta)
-                if ok:
-                    meta = entregas.salva(id_, nome, descricao, "apk",
-                                          [(apk, f"{androidgen.slugify(nome)}.apk", "App Android (.apk)")],
-                                          {"app_id": app_id, "modo": "avancado", "arquivos_fonte": arqs})
-                    await emit({"type": "done", "id": id_, "name": nome, "kind": "apk", "files": meta["files"],
-                                "note": "Passe o arquivo para o celular e abra-o para instalar. Para mudar o app, use ✏ Modificar."})
-                    return
-                erros = androidgen.resumo_erros(log)
-                if tentativa >= config.MAX_FIX_ATTEMPTS:
-                    await emit({"type": "error", "msg": "Não consegui compilar o app depois das correções.", "log": erros})
-                    return
-                mensagens += [{"role": "assistant", "content": texto},
-                              {"role": "user", "content": (
-                                  "O código NÃO compilou. ERROS DE COMPILAÇÃO:\n" + erros +
-                                  "\n\nCorrija e devolva SOMENTE os arquivos que precisam mudar, completos, no mesmo formato.")}]
+                await emit({"type": "status", "msg": f"A IA está corrigindo {len(erros) or 1} erro(s) (rodada {rodada + 1} de {config.MAX_FIX_ATTEMPTS})…"})
+                msgs = _mensagens_correcao_projeto(SYS_ANDROID, pedido_curto, atuais, com_erro or [principal], relatorio)
+                texto = await androidgen.pede_codigo(msgs, emit, temperatura=0.1)
+                novos = {c: androidgen.tira_numeros(t) for c, t in extrai_arquivos(texto).items()}
+                if novos and not valida_android(novos):
+                    atuais.update(novos)
         except RuntimeError as e:
             await emit({"type": "error", "msg": str(e)})
         finally:
@@ -407,16 +453,20 @@ async def gera_codigo(alvo: str, descricao: str, base: dict[str, str] | None, ba
                      {"role": "assistant", "content": a["ex"][1]}, {"role": "user", "content": pedido}]
         id_ = uuid.uuid4().hex[:10]
         pasta = config.WORK_DIR / f"cod-{id_}"
+        arqs: dict[str, str] = {}
+        pedido_curto = androidgen._pedido_limpo(descricao)
         try:
             for tentativa in range(config.MAX_FIX_ATTEMPTS + 1):
                 await emit({"type": "status", "msg": (f"A IA está escrevendo o {a['rotulo']}…" if tentativa == 0 else
                             f"Achei um erro. A IA está corrigindo (tentativa {tentativa} de {config.MAX_FIX_ATTEMPTS})…")})
-                texto = await androidgen.pede_codigo(mensagens, emit)
-                novos = extrai_arquivos(texto)
+                texto = await androidgen.pede_codigo(mensagens, emit, temperatura=0.2 if tentativa == 0 else 0.1)
+                novos = {c: androidgen.tira_numeros(t) for c, t in extrai_arquivos(texto).items()}
                 if not novos or not all(caminho_seguro(c) for c in novos) or len(novos) > MAX_ARQUIVOS:
+                    if tentativa > 0 and arqs:
+                        continue     # correção fora do formato: tenta de novo com a versão anterior
                     await emit({"type": "error", "msg": "A IA não devolveu os arquivos no formato pedido.", "log": texto[-1200:]})
                     return
-                arqs = {**(base or {}), **novos}
+                arqs = {**(arqs or base or {}), **novos}    # SEMPRE a última versão de cada arquivo
                 if a["principal"] not in arqs:
                     await emit({"type": "error", "msg": f"Faltou o arquivo {a['principal']}.", "log": texto[-800:]})
                     return
@@ -435,9 +485,8 @@ async def gera_codigo(alvo: str, descricao: str, base: dict[str, str] | None, ba
                     if tentativa >= config.MAX_FIX_ATTEMPTS:
                         await emit({"type": "error", "msg": "O código continua com erros de sintaxe.", "log": erros})
                         return
-                    mensagens += [{"role": "assistant", "content": texto},
-                                  {"role": "user", "content": "O código tem erros:\n" + erros +
-                                   "\n\nCorrija e devolva SOMENTE os arquivos que precisam mudar, completos, no mesmo formato."}]
+                    com_erro = [c for c in arqs if c.endswith(".py") and c in erros] or [a["principal"]]
+                    mensagens = _mensagens_correcao_projeto(a["sys"], pedido_curto, arqs, com_erro, erros)
                     continue
                 slug = androidgen.slugify(nome)
                 pasta.mkdir(parents=True, exist_ok=True)

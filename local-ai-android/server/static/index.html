@@ -279,7 +279,7 @@
             <div class="linha-opt">Qualidade (passos) <input type="range" id="imgPassos" min="1" max="8" value="4"> <span id="imgPassosV">4</span></div>
             <div class="linha-opt" id="imgForcaLinha" hidden>Quanto mudar <input type="range" id="imgForca" min="0.2" max="0.95" step="0.05" value="0.6"> <span id="imgForcaV">0.60</span></div>
             <label title="A IA traduz o pedido para inglês e o detalha; os modelos de imagem entendem muito melhor"><input type="checkbox" id="imgMelhorar" checked> ✨ Melhorar o pedido com a IA</label>
-            <div class="sec-btn"><span id="imgModeloTxt">Modelo de imagens: verificando…</span><button class="bt-mini" id="imgBaixar" hidden>Baixar (2 GB)</button></div>
+            <div class="sec-btn"><span id="imgModeloTxt">Modelo de imagens: verificando…</span><button class="bt-mini" id="imgBaixar" hidden>Baixar no PC (2 GB)</button></div>
             <div class="barra-img" id="imgBaixarBarra" hidden><i></i></div>
           </div>
           <div id="vidOpts" hidden>
@@ -288,7 +288,7 @@
             <div class="linha-opt">Qualidade (passos) <input type="range" id="vidPassos" min="6" max="25" value="12"> <span id="vidPassosV">12</span></div>
             <label title="A IA traduz o pedido para inglês e descreve movimento e câmera; o modelo de vídeo entende muito melhor"><input type="checkbox" id="vidMelhorar" checked> ✨ Melhorar o pedido com a IA</label>
             <div class="dica">Roda na CPU: um clipe de ~1 s leva de 15 a 25 minutos. Pode fechar o app; ele continua no PC e o vídeo aparece em 📁 Arquivos criados.</div>
-            <div class="sec-btn"><span id="vidModeloTxt">Modelo de vídeo: verificando…</span><button class="bt-mini" id="vidBaixar" hidden>Baixar (5 GB)</button></div>
+            <div class="sec-btn"><span id="vidModeloTxt">Modelo de vídeo: verificando…</span><button class="bt-mini" id="vidBaixar" hidden>Baixar no PC (5 GB)</button></div>
             <div class="barra-img" id="vidBaixarBarra" hidden><i></i></div>
           </div>
           <div class="sec">Opções</div>
@@ -336,7 +336,7 @@
   <div class="lista" id="llmLista"></div>
   <div class="dica" id="llmMsg"></div>
   <h3 class="sub">➕ Adicionar outra IA</h3>
-  <div class="dica">Digite só o <b>nome</b> (ex.: “llama 3.2 3b”, “mistral 7b”, “gemma”, “stable diffusion”) ou o endereço do Hugging Face. A busca é online e <b>nada é filtrado</b>: aparece o que o Hugging Face tiver com esse nome. Os avisos de tamanho são só informação.</div>
+  <div class="dica">Digite só o <b>nome</b> (ex.: “llama 3.2 3b”, “mistral 7b”, “gemma”, “stable diffusion”) ou o endereço do Hugging Face. A busca é online e <b>nada é filtrado</b>: aparece o que o Hugging Face tiver com esse nome. Os avisos de tamanho são só informação. <b>Tudo é baixado no PC</b>, nunca no celular.</div>
   <div class="linha-bm"><select id="mdTipo"><option value="texto">💬 Conversa</option><option value="imagem">🎨 Imagem</option></select><input type="text" class="campo" id="mdQ" placeholder="Nome da IA…" autocomplete="off"><button class="bt pri" id="mdBusca">Buscar</button></div>
   <div class="lista" id="mdRes"></div>
   <h3 class="sub">Suas IAs adicionadas</h3>
@@ -1147,10 +1147,10 @@ async function mostraArquivos(repo, tipo, row, btn) {
       t.querySelector('span').textContent = g.nome; t.querySelector('small').textContent = (g.quant ? g.quant + ' · ' : '') + fmtGB(g.tam) + (g.arquivos.length > 1 ? ' · ' + g.arquivos.length + ' partes' : '');
       if (g.recomendado) { const rc = document.createElement('span'); rc.className = 'rec'; rc.textContent = ' ★ recomendado para o seu PC'; t.querySelector('small').after(rc); }
       t.querySelector('.aviso').textContent = g.aviso || '';
-      const bb = document.createElement('button'); bb.className = 'bt' + (g.recomendado ? ' pri' : ''); bb.textContent = 'Baixar';
+      const bb = document.createElement('button'); bb.className = 'bt' + (g.recomendado ? ' pri' : ''); bb.textContent = 'Baixar no PC';
       bb.onclick = async () => {
         bb.disabled = true; const rr = await fetch('/modelos/baixar', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({repo, arquivos: g.arquivos, tipo, tam: g.tam})});
-        if (!rr.ok) { $('llmMsg').textContent = '⚠ ' + (await rr.json()).detail; bb.disabled = false; } else { bb.textContent = 'Baixando…'; lerMeus(); }
+        if (!rr.ok) { $('llmMsg').textContent = '⚠ ' + (await rr.json()).detail; bb.disabled = false; } else { bb.textContent = 'Baixando no PC…'; lerMeus(); }
       };
       l.append(t, bb); row.appendChild(l);
     }
@@ -1164,7 +1164,7 @@ async function lerMeus() {
       const row = document.createElement('div'); row.className = 'item-l'; row.style.flexDirection = 'column';
       const topo = document.createElement('div'); topo.style.cssText = 'display:flex;gap:10px;align-items:center;width:100%';
       const t = document.createElement('div'); t.className = 't'; t.innerHTML = '<b></b><small></small>';
-      t.querySelector('b').textContent = d.repo; t.querySelector('small').textContent = d.erro ? '⚠ ' + d.erro : 'Baixando… ' + Math.round(d.progresso * 100) + '% (' + fmtGB(d.feito) + ' de ' + fmtGB(d.tam) + ')';
+      t.querySelector('b').textContent = d.repo; t.querySelector('small').textContent = d.erro ? '⚠ ' + d.erro : 'Baixando no PC… ' + Math.round(d.progresso * 100) + '% (' + fmtGB(d.feito) + ' de ' + fmtGB(d.tam) + ')';
       const b = document.createElement('button'); b.className = 'bt'; b.textContent = d.fim ? 'Ok' : 'Cancelar';
       b.onclick = async () => { await fetch('/modelos/cancelar', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({id: d.id})}); lerMeus(); };
       topo.append(t, b); row.appendChild(topo);
@@ -1180,6 +1180,7 @@ async function lerMeus() {
       const b = document.createElement('button'); b.className = 'bt' + (emUso ? '' : ' pri');
       if (emUso) { b.textContent = 'Em uso'; b.disabled = true; }
       else if (m.tipo === 'texto') { b.textContent = 'Usar'; b.onclick = async () => { $('llmMsg').textContent = 'Trocando o modelo… ele recarrega em alguns minutos.'; const r = await fetch('/modelos/usar', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({id: m.id})}); if (!r.ok) $('llmMsg').textContent = '⚠ ' + (await r.json()).detail; carregaLlm(); lerMeus(); }; }
+      else if (m.compativel === false) { b.textContent = 'Não funciona'; b.disabled = true; t.querySelector('small').textContent += ' · ⚠ ' + (m.motivo || 'incompatível'); }
       else { b.textContent = 'Usar nas imagens'; b.onclick = () => { $('llmDlg').close(); $('modo').value = 'img'; $('modo').onchange(); setTimeout(() => { $('imgModelo').value = 'x' + m.id; $('imgModelo').onchange(); }, 400); }; }
       const ap = document.createElement('button'); ap.className = 'bt'; ap.textContent = 'Apagar';
       ap.onclick = async () => { if (!confirm('Apagar ' + m.nome + ' do disco?')) return; await fetch('/modelos/apagar', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({id: m.id})}); lerMeus(); };
@@ -1190,6 +1191,20 @@ async function lerMeus() {
     if (!e.baixando.some(d => !d.fim) && mdTimer) { clearInterval(mdTimer); mdTimer = null; }
   } catch (e) {}
 }
+// Modelos de IA são SEMPRE baixados no PC: um link do Hugging Face (na conversa ou vindo do app) abre o gerenciador
+window.abreModeloNoPC = url => {
+  const m = String(url).match(/huggingface\.co\/(?!datasets\/|spaces\/|docs\/|blog\/)([\w.-]+\/[\w.-]+)/);
+  if (!m) return false;
+  $('llmBtn').click();
+  $('mdTipo').value = /diffusion|sdxl|\bsd[-_]|flux|turbo|image|realistic|vision/i.test(m[1]) && !/qwen|llama|mistral|gemma|phi|coder/i.test(m[1]) ? 'imagem' : 'texto';
+  $('mdQ').value = m[1]; buscaModelos();
+  $('llmMsg').textContent = 'Modelos de IA são baixados no PC (nunca no celular). Escolha o arquivo e toque em “Baixar no PC”.';
+  return true;
+};
+document.addEventListener('click', e => {
+  const a = e.target.closest('a[href]'); if (!a || a.classList.contains('dl')) return;
+  if (/huggingface\.co\//.test(a.href) && window.abreModeloNoPC(a.href)) e.preventDefault();
+});
 $('mdBusca').onclick = buscaModelos; $('mdQ').onkeydown = e => { if (e.key === 'Enter') buscaModelos(); };
 function atualizaEstadoLlm(estado) {
   $('bolinha').className = 'bolinha ' + estado;

@@ -20,90 +20,16 @@ from pathlib import Path
 import httpx
 
 import config
+import gerador
 import entregas
 import recursos
 
 PACKAGE = "com.localai.app"
 
-SYSTEM_PROMPT = """Você é um programador Android experiente. Escreva UM aplicativo Android completo em UM único arquivo Java.
+SYSTEM_PROMPT = 'Você é um desenvolvedor Android sênior. Escreva UM aplicativo Android COMPLETO, funcional e bonito em UM único arquivo Java.\n\nO projeto Gradle já existe; você escreve só o MainActivity.java. REGRAS:\n1. Primeira linha: package com.localai.app;\n2. public class MainActivity extends Activity (android.app.Activity). NÃO use AppCompatActivity, AndroidX, Kotlin, Compose nem bibliotecas externas.\n3. Use só android.*, java.* e org.json. NÃO existem layouts XML nem R.layout/R.id/R.drawable: monte a interface toda por código (LinearLayout, ScrollView, TextView, EditText, Button, ListView + ArrayAdapter...) e chame setContentView(...).\n4. Coloque TODOS os imports (inclusive android.view.View e cada android.widget usado).\n5. Logo depois do package, escreva um comentário /* O QUE O APP FAZ: ... */ listando em tópicos as funções que você vai implementar. Depois implemente TODAS de verdade (nada de "TODO" ou funções vazias).\n6. O que o usuário cria (listas, notas, configurações, pontuações) deve ser SALVO com SharedPreferences (JSON com org.json) e carregado no onCreate.\n7. Variáveis usadas dentro de listeners/lambdas e que mudam: declare como CAMPOS da classe (private), não como variáveis locais.\n8. Rede: HttpURLConnection dentro de new Thread(...) e atualize a tela com runOnUiThread(...). Repetição/tempo: android.os.Handler + postDelayed (não use AsyncTask nem Timer para mexer na tela).\n9. Visual caprichado: margens com um método dp(int), fonte legível, cores com Color.parseColor("#..."), botões com GradientDrawable arredondado.\n10. Textos da interface em português do Brasil. Diálogos: android.app.AlertDialog.Builder. Avisos curtos: Toast.\n\nFORMATO DA RESPOSTA (exatamente assim, sem explicação fora do bloco):\nNOME: <nome curto do app>\n```java\n<código completo>\n```'
 
-REGRAS OBRIGATÓRIAS:
-1. Primeira linha do arquivo: package com.localai.app;
-2. Classe principal: public class MainActivity extends android.app.Activity (NÃO use AppCompatActivity, NÃO use AndroidX, NÃO use Kotlin).
-3. Use SOMENTE classes do Android (android.*) e do Java (java.*). Nenhuma biblioteca externa.
-4. NÃO use arquivos XML nem R.layout/R.id. Monte toda a interface por código Java (LinearLayout, TextView, Button, EditText, ScrollView, ListView com ArrayAdapter, etc.) e chame setContentView(view).
-5. Inclua TODOS os imports necessários. O código precisa compilar na primeira tentativa.
-6. Converta dp para pixels com um método auxiliar (ex.: (int) (valor * getResources().getDisplayMetrics().density)).
-7. Rede (se precisar): HttpURLConnection dentro de uma Thread e atualize a tela com runOnUiThread.
-8. Todos os textos da interface em português do Brasil.
-9. Classes auxiliares podem existir no mesmo arquivo (sem "public").
-
-FORMATO DA RESPOSTA (siga exatamente, sem explicações):
-NOME: <nome curto do app>
-```java
-<código completo>
-```"""
-
-EXEMPLO_PEDIDO = "um contador com botões de mais e menos"
-EXEMPLO_RESPOSTA = """NOME: Contador
-```java
-package com.localai.app;
-
-import android.app.Activity;
-import android.os.Bundle;
-import android.view.Gravity;
-import android.view.View;
-import android.widget.Button;
-import android.widget.LinearLayout;
-import android.widget.TextView;
-
-public class MainActivity extends Activity {
-    private int valor = 0;
-
-    private int dp(int v) {
-        return (int) (v * getResources().getDisplayMetrics().density);
-    }
-
-    @Override
-    protected void onCreate(Bundle savedInstanceState) {
-        super.onCreate(savedInstanceState);
-        LinearLayout raiz = new LinearLayout(this);
-        raiz.setOrientation(LinearLayout.VERTICAL);
-        raiz.setGravity(Gravity.CENTER);
-        raiz.setPadding(dp(24), dp(24), dp(24), dp(24));
-
-        final TextView texto = new TextView(this);
-        texto.setTextSize(48);
-        texto.setGravity(Gravity.CENTER);
-        texto.setText("0");
-
-        Button mais = new Button(this);
-        mais.setText("+1");
-        mais.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                valor++;
-                texto.setText(String.valueOf(valor));
-            }
-        });
-
-        Button menos = new Button(this);
-        menos.setText("-1");
-        menos.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                valor--;
-                texto.setText(String.valueOf(valor));
-            }
-        });
-
-        raiz.addView(texto);
-        raiz.addView(mais);
-        raiz.addView(menos);
-        setContentView(raiz);
-    }
-}
-```"""
+EXEMPLO_PEDIDO = 'um conversor de temperatura de Celsius para Fahrenheit que guarda o histórico'
+EXEMPLO_RESPOSTA = 'NOME: Conversor de Temperatura\n```java\npackage com.localai.app;\n\n/* O QUE O APP FAZ:\n * - Campo para digitar a temperatura em Celsius e botão Converter\n * - Mostra o resultado em Fahrenheit\n * - Guarda o histórico das conversões (salvo no celular) e mostra numa lista\n * - Botão para limpar o histórico\n */\n\nimport android.app.Activity;\nimport android.app.AlertDialog;\nimport android.content.SharedPreferences;\nimport android.graphics.Color;\nimport android.graphics.drawable.GradientDrawable;\nimport android.os.Bundle;\nimport android.text.InputType;\nimport android.view.Gravity;\nimport android.view.View;\nimport android.widget.ArrayAdapter;\nimport android.widget.Button;\nimport android.widget.EditText;\nimport android.widget.LinearLayout;\nimport android.widget.ListView;\nimport android.widget.TextView;\nimport android.widget.Toast;\n\nimport org.json.JSONArray;\n\nimport java.util.ArrayList;\nimport java.util.Locale;\n\npublic class MainActivity extends Activity {\n    private final ArrayList<String> historico = new ArrayList<>();\n    private ArrayAdapter<String> adaptador;\n    private EditText campo;\n    private TextView resultado;\n    private SharedPreferences prefs;\n\n    private int dp(int v) {\n        return (int) (v * getResources().getDisplayMetrics().density);\n    }\n\n    private Button botao(String texto, String cor) {\n        Button b = new Button(this);\n        b.setText(texto);\n        b.setTextColor(Color.WHITE);\n        b.setAllCaps(false);\n        GradientDrawable fundo = new GradientDrawable();\n        fundo.setColor(Color.parseColor(cor));\n        fundo.setCornerRadius(dp(12));\n        b.setBackground(fundo);\n        return b;\n    }\n\n    @Override\n    protected void onCreate(Bundle savedInstanceState) {\n        super.onCreate(savedInstanceState);\n        prefs = getSharedPreferences("dados", MODE_PRIVATE);\n\n        LinearLayout raiz = new LinearLayout(this);\n        raiz.setOrientation(LinearLayout.VERTICAL);\n        raiz.setPadding(dp(20), dp(20), dp(20), dp(20));\n        raiz.setBackgroundColor(Color.parseColor("#F4F6FA"));\n\n        TextView titulo = new TextView(this);\n        titulo.setText("Celsius → Fahrenheit");\n        titulo.setTextSize(24);\n        titulo.setTextColor(Color.parseColor("#1F2A44"));\n        raiz.addView(titulo);\n\n        campo = new EditText(this);\n        campo.setHint("Temperatura em °C");\n        campo.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL | InputType.TYPE_NUMBER_FLAG_SIGNED);\n        raiz.addView(campo);\n\n        Button converter = botao("Converter", "#2E7D32");\n        converter.setOnClickListener(v -> converte());\n        raiz.addView(converter);\n\n        resultado = new TextView(this);\n        resultado.setTextSize(28);\n        resultado.setGravity(Gravity.CENTER);\n        resultado.setPadding(0, dp(16), 0, dp(16));\n        raiz.addView(resultado);\n\n        Button limpar = botao("Limpar histórico", "#C62828");\n        limpar.setOnClickListener(v -> new AlertDialog.Builder(this)\n                .setTitle("Limpar histórico?")\n                .setPositiveButton("Sim", (d, w) -> {\n                    historico.clear();\n                    adaptador.notifyDataSetChanged();\n                    salva();\n                })\n                .setNegativeButton("Não", null)\n                .show());\n        raiz.addView(limpar);\n\n        ListView lista = new ListView(this);\n        adaptador = new ArrayAdapter<>(this, android.R.layout.simple_list_item_1, historico);\n        lista.setAdapter(adaptador);\n        raiz.addView(lista, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));\n\n        carrega();\n        setContentView(raiz);\n    }\n\n    private void converte() {\n        String texto = campo.getText().toString().trim().replace(\',\', \'.\');\n        if (texto.isEmpty()) {\n            Toast.makeText(this, "Digite uma temperatura", Toast.LENGTH_SHORT).show();\n            return;\n        }\n        try {\n            double c = Double.parseDouble(texto);\n            double f = c * 9 / 5 + 32;\n            String linha = String.format(Locale.US, "%.1f °C = %.1f °F", c, f);\n            resultado.setText(linha);\n            historico.add(0, linha);\n            adaptador.notifyDataSetChanged();\n            salva();\n        } catch (NumberFormatException e) {\n            Toast.makeText(this, "Número inválido", Toast.LENGTH_SHORT).show();\n        }\n    }\n\n    private void salva() {\n        prefs.edit().putString("historico", new JSONArray(historico).toString()).apply();\n    }\n\n    private void carrega() {\n        try {\n            JSONArray a = new JSONArray(prefs.getString("historico", "[]"));\n            for (int i = 0; i < a.length(); i++) {\n                historico.add(a.getString(i));\n            }\n            adaptador.notifyDataSetChanged();\n        } catch (Exception e) {\n            historico.clear();\n        }\n    }\n}\n```'
 
 # ------------------------------------------------------------------ projeto Gradle
 SETTINGS_GRADLE = """pluginManagement {
@@ -129,7 +55,8 @@ ROOT_BUILD_GRADLE = """plugins {
 }
 """
 
-GRADLE_PROPERTIES = """org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+GRADLE_PROPERTIES = """org.gradle.jvmargs=-Xmx1536m -Dfile.encoding=UTF-8
+org.gradle.daemon.idletimeout=900000
 android.useAndroidX=false
 android.nonTransitiveRClass=true
 """
@@ -213,7 +140,7 @@ def extrai_resposta(texto: str) -> tuple[str, str]:
     m = re.search(r"```(?:java)?\s*\n(.*?)(?:```|$)", texto, re.S)
     if not m:
         raise ValueError("A IA não devolveu um bloco de código.")
-    codigo = m.group(1).strip()
+    codigo = tira_numeros(m.group(1).strip())
     if "class MainActivity" not in codigo:
         raise ValueError("O código não define a classe MainActivity.")
     if not re.match(r"\s*package\s+com\.localai\.app\s*;", codigo):
@@ -222,6 +149,23 @@ def extrai_resposta(texto: str) -> tuple[str, str]:
     n = re.search(r"NOME:\s*(.+)", texto)
     nome = (n.group(1).strip() if n else "App IA")[:40] or "App IA"
     return nome, codigo + "\n"
+
+
+def tira_numeros(codigo: str) -> str:
+    """Se a IA devolveu o código com os números de linha da correção ("  12| ..."), tira os números."""
+    ls = codigo.split("\n")
+    if ls and sum(1 for ln in ls if re.match(r"^\s*\d+\|", ln)) > len(ls) * 0.6:
+        return "\n".join(re.sub(r"^\s*\d+\|\s?", "", ln) for ln in ls)
+    return codigo
+
+
+def cortado(texto: str) -> bool:
+    """A resposta acabou no meio do código (o modelo atingiu o limite de palavras)?"""
+    m = re.search(r"```\w*\s*\n(.*)", texto, re.S)
+    if not m or "```" in m.group(1):
+        return False
+    corpo = gerador._sem_comentarios_e_textos(m.group(1))
+    return corpo.count("{") > corpo.count("}")
 
 
 def resumo_erros(log: str, limite: int = 1600) -> str:
@@ -240,11 +184,10 @@ def resumo_erros(log: str, limite: int = 1600) -> str:
 
 
 # ------------------------------------------------------------------ chamadas externas
-async def pede_codigo(messages: list[dict], emit) -> str:
-    """Chama o llama-server em streaming e junta o texto, avisando o progresso."""
-    payload = {"messages": messages, "stream": True, "temperature": 0.2, "top_p": 0.9,
-               "cache_prompt": True,  # o exemplo e as regras são sempre iguais: reaproveita o cálculo
-               "max_tokens": config.GEN_MAX_TOKENS}
+async def _uma_chamada(messages: list[dict], emit, temperatura: float, max_tokens: int) -> str:
+    payload = {"messages": messages, "stream": True, "temperature": temperatura, "top_p": 0.9,
+               "cache_prompt": True,  # as regras e o exemplo são sempre iguais: reaproveita o cálculo
+               "max_tokens": max_tokens}
     texto, n, ultimo = "", 0, time.time()
     async with httpx.AsyncClient(timeout=None) as client:
         try:
@@ -272,6 +215,25 @@ async def pede_codigo(messages: list[dict], emit) -> str:
     return texto
 
 
+async def pede_codigo(messages: list[dict], emit, temperatura: float = 0.2) -> str:
+    """Chama o llama-server em streaming. Se a resposta for cortada no meio do código, pede para continuar."""
+    tamanho = sum(len(m["content"]) for m in messages) // 3      # ~3 letras por "palavra" do modelo
+    limite = max(1024, min(config.GEN_MAX_TOKENS, config.CTX - tamanho - 200))
+    texto = await _uma_chamada(messages, emit, temperatura, limite)
+    for _ in range(2):
+        if not cortado(texto):
+            break
+        resto = config.CTX - (tamanho + len(texto) // 3) - 200
+        if resto < 400:
+            break
+        mais = await _uma_chamada(messages + [{"role": "assistant", "content": texto},
+                                              {"role": "user", "content": "A resposta foi cortada. Continue EXATAMENTE de onde parou, sem repetir nada e sem explicações."}],
+                                  emit, temperatura, min(resto, config.GEN_MAX_TOKENS))
+        mais = re.sub(r"^\s*```\w*\s*\n", "", mais)   # se ela reabrir o bloco, ignora a abertura
+        texto += mais
+    return texto
+
+
 async def compila(pasta: Path) -> tuple[bool, str, Path | None]:
     gradle = config.GRADLE_BIN
     env = dict(os.environ)
@@ -282,8 +244,8 @@ async def compila(pasta: Path) -> tuple[bool, str, Path | None]:
     # start_new_session: o Gradle e os processos que ele cria ficam num grupo próprio,
     # para podermos matar tudo de uma vez ao cancelar (senão sobra Java rodando escondido)
     proc = await asyncio.create_subprocess_exec(
-        *recursos.baixa_prioridade([gradle, "assembleDebug", "--no-daemon", "--console=plain", "-q",
-                                    "-Dorg.gradle.workers.max=2"]),
+        *recursos.baixa_prioridade([gradle, "assembleDebug", "--console=plain", "-q", "-Dorg.gradle.workers.max=2"]
+                                   + ([] if config.GRADLE_DAEMON else ["--no-daemon"])),
         cwd=pasta, env=env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
         start_new_session=True,
     )
@@ -315,12 +277,65 @@ async def compila(pasta: Path) -> tuple[bool, str, Path | None]:
 _trava = recursos.pesado   # uma tarefa pesada por vez (RAM/CPU compartilhadas)
 
 
+def _pedido_limpo(descricao: str) -> str:
+    """O pedido sem as referências da biblioteca (nas correções elas só ocupariam espaço)."""
+    return descricao.split("\n\nReferências da biblioteca local")[0].split("\n\n(Pedido curto:")[0].strip()
+
+
+async def _pede_revisao(mensagens, temperatura, max_tokens):
+    async def mudo(_ev):
+        return None
+    return await _uma_chamada(mensagens, mudo, temperatura, max_tokens)
+
+
+async def _compila_e_corrige(codigo: str, nome: str, app_id: str, pedido: str, pasta: Path, emit,
+                             rodadas: int) -> tuple[bool, str, Path | None, str]:
+    """Compila; corrige sozinho o que é mecânico; chama a IA (conversa limpa) para o resto.
+    Devolve (ok, código final, apk, relatório de erros)."""
+    erros, log, anteriores, relatorio = [], "", set(), ""
+    for rodada in range(rodadas + 1):
+        for _auto in range(3):
+            codigo, feito = gerador.normaliza_java(codigo, PACKAGE)
+            if feito:
+                await emit({"type": "status", "msg": "Ajuste automático: " + "; ".join(feito) + "."})
+            await emit({"type": "code", "text": codigo})
+            if pasta.exists():
+                shutil.rmtree(pasta)
+            escreve_projeto(pasta, nome, app_id, codigo)
+            await emit({"type": "status", "msg": "Compilando o app… (a primeira vez baixa as ferramentas e demora mais)"})
+            ok, log, apk = await compila(pasta)
+            if ok:
+                return True, codigo, apk, ""
+            erros = gerador.erros_java(log)
+            codigo2, feito2 = gerador.corrige_java_por_erros(codigo, erros)
+            if not feito2:
+                break
+            codigo = codigo2
+            await emit({"type": "status", "msg": "Corrigi sozinho: " + "; ".join(feito2) + ". Compilando de novo…"})
+        relatorio = gerador.relatorio_erros(erros, codigo, gerador.dica_java, log=log)
+        assinatura = gerador.assinatura_erros(erros, codigo)
+        if assinatura and assinatura <= anteriores:
+            relatorio += gerador.AVISO_REPETIDO
+        anteriores = assinatura
+        if rodada >= rodadas:
+            break
+        await emit({"type": "status", "msg": f"A IA está corrigindo {len(erros) or 1} erro(s) (rodada {rodada + 1} de {rodadas})…"})
+        msgs = gerador.mensagens_correcao(SYSTEM_PROMPT, pedido, codigo, relatorio, "java", nome)
+        texto = await pede_codigo(msgs, emit, temperatura=0.4 if gerador.AVISO_REPETIDO in relatorio else 0.1)
+        try:
+            _n, codigo = extrai_resposta(texto)
+        except ValueError:
+            continue   # resposta inútil: tenta outra rodada com o mesmo código
+    return False, codigo, None, relatorio
+
+
 async def gera_app(descricao: str, emit, base_codigo: str | None = None, base_nome: str | None = None) -> None:
     """Executa o fluxo completo, mandando eventos por emit(dict)."""
     if _trava.locked():
         await emit({"type": "error", "msg": "Ainda estou criando outro app. Espere ele terminar ou clique em Parar."})
         return
     async with _trava:
+        await gerador.garante_modelo_codigo(emit)
         mensagens = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": f"Crie: {EXEMPLO_PEDIDO}"},
@@ -330,51 +345,56 @@ async def gera_app(descricao: str, emit, base_codigo: str | None = None, base_no
                 f"devolva o arquivo COMPLETO no mesmo formato. Pedido: {descricao}") if base_codigo
              else f"Crie: {descricao}"},
         ]
+        pedido = _pedido_limpo(descricao)
         id_ = uuid.uuid4().hex[:10]
         pasta = config.WORK_DIR / f"app-{id_}"
+        pasta2 = config.WORK_DIR / f"app-{id_}-rev"
         try:
-            for tentativa in range(config.MAX_FIX_ATTEMPTS + 1):
-                if tentativa == 0:
-                    await emit({"type": "status", "msg": "A IA está escrevendo o código do app… (pode levar alguns minutos)"})
-                else:
-                    await emit({"type": "status",
-                                "msg": f"Deu erro ao compilar. A IA está corrigindo (tentativa {tentativa} de {config.MAX_FIX_ATTEMPTS})…"})
-                texto = await pede_codigo(mensagens, emit)
+            await emit({"type": "status", "msg": "A IA está escrevendo o código do app… (pode levar alguns minutos)"})
+            texto = await pede_codigo(mensagens, emit)
+            try:
+                nome, codigo = extrai_resposta(texto)
+            except ValueError:   # fora do formato: pede de novo, lembrando o formato
+                texto = await pede_codigo(mensagens + [{"role": "assistant", "content": texto[:3000]}, {"role": "user", "content":
+                        "Responda SÓ no formato pedido: a linha NOME: e o código completo dentro de ```java ... ```."}], emit)
                 try:
                     nome, codigo = extrai_resposta(texto)
-                    if base_nome and nome == "App IA":
-                        nome = base_nome
                 except ValueError as e:
                     await emit({"type": "error", "msg": str(e), "log": texto[-1500:]})
                     return
-                await emit({"type": "code", "text": codigo})
-
-                if pasta.exists():
-                    shutil.rmtree(pasta)
-                app_id = f"com.localai.{slugify(nome)}{id_[:4]}"
-                escreve_projeto(pasta, nome, app_id, codigo)
-                await emit({"type": "status", "msg": "Compilando o app… (a primeira vez baixa as ferramentas e demora mais)"})
-                ok, log, apk = await compila(pasta)
-                if ok:
-                    meta = entregas.salva(
-                        id_, nome, descricao, "apk",
-                        [(apk, f"{slugify(nome)}.apk", "App Android (.apk)")],
-                        {"code": codigo, "app_id": app_id})
-                    shutil.rmtree(pasta, ignore_errors=True)
-                    await emit({"type": "done", "id": id_, "name": nome, "kind": "apk", "files": meta["files"],
-                                "note": "Passe o arquivo para o celular e abra-o para instalar. Se o Android pedir, permita instalar de fontes desconhecidas."})
-                    return
-                erros = resumo_erros(log)
-                if tentativa >= config.MAX_FIX_ATTEMPTS:
-                    await emit({"type": "error", "msg": "Não consegui compilar o app depois das correções.", "log": erros})
-                    return
-                mensagens += [
-                    {"role": "assistant", "content": texto},
-                    {"role": "user", "content": (
-                        "O código NÃO compilou. ERROS DE COMPILAÇÃO:\n" + erros +
-                        "\n\nCorrija e devolva o arquivo COMPLETO no mesmo formato (NOME: e bloco ```java).")},
-                ]
+            if base_nome and nome == "App IA":
+                nome = base_nome
+            app_id = f"com.localai.{slugify(nome)}{id_[:4]}"
+            ok, codigo, apk, relatorio = await _compila_e_corrige(codigo, nome, app_id, pedido, pasta, emit, config.MAX_FIX_ATTEMPTS)
+            if not ok:
+                await emit({"type": "error", "msg": "Não consegui compilar o app depois das correções.", "log": relatorio})
+                return
+            nota_rev = ""
+            if config.REVISAO:
+                await emit({"type": "status", "msg": "Compilou! A IA está conferindo se o app faz tudo o que você pediu…"})
+                faltando = await gerador.revisa(pedido, codigo, "java", _pede_revisao)
+                if faltando:
+                    await emit({"type": "status", "msg": "Faltou: " + "; ".join(faltando) + ". A IA está completando…"})
+                    texto = await pede_codigo(gerador.mensagens_melhoria(SYSTEM_PROMPT, pedido, codigo, faltando, "java", nome), emit)
+                    try:
+                        _n, codigo2 = extrai_resposta(texto)
+                        ok2, codigo2, apk2, _r = await _compila_e_corrige(codigo2, nome, app_id, pedido, pasta2, emit, 2)
+                    except ValueError:
+                        ok2 = False
+                    if ok2:
+                        codigo, apk = codigo2, apk2
+                        nota_rev = " A revisão completou: " + "; ".join(faltando) + "."
+                    else:
+                        await emit({"type": "code", "text": codigo})
+                        nota_rev = " (A revisão sugeriu completar: " + "; ".join(faltando) + ", mas essa versão não compilou; entreguei a que funciona.)"
+            meta = entregas.salva(
+                id_, nome, descricao, "apk",
+                [(apk, f"{slugify(nome)}.apk", "App Android (.apk)")],
+                {"code": codigo, "app_id": app_id})
+            await emit({"type": "done", "id": id_, "name": nome, "kind": "apk", "files": meta["files"],
+                        "note": "Toque para baixar no celular e instalar. Se o Android pedir, permita instalar de fontes desconhecidas." + nota_rev})
         except RuntimeError as e:
             await emit({"type": "error", "msg": str(e)})
         finally:
             shutil.rmtree(pasta, ignore_errors=True)
+            shutil.rmtree(pasta2, ignore_errors=True)
