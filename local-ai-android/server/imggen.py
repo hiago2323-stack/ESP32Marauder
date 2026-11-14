@@ -23,8 +23,8 @@ def main():
     try:
         from stable_diffusion_cpp import StableDiffusion
         kw = dict(model_path=cfg["modelo"], n_threads=cfg["threads"], vae_decode_only=not cfg.get("init"))
-        if modo == "hibrido":                         # modelo de difusão na placa; texto e decodificador na CPU
-            kw.update(keep_clip_on_cpu=True, keep_vae_on_cpu=True)
+        if modo == "segmentado":                      # na placa EM PARTES, dentro do limite de memória que sobra
+            kw.update(offload_params_to_cpu=True, max_vram=cfg["orcamento"], keep_clip_on_cpu=False, keep_vae_on_cpu=False)
         elif modo == "gpu":
             kw.update(keep_clip_on_cpu=False, keep_vae_on_cpu=False)
         sd = StableDiffusion(**kw)

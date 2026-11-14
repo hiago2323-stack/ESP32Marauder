@@ -1,7 +1,9 @@
 """Leituras do PC para a tela: temperaturas, ventoinhas, uso da GPU e da memória."""
+import json
 import os
 import subprocess
 
+import placa
 import recursos
 import time
 from pathlib import Path
@@ -17,6 +19,9 @@ def _num(s: str):
 
 
 def _gpu() -> dict | None:
+    amd = placa.acha_amd()
+    if amd:   # placa AMD (ex.: RX 580): lê pelo /sys
+        return amd.resumo()
     try:
         r = subprocess.run(
             ["nvidia-smi", "--query-gpu=temperature.gpu,utilization.gpu,memory.used,memory.total,fan.speed,power.draw,name",
@@ -102,6 +107,19 @@ def _controle_ventoinha() -> str:
         return "desconhecido"
 
 
+def _estado_ventoinhas() -> dict:
+    """Estado gravado pelo serviço de ventoinhas (/run/localai-fan.json). Vazio/antigo = serviço parado."""
+    arq = Path(os.environ.get("FANCTL_STATUS", "/run/localai-fan.json"))
+    try:
+        d = json.loads(arq.read_text())
+        if time.time() - d.get("hora", 0) > 15 or d.get("parado"):
+            return {"ativo": False}
+        d["ativo"] = True
+        return d
+    except (OSError, ValueError):
+        return {"ativo": False}
+
+
 def ler() -> dict:
     global _cache
     agora = time.time()
@@ -109,7 +127,7 @@ def ler() -> dict:
         return _cache[1]
     temp, fans = _hwmon()
     dado = {"gpu": _gpu(), "cpu": {"temp": temp, "uso": _uso_cpu(), "carga": round(os.getloadavg()[0], 2), "nucleos": os.cpu_count()},
-            "ventoinhas": fans, "ram": _ram(), "controle_ventoinha": _controle_ventoinha(),
+            "ventoinhas": fans, "ram": _ram(), "controle_ventoinha": _controle_ventoinha(), "ventoinha_ctl": _estado_ventoinhas(),
             "modelos_na_ram": sorted(recursos._modelos)}
     _cache = (agora, dado)
     return dado

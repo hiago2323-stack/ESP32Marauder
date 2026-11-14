@@ -105,3 +105,26 @@ IMG_MODELOS = {
 
 # ---- Biblioteca local (documentação e código de referência; fica no disco grande via link ~/biblioteca) ----
 BIBLIOTECA_DIR = Path(os.environ.get("BIBLIOTECA_DIR", str(HOME / "biblioteca")))
+
+# ---- Vídeo curto a partir de texto (Wan 2.1, 1,3 bilhão de parâmetros, pelo stable-diffusion.cpp) ----
+# Roda na CPU (a placa de 2 GB não comporta); um clipe de ~1 s leva de 15 a 25 minutos. Modelo oficial, sem alterações.
+_HF = "https://huggingface.co"
+VIDEO_ARQUIVOS = {
+    "difusao": {"arquivo": IMG_MODEL.parent / "Wan2.1-T2V-1.3B-Q4_K_M.gguf", "tam": 982716640,
+                "url": f"{_HF}/samuelchristlie/Wan2.1-T2V-1.3B-GGUF/resolve/main/Wan2.1-T2V-1.3B-Q4_K_M.gguf"},
+    "texto": {"arquivo": IMG_MODEL.parent / "umt5-xxl-encoder-Q4_K_M.gguf", "tam": 3655145312,
+              "url": f"{_HF}/city96/umt5-xxl-encoder-gguf/resolve/main/umt5-xxl-encoder-Q4_K_M.gguf"},
+    "vae": {"arquivo": IMG_MODEL.parent / "wan_2.1_vae.safetensors", "tam": 253815318,
+            "url": f"{_HF}/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/vae/wan_2.1_vae.safetensors"},
+}
+VIDEO_FPS = 16
+
+# ---- Visão: foto do usuário e imagens anexadas ----
+# Modelo que "enxerga" (Qwen2.5-VL 3B, Apache-2.0, ~2,8 GB). Roda na CPU, só durante a análise, e é desligado em seguida.
+VISAO_REPO = os.environ.get("VISAO_REPO", "ggml-org/Qwen2.5-VL-3B-Instruct-GGUF")
+VISAO_ARQUIVOS = ["Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf", "mmproj-Qwen2.5-VL-3B-Instruct-Q8_0.gguf"]
+VISAO_TAM = 1930000000 + 840000000
+VISAO_PORTA = int(os.environ.get("VISAO_PORTA", "8082"))
+LLAMA_SERVER_BIN = Path(os.environ.get("LLAMA_SERVER_BIN", str(HOME / "llama.cpp" / "build" / "bin" / "llama-server")))
+# Foto e nome do usuário (ficam só neste PC)
+PERFIL_DIR = Path(os.environ.get("PERFIL_DIR", str(HOME / "localai" / "perfil")))

@@ -15,8 +15,10 @@ import os
 import shutil
 import subprocess
 import time
+from pathlib import Path
 
 import config
+import placa
 
 # Trabalhos pesados (compilar, gerar imagem, criar app/firmware): um de cada vez.
 pesado = asyncio.Lock()
@@ -50,7 +52,7 @@ def ram_livre_mb() -> int:
 
 
 def vram_livre_mb() -> int | None:
-    """VRAM livre da GPU NVIDIA em MiB, ou None se não houver GPU/nvidia-smi."""
+    """VRAM livre da GPU em MiB (NVIDIA pelo nvidia-smi, AMD pelo /sys), ou None se não houver placa."""
     try:
         r = subprocess.run(["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
                            capture_output=True, text=True, timeout=3)
@@ -58,7 +60,8 @@ def vram_livre_mb() -> int | None:
             return int(float(r.stdout.strip().splitlines()[0]))
     except (OSError, subprocess.TimeoutExpired, ValueError):
         pass
-    return None
+    amd = placa.acha_amd()
+    return amd.vram_livre_mb() if amd else None
 
 
 def baixa_prioridade(cmd: list[str]) -> list[str]:
@@ -119,18 +122,53 @@ def garante_ram(minimo_mb: int, o_que: str) -> None:
 
 
 # ------------------------------------------------------------ GPU, CPU ou os dois
-def modo_imagem() -> str:
-    """Onde rodar o gerador de imagens, conforme a VRAM livre agora.
+def modo_imagem(v: int | None = None) -> str:
+    """Onde rodar o gerador de imagens/vídeo, conforme a VRAM livre agora.
 
-    gpu     : tudo na placa (precisa de ~1,5 GB livres)
-    hibrido : o modelo de difusão na placa e o texto/decodificador na CPU (~0,8 GB livres)
-    cpu     : tudo na CPU (a placa está ocupada pelo modelo de linguagem)
+    gpu        : tudo na placa, de uma vez (precisa de ~2,4 GB livres; numa placa de 2 GB quase nunca)
+    segmentado : o modelo roda na placa EM PARTES, dentro de um limite de memória (max_vram do stable-diffusion.cpp);
+                 os pesos ficam na RAM e vão para a placa conforme o uso. Cabe nos ~0,7 GB ou mais que sobram.
+    cpu        : tudo na CPU
     """
-    v = vram_livre_mb()
+    v = vram_livre_mb() if v is None else v
     if v is None:
         return "cpu"
-    if v >= 1500:
+    if v >= 2400:
         return "gpu"
-    if v >= 800:
-        return "hibrido"
+    if v >= 600:
+        return "segmentado"
     return "cpu"
+
+
+def orcamento_vram_gib(v: int) -> float:
+    """Quanto da VRAM livre o gerador pode usar (em GiB), deixando folga para a tela e o modelo de texto."""
+    return round(max(0.35, min((v - 250) / 1024, 1.8)), 2)
+
+
+# ------------------------------------------------------------ a placa deu conta? (aprende com as tentativas)
+def _arq_gpu() -> Path:
+    return config.MODELO_ENV.parent / "gpu_imagem.json"
+
+
+def _le_gpu() -> dict:
+    try:
+        import json
+        return json.loads(_arq_gpu().read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def gpu_liberada(tarefa: str) -> bool:
+    """Falso se a placa falhou 2 vezes seguidas nas últimas 24 h nesta tarefa ('imagem' ou 'video')."""
+    e = _le_gpu().get(tarefa, {})
+    return not (e.get("falhas", 0) >= 2 and time.time() - e.get("quando", 0) < 24 * 3600)
+
+
+def anota_gpu(tarefa: str, ok: bool) -> None:
+    import json
+    d = _le_gpu()
+    d[tarefa] = {"falhas": 0 if ok else d.get(tarefa, {}).get("falhas", 0) + 1, "quando": time.time()}
+    try:
+        _arq_gpu().write_text(json.dumps(d))
+    except OSError:
+        pass

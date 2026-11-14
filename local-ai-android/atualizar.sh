@@ -37,6 +37,7 @@ kokoro-onnx==0.6.*
 ddgs==9.*
 nvidia-ml-py==13.*
 pillow>=10
+imageio-ffmpeg
 EOF
   cat > config.py <<'EOF'
 """Configuração do servidor, lida de variáveis de ambiente (arquivo .env via instalador)."""
@@ -146,6 +147,29 @@ IMG_MODELOS = {
 
 # ---- Biblioteca local (documentação e código de referência; fica no disco grande via link ~/biblioteca) ----
 BIBLIOTECA_DIR = Path(os.environ.get("BIBLIOTECA_DIR", str(HOME / "biblioteca")))
+
+# ---- Vídeo curto a partir de texto (Wan 2.1, 1,3 bilhão de parâmetros, pelo stable-diffusion.cpp) ----
+# Roda na CPU (a placa de 2 GB não comporta); um clipe de ~1 s leva de 15 a 25 minutos. Modelo oficial, sem alterações.
+_HF = "https://huggingface.co"
+VIDEO_ARQUIVOS = {
+    "difusao": {"arquivo": IMG_MODEL.parent / "Wan2.1-T2V-1.3B-Q4_K_M.gguf", "tam": 982716640,
+                "url": f"{_HF}/samuelchristlie/Wan2.1-T2V-1.3B-GGUF/resolve/main/Wan2.1-T2V-1.3B-Q4_K_M.gguf"},
+    "texto": {"arquivo": IMG_MODEL.parent / "umt5-xxl-encoder-Q4_K_M.gguf", "tam": 3655145312,
+              "url": f"{_HF}/city96/umt5-xxl-encoder-gguf/resolve/main/umt5-xxl-encoder-Q4_K_M.gguf"},
+    "vae": {"arquivo": IMG_MODEL.parent / "wan_2.1_vae.safetensors", "tam": 253815318,
+            "url": f"{_HF}/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/vae/wan_2.1_vae.safetensors"},
+}
+VIDEO_FPS = 16
+
+# ---- Visão: foto do usuário e imagens anexadas ----
+# Modelo que "enxerga" (Qwen2.5-VL 3B, Apache-2.0, ~2,8 GB). Roda na CPU, só durante a análise, e é desligado em seguida.
+VISAO_REPO = os.environ.get("VISAO_REPO", "ggml-org/Qwen2.5-VL-3B-Instruct-GGUF")
+VISAO_ARQUIVOS = ["Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf", "mmproj-Qwen2.5-VL-3B-Instruct-Q8_0.gguf"]
+VISAO_TAM = 1930000000 + 840000000
+VISAO_PORTA = int(os.environ.get("VISAO_PORTA", "8082"))
+LLAMA_SERVER_BIN = Path(os.environ.get("LLAMA_SERVER_BIN", str(HOME / "llama.cpp" / "build" / "bin" / "llama-server")))
+# Foto e nome do usuário (ficam só neste PC)
+PERFIL_DIR = Path(os.environ.get("PERFIL_DIR", str(HOME / "localai" / "perfil")))
 EOF
   cat > main.py <<'EOF'
 """Servidor do PC: conversa com o modelo, pesquisa na web e compila projetos Android.
@@ -190,6 +214,7 @@ from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, Uplo
 from fastapi.responses import FileResponse, RedirectResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
+import agente
 import androidgen
 import biblioteca
 import codegen
@@ -198,10 +223,13 @@ import entregas
 import esp32gen
 import imagens
 import memory
+import modelos
+import perfil
 import perfis
 import recursos
 import telemetria
 import uploads
+import video
 
 @asynccontextmanager
 async def ciclo_de_vida(_app):
@@ -362,7 +390,8 @@ async def _build_messages(req: ChatRequest) -> tuple[list[dict], int]:
     entre um turno e outro, e o llama-server reaproveita o que já calculou (cache do prompt), em vez
     de reprocessar tudo a cada pergunta.
     """
-    system = f"{config.SYSTEM_PROMPT}\nData de hoje: {date.today().isoformat()}."
+    sobre = perfil.contexto()   # nome e aparência do usuário (muda raramente: não atrapalha o cache do prompt)
+    system = f"{config.SYSTEM_PROMPT}\nData de hoje: {date.today().isoformat()}." + (f"\n{sobre}" if sobre else "")
     msgs = [{"role": "system", "content": system}] + [dict(m) for m in req.messages]
     ultimo = next((i for i in range(len(msgs) - 1, -1, -1) if msgs[i].get("role") == "user"), None)
     if ultimo is None:
@@ -412,8 +441,22 @@ async def _build_messages(req: ChatRequest) -> tuple[list[dict], int]:
     return msgs, n_web
 
 
+def _sse_texto(texto: str):
+    """Resposta pronta (não vinda do modelo) no mesmo formato de streaming da conversa."""
+    async def gen():
+        for i in range(0, len(texto), 24):
+            yield f"data: {json.dumps({'choices': [{'delta': {'content': texto[i:i + 24]}}]})}\n\n".encode()
+        yield b"data: [DONE]\n\n"
+    return gen()
+
+
 @app.post("/chat", dependencies=[Depends(require_token)])
 async def chat(req: ChatRequest):
+    ultimo = next((m for m in reversed(req.messages) if m.get("role") == "user"), None)
+    if ultimo and not req.anexos and isinstance(ultimo.get("content"), str):
+        resposta = await agente.tenta(ultimo["content"])   # "instala o modelo X", "volta pro rápido"...
+        if resposta is not None:
+            return StreamingResponse(_sse_texto(resposta), media_type="text/event-stream", headers={"X-Web-Results": "0"})
     messages, n_web = await _build_messages(req)
     payload = {"messages": messages, "max_tokens": req.max_tokens, "temperature": req.temperature,
                "top_p": 0.9, "top_k": 40, "min_p": 0.05, "repeat_penalty": 1.05, "cache_prompt": True, "stream": True}
@@ -451,7 +494,8 @@ class PerfilReq(BaseModel):
 
 @app.get("/llm", dependencies=[Depends(require_token)])
 async def llm_info():
-    return {"atual": perfis.atual(), "estado": await perfis.estado_llm(), "perfis": perfis.lista()}
+    return {"atual": perfis.atual(), "estado": await perfis.estado_llm(), "perfis": perfis.lista(),
+            "modelo_atual": Path(perfis._le_env().get("MODEL", "")).name}
 
 
 @app.post("/llm/select", dependencies=[Depends(require_token)])
@@ -472,6 +516,135 @@ async def llm_download(req: PerfilReq):
     except ValueError as e:
         raise HTTPException(400, str(e))
     return {"ok": True}
+
+
+# ----------------------------------------------------------------------------- adicionar outras IAs (busca pelo nome)
+class BaixarModeloReq(BaseModel):
+    repo: str
+    arquivos: list[str]
+    tipo: str = "texto"
+    tam: int = 0
+
+
+@app.get("/modelos/buscar", dependencies=[Depends(require_token)])
+async def modelos_buscar(q: str, tipo: str = "texto"):
+    try:
+        return await modelos.buscar(q, tipo)
+    except (httpx.HTTPError, ValueError):
+        raise HTTPException(502, "Não consegui falar com o Hugging Face (o PC está sem internet?).")
+
+
+@app.get("/modelos/arquivos", dependencies=[Depends(require_token)])
+async def modelos_arquivos(repo: str, tipo: str = "texto"):
+    try:
+        return await modelos.arquivos(repo, tipo)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except httpx.HTTPError:
+        raise HTTPException(502, "Não consegui falar com o Hugging Face (o PC está sem internet?).")
+
+
+@app.post("/modelos/baixar", dependencies=[Depends(require_token)])
+async def modelos_baixar(req: BaixarModeloReq):
+    try:
+        return {"id": modelos.baixar(req.repo, req.arquivos, req.tipo, req.tam)}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.get("/modelos/estado", dependencies=[Depends(require_token)])
+async def modelos_estado():
+    return await asyncio.to_thread(modelos.estado)
+
+
+@app.post("/modelos/cancelar", dependencies=[Depends(require_token)])
+async def modelos_cancelar(req: PerfilReq):
+    return {"ok": modelos.cancelar(req.id)}
+
+
+@app.post("/modelos/usar", dependencies=[Depends(require_token)])
+async def modelos_usar(req: PerfilReq):
+    try:
+        await asyncio.to_thread(modelos.usar, req.id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+    return {"ok": True}
+
+
+@app.post("/modelos/apagar", dependencies=[Depends(require_token)])
+async def modelos_apagar(req: PerfilReq):
+    try:
+        await asyncio.to_thread(modelos.apagar, req.id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True}
+
+
+# ----------------------------------------------------------------------------- perfil: nome e foto do usuário
+class PerfilNome(BaseModel):
+    nome: str = ""
+
+
+class PerfilDescricao(BaseModel):
+    descricao: str = ""
+
+
+@app.get("/perfil", dependencies=[Depends(require_token)])
+async def perfil_info():
+    return perfil.estado()
+
+
+@app.post("/perfil", dependencies=[Depends(require_token)])
+async def perfil_nome(req: PerfilNome):
+    perfil.define_nome(req.nome)
+    return perfil.estado()
+
+
+@app.post("/perfil/descricao", dependencies=[Depends(require_token)])
+async def perfil_descricao(req: PerfilDescricao):
+    perfil.define_descricao(req.descricao)
+    return perfil.estado()
+
+
+@app.post("/perfil/foto", dependencies=[Depends(require_token)])
+async def perfil_foto(foto: UploadFile = File(...)):
+    dados = await foto.read()
+    try:
+        perfil.salva_foto(dados, Path(foto.filename or "").suffix or ".jpg")
+        perfil.analisar()
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return perfil.estado()
+
+
+@app.post("/perfil/analisar", dependencies=[Depends(require_token)])
+async def perfil_analisar():
+    try:
+        perfil.analisar()
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return perfil.estado()
+
+
+@app.get("/perfil/foto", dependencies=[Depends(require_token)])
+async def perfil_foto_arquivo():
+    f = perfil.caminho_foto()
+    if not f:
+        raise HTTPException(404, "Sem foto.")
+    return FileResponse(f, headers={"Cache-Control": "no-store"})
+
+
+@app.delete("/perfil", dependencies=[Depends(require_token)])
+async def perfil_apaga():
+    perfil.apaga()
+    return perfil.estado()
+
+
+@app.get("/imagem/modelos", dependencies=[Depends(require_token)])
+async def imagem_modelos():
+    return imagens.lista_modelos()
 
 
 @app.get("/telemetry", dependencies=[Depends(require_token)])
@@ -526,6 +699,7 @@ class AppRequest(BaseModel):
     forca: float = 0.6
     melhorar: bool = True
     modelo: str = "rapido"            # /imagem/generate: rapido | realista
+    quadros: int = 17                 # /video/generate: 9, 17 ou 33 quadros (a 16 por segundo)
 
 
 def _base_de(req: AppRequest) -> dict:
@@ -640,6 +814,49 @@ async def imagem_modelo_baixar(m: str = "rapido"):
     except ValueError as e:
         raise HTTPException(400, str(e))
     return {"ok": True}
+
+
+# ----------------------------------------------------------------------------- vídeo
+@app.get("/video/modelo", dependencies=[Depends(require_token)])
+async def video_modelo():
+    return video.estado()
+
+
+@app.post("/video/modelo", dependencies=[Depends(require_token)])
+async def video_modelo_baixar():
+    try:
+        video.baixar()
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True}
+
+
+@app.post("/video/generate", dependencies=[Depends(require_token)])
+async def video_generate(req: AppRequest):
+    desc = req.description.strip()[:800]
+    if not desc:
+        raise HTTPException(400, "Descreva o vídeo que você quer.")
+    try:
+        video.inicia(desc, req.tamanho, req.quadros, req.passos, req.melhorar)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return StreamingResponse(video.segue(), media_type="text/event-stream")
+
+
+@app.get("/video/seguir", dependencies=[Depends(require_token)])
+async def video_seguir():
+    """Reconecta ao vídeo em andamento (ou mostra o último) depois de uma queda de conexão."""
+    return StreamingResponse(video.segue(), media_type="text/event-stream")
+
+
+@app.get("/video/estado", dependencies=[Depends(require_token)])
+async def video_estado():
+    return video.situacao()
+
+
+@app.post("/video/cancelar", dependencies=[Depends(require_token)])
+async def video_cancelar():
+    return {"ok": video.cancela()}
 
 
 # ----------------------------------------------------------------------------- anexos
@@ -1496,7 +1713,7 @@ import config
 
 ID_RE = re.compile(r"[0-9a-f]{10}")
 TIPOS = {".apk": "application/vnd.android.package-archive", ".bin": "application/octet-stream",
-         ".png": "image/png", ".html": "text/html", ".py": "text/x-python", ".zip": "application/zip"}
+         ".png": "image/png", ".mp4": "video/mp4", ".html": "text/html", ".py": "text/x-python", ".zip": "application/zip"}
 
 
 def salva(id_: str, nome: str, descricao: str, tipo: str, arquivos: list, extra: dict | None = None) -> dict:
@@ -1892,9 +2109,11 @@ async def estado_llm() -> str:
 EOF
   cat > telemetria.py <<'EOF'
 """Leituras do PC para a tela: temperaturas, ventoinhas, uso da GPU e da memória."""
+import json
 import os
 import subprocess
 
+import placa
 import recursos
 import time
 from pathlib import Path
@@ -1910,6 +2129,9 @@ def _num(s: str):
 
 
 def _gpu() -> dict | None:
+    amd = placa.acha_amd()
+    if amd:   # placa AMD (ex.: RX 580): lê pelo /sys
+        return amd.resumo()
     try:
         r = subprocess.run(
             ["nvidia-smi", "--query-gpu=temperature.gpu,utilization.gpu,memory.used,memory.total,fan.speed,power.draw,name",
@@ -1995,6 +2217,19 @@ def _controle_ventoinha() -> str:
         return "desconhecido"
 
 
+def _estado_ventoinhas() -> dict:
+    """Estado gravado pelo serviço de ventoinhas (/run/localai-fan.json). Vazio/antigo = serviço parado."""
+    arq = Path(os.environ.get("FANCTL_STATUS", "/run/localai-fan.json"))
+    try:
+        d = json.loads(arq.read_text())
+        if time.time() - d.get("hora", 0) > 15 or d.get("parado"):
+            return {"ativo": False}
+        d["ativo"] = True
+        return d
+    except (OSError, ValueError):
+        return {"ativo": False}
+
+
 def ler() -> dict:
     global _cache
     agora = time.time()
@@ -2002,51 +2237,46 @@ def ler() -> dict:
         return _cache[1]
     temp, fans = _hwmon()
     dado = {"gpu": _gpu(), "cpu": {"temp": temp, "uso": _uso_cpu(), "carga": round(os.getloadavg()[0], 2), "nucleos": os.cpu_count()},
-            "ventoinhas": fans, "ram": _ram(), "controle_ventoinha": _controle_ventoinha(),
+            "ventoinhas": fans, "ram": _ram(), "controle_ventoinha": _controle_ventoinha(), "ventoinha_ctl": _estado_ventoinhas(),
             "modelos_na_ram": sorted(recursos._modelos)}
     _cache = (agora, dado)
     return dado
 EOF
   cat > fanctl.py <<'EOF'
 #!/usr/bin/env python3
-"""Controle automático das ventoinhas: aumenta a rotação conforme a temperatura (sob demanda).
+"""Controle automático das ventoinhas: sobe a rotação sob demanda (pelo USO e pela temperatura).
 
-GPU NVIDIA: lê a temperatura e ajusta a ventoinha por uma curva. Tenta primeiro pelo NVML
-(sem precisar de tela) e, se a placa não aceitar, pelo nvidia-settings (precisa do Coolbits).
-CPU: se a placa-mãe expõe um PWM no Linux, ele é achado sozinho (prefere a ventoinha rotulada "cpu");
-para escolher à mão, defina FANCTL_CPU_PWM com o caminho (ex.: /sys/class/hwmon/hwmon3/pwm2) e, para
-desligar o controle da CPU, FANCTL_CPU_PWM=off. Veja o diagnostico_fans.sh para descobrir.
+GPU NVIDIA: lê temperatura e uso e ajusta a ventoinha por uma curva. Tenta primeiro o NVML (sem precisar de
+tela) e, se a placa não aceitar, o nvidia-settings (precisa do Coolbits e de uma sessão gráfica aberta).
+PLACA-MÃE (processador e caixa): descobre sozinho quais saídas PWM do chip da placa-mãe (nct6775, it87...) mexem
+numa ventoinha de verdade, com um teste rápido na primeira vez, e passa a controlar todas pela temperatura/uso
+da CPU e da GPU. O resultado do teste fica guardado. Para forçar uma só saída: FANCTL_CPU_PWM=/sys/.../pwm2.
+Estado em tempo real (para a tela do app): /run/localai-fan.json
 
-SOB DEMANDA: além da temperatura, a rotação acompanha a CARGA (uso da GPU e da CPU). Quando a IA começa a
-trabalhar, as ventoinhas já sobem antes de o calor aparecer; ao terminar, descem devagar.
-
-SEGURANÇA: ao parar (ou se perder a leitura da temperatura) devolve o controle ao automático
-da placa. A curva nunca deixa a ventoinha abaixo do mínimo.
+SEGURANÇA: ao parar (ou se perder a leitura da temperatura) devolve o controle ao automático. A curva nunca
+deixa a ventoinha abaixo do mínimo; com a temperatura alta ela vai a 100%.
 Roda como serviço (root): localai-fan.service. Para desligar: sudo systemctl disable --now localai-fan
 """
 import glob
+import json
 import os
+import re
 import signal
 import subprocess
 import sys
 import time
 
+import placa
+
 # (temperatura em °C, ventoinha em %). Entre os pontos, interpola.
-CURVA_GPU = [(40, 30), (50, 38), (60, 50), (70, 70), (78, 90), (82, 100)]
-CURVA_CPU = [(40, 30), (55, 45), (65, 65), (75, 85), (85, 100)]
-INTERVALO = float(os.environ.get("FANCTL_INTERVALO", "2"))
+CURVA_GPU = [(35, 30), (45, 42), (55, 58), (62, 72), (70, 88), (76, 100)]
+CURVA_CPU = [(35, 30), (45, 42), (55, 58), (62, 72), (70, 88), (76, 100)]
+INTERVALO = float(os.environ.get("FANCTL_INTERVALO", "1.5"))
 DESCE_POR_CICLO = 2          # a rotação sobe na hora, mas desce devagar (evita "serrote")
 FALHAS_PARA_RESTAURAR = 3
-
-
-def alvo_cpu(temp, carga):
-    """Rotação desejada da CPU. Carga alta (a IA gerando resposta) sobe antes de esquentar."""
-    alvo = interpola(CURVA_CPU, temp)
-    if carga is not None and carga >= 60:
-        alvo = max(alvo, 50)
-    if carga is not None and carga >= 85:
-        alvo = max(alvo, 65)
-    return int(round(min(100, max(30, alvo))))
+HWMON = os.environ.get("FANCTL_HWMON", "/sys/class/hwmon")
+STATUS = os.environ.get("FANCTL_STATUS", "/run/localai-fan.json")
+ESTADO = os.environ.get("FANCTL_ESTADO", "/var/lib/localai-fan/mapa.json")
 
 
 def interpola(curva, t):
@@ -2059,12 +2289,28 @@ def interpola(curva, t):
 
 
 def alvo_gpu(temp, uso):
-    """Rotação desejada. Se a GPU está muito ocupada, já sobe um pouco antes de esquentar."""
+    """Rotação desejada. Se a GPU está ocupada, sobe ANTES de esquentar (a geração de imagens esquenta rápido)."""
     alvo = interpola(CURVA_GPU, temp)
-    if uso is not None and uso >= 50:
-        alvo = max(alvo, 45)
-    if uso is not None and uso >= 85:
-        alvo = max(alvo, 60)
+    if uso is not None:
+        if uso >= 30:
+            alvo = max(alvo, 50)
+        if uso >= 60:
+            alvo = max(alvo, 68)
+        if uso >= 85:
+            alvo = max(alvo, 85)
+    return int(round(min(100, max(30, alvo))))
+
+
+def alvo_cpu(temp, uso):
+    """Idem para o processador: o uso alto sobe a rotação antes de a temperatura reagir."""
+    alvo = interpola(CURVA_CPU, temp) if temp is not None else 45
+    if uso is not None:
+        if uso >= 40:
+            alvo = max(alvo, 50)
+        if uso >= 70:
+            alvo = max(alvo, 68)
+        if uso >= 90:
+            alvo = max(alvo, 85)
     return int(round(min(100, max(30, alvo))))
 
 
@@ -2080,6 +2326,52 @@ class Suavizador:
         return self.atual
 
 
+# ----------------------------------------------------------------------------- leituras
+def _ler(caminho):
+    with open(caminho) as f:
+        return f.read().strip()
+
+
+def temp_cpu():
+    for d in sorted(glob.glob(f"{HWMON}/hwmon*")):
+        try:
+            nome = _ler(f"{d}/name")
+            if nome in ("k10temp", "coretemp", "zenpower"):
+                melhor = None
+                for t in sorted(glob.glob(f"{d}/temp*_input")):
+                    rot = ""
+                    try:
+                        rot = _ler(t.replace("_input", "_label"))
+                    except OSError:
+                        pass
+                    v = int(_ler(t)) / 1000
+                    if rot in ("Tctl", "Tdie", "Package id 0"):
+                        return v
+                    melhor = v if melhor is None else melhor
+                return melhor
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+class UsoCpu:
+    """Uso total da CPU em % entre uma leitura e a seguinte (/proc/stat)."""
+
+    def __init__(self):
+        self.ant = None
+
+    def ler(self):
+        try:
+            v = [int(x) for x in open("/proc/stat").readline().split()[1:]]
+        except (OSError, ValueError):
+            return None
+        total, ocioso = sum(v), v[3] + (v[4] if len(v) > 4 else 0)
+        ant, self.ant = self.ant, (total, ocioso)
+        if not ant or total <= ant[0]:
+            return None
+        return max(0.0, min(100.0, 100.0 * (1 - (ocioso - ant[1]) / (total - ant[0]))))
+
+
 # ----------------------------------------------------------------------------- GPU
 def _smi(campo):
     r = subprocess.run(["nvidia-smi", f"--query-gpu={campo}", "--format=csv,noheader,nounits"],
@@ -2092,6 +2384,7 @@ class GpuNvidia:
 
     def __init__(self):
         self.metodo = None
+        self.erro = ""
         self.nvml = None
         self.h = None
         try:
@@ -2140,10 +2433,12 @@ class GpuNvidia:
                 fn(pct)
                 if self.metodo != nome:
                     print(f"[fanctl] GPU: controle da ventoinha via {nome}", flush=True)
-                self.metodo = nome
+                self.metodo, self.erro = nome, ""
                 return
             except Exception as e:  # tenta o próximo método
                 erro = e
+        self.metodo = None
+        self.erro = str(erro)[:160]
         raise RuntimeError(f"Nenhum método controla a ventoinha da GPU: {erro}")
 
     def restaurar(self):
@@ -2163,141 +2458,201 @@ class GpuNvidia:
         self.metodo = None
 
 
-# ----------------------------------------------------------------------------- CPU (opcional)
-def temp_cpu():
-    for d in glob.glob("/sys/class/hwmon/hwmon*"):
-        try:
-            nome = open(f"{d}/name").read().strip()
-            if nome in ("k10temp", "coretemp", "zenpower"):
-                return int(open(f"{d}/temp1_input").read()) / 1000
-        except (OSError, ValueError):
-            continue
-    return None
+# ----------------------------------------------------------------------------- placa-mãe (CPU e caixa)
+class Pwm:
+    """Uma saída PWM do chip da placa-mãe ligada a uma ventoinha (ex.: /sys/class/hwmon/hwmon3/pwm2)."""
 
-
-def carga_cpu(anterior=[None]):
-    """Uso da CPU (%) desde a última chamada, lido de /proc/stat. None na primeira chamada."""
-    try:
-        v = [int(x) for x in open("/proc/stat").readline().split()[1:]]
-    except (OSError, ValueError):
-        return None
-    total, ocioso = sum(v), v[3] + (v[4] if len(v) > 4 else 0)
-    ant, anterior[0] = anterior[0], (total, ocioso)
-    if ant is None or total <= ant[0]:
-        return None
-    return 100.0 * (1 - (ocioso - ant[1]) / (total - ant[0]))
-
-
-def acha_pwm_cpu(raiz="/sys/class/hwmon"):
-    """Procura um PWM de placa-mãe controlável. Prefere o canal cuja ventoinha se chama 'cpu'; senão,
-    o primeiro que tenha ventoinha girando. Devolve o caminho (ex.: .../hwmon3/pwm2) ou None."""
-    achados = []
-    for d in sorted(glob.glob(f"{raiz}/hwmon*")):
-        for pwm in sorted(glob.glob(f"{d}/pwm[0-9]")):
-            n = pwm[len(d) + 4:]
-            if not os.path.exists(pwm + "_enable") or not os.access(pwm, os.W_OK):
-                continue
-            try:
-                rpm = int(open(f"{d}/fan{n}_input").read())
-            except (OSError, ValueError):
-                continue
-            try:
-                rotulo = open(f"{d}/fan{n}_label").read().strip().lower()
-            except OSError:
-                rotulo = ""
-            if "cpu" in rotulo:
-                return pwm
-            if rpm > 0:
-                achados.append(pwm)
-    return achados[0] if achados else None
-
-
-class CpuPwm:
-    """Ventoinha ligada a um PWM da placa-mãe (ex.: /sys/class/hwmon/hwmon3/pwm2)."""
-
-    def __init__(self, pwm):
+    def __init__(self, pwm, fan=None):
         self.pwm = pwm
+        self.fan = fan
         self.enable = pwm + "_enable"
         self.original = None
+        self.pct = None
+
+    def rpm(self):
+        try:
+            return int(_ler(self.fan)) if self.fan else None
+        except (OSError, ValueError):
+            return None
 
     def definir(self, pct):
         if self.original is None:
-            self.original = open(self.enable).read().strip()
-            open(self.enable, "w").write("1")  # 1 = manual
-        open(self.pwm, "w").write(str(int(round(255 * pct / 100))))
+            self.original = _ler(self.enable)
+            with open(self.enable, "w") as f:
+                f.write("1")  # 1 = manual
+        with open(self.pwm, "w") as f:
+            f.write(str(int(round(255 * pct / 100))))
+        self.pct = pct
 
     def restaurar(self):
         if self.original is not None:
             try:
-                open(self.enable, "w").write(self.original)
+                with open(self.enable, "w") as f:
+                    f.write(self.original)
             except OSError as e:
-                print(f"[fanctl] aviso ao restaurar a CPU: {e}", flush=True)
+                print(f"[fanctl] aviso ao restaurar {self.pwm}: {e}", flush=True)
             self.original = None
+            self.pct = None
+
+
+def candidatos():
+    """Todas as saídas PWM (com ventoinha e modo manual disponíveis) dos chips da placa-mãe."""
+    saida = []
+    for d in sorted(glob.glob(f"{HWMON}/hwmon*")):
+        try:
+            chip = _ler(f"{d}/name")
+        except OSError:
+            chip = ""
+        if chip in ("amdgpu", "radeon", "nouveau"):   # ventoinha da placa de vídeo: quem cuida é a classe da GPU
+            continue
+        for p in sorted(glob.glob(f"{d}/pwm[0-9]*")):
+            m = re.search(r"/pwm(\d+)$", p)
+            if not m:
+                continue
+            fan = f"{d}/fan{m.group(1)}_input"
+            if os.path.exists(p + "_enable") and os.path.exists(fan):
+                saida.append((p, fan))
+    return saida
+
+
+def testa_resposta(pwm, fan, espera=float(os.environ.get("FANCTL_ESPERA_TESTE", "5"))):
+    """Como o pwmconfig: pula para 100% e depois ~40% e vê se a rotação acompanha. Sempre restaura o modo original."""
+    p = Pwm(pwm, fan)
+    try:
+        p.definir(100)
+        time.sleep(espera)
+        alto = p.rpm() or 0
+        p.definir(40)
+        time.sleep(espera)
+        baixo = p.rpm() or 0
+        return alto > 0 and alto - baixo >= 150
+    except (OSError, ValueError):
+        return False
+    finally:
+        p.restaurar()
+
+
+def descobre_pwms():
+    """Devolve as saídas PWM que realmente mexem numa ventoinha (usa o resultado guardado se houver)."""
+    forcado = os.environ.get("FANCTL_CPU_PWM")
+    if forcado:
+        return [Pwm(forcado, re.sub(r"pwm(\d+)$", r"fan\1_input", forcado))]
+    cands = candidatos()
+    if not cands or os.environ.get("FANCTL_AUTO_PWM", "1") == "0":
+        return []
+    try:
+        guardado = json.load(open(ESTADO))
+    except (OSError, ValueError):
+        guardado = None
+    chave = sorted(p for p, _ in cands)
+    if guardado and guardado.get("candidatos") == chave:
+        return [Pwm(p, f) for p, f in cands if p in guardado.get("ativos", [])]
+    t = temp_cpu()
+    if t is not None and t > 70:
+        return []   # CPU quente: não arrisca deixar nenhuma ventoinha baixar num teste agora
+    print(f"[fanctl] testando {len(cands)} saída(s) PWM da placa-mãe (as ventoinhas vão acelerar e desacelerar um pouco)…", flush=True)
+    ativos = [(p, f) for p, f in cands if testa_resposta(p, f)]
+    try:
+        os.makedirs(os.path.dirname(ESTADO), exist_ok=True)
+        json.dump({"candidatos": chave, "ativos": [p for p, _ in ativos]}, open(ESTADO, "w"))
+    except OSError:
+        pass
+    print(f"[fanctl] ventoinhas da placa-mãe que respondem: {len(ativos)} de {len(cands)}", flush=True)
+    return [Pwm(p, f) for p, f in ativos]
 
 
 # ----------------------------------------------------------------------------- laço principal
 class Controlador:
-    def __init__(self, gpu, cpu=None, leitura_cpu=temp_cpu, leitura_carga=carga_cpu):
-        self.gpu, self.cpu, self.leitura_cpu, self.leitura_carga = gpu, cpu, leitura_cpu, leitura_carga
+    def __init__(self, gpu, pwms=None, leitura_cpu=temp_cpu, uso_cpu=None):
+        self.gpu, self.pwms, self.leitura_cpu = gpu, pwms or [], leitura_cpu
+        self.uso = uso_cpu or UsoCpu()
         self.sg, self.sc = Suavizador(), Suavizador()
         self.falhas = 0
         self.ativo = False
+        self.estado = {}
 
     def ciclo(self):
-        """Um ciclo de leitura e ajuste. Devolve (pct_gpu, pct_cpu) aplicados."""
+        """Um ciclo de leitura e ajuste. Devolve (pct_gpu, pct_placa_mae)."""
+        t = u = None
         try:
             t, u = self.gpu.temp(), self.gpu.uso()
             self.falhas = 0
         except Exception:
             self.falhas += 1
             if self.falhas >= FALHAS_PARA_RESTAURAR and self.ativo:
-                print("[fanctl] sem leitura da temperatura: devolvendo ao automático", flush=True)
-                self.parar()
-            return None, None
-        pg = self.sg.passo(alvo_gpu(t, u))
-        self.gpu.definir(pg)
-        self.ativo = True
+                print("[fanctl] sem leitura da temperatura da GPU: devolvendo ao automático", flush=True)
+                self.gpu.restaurar()
+        pg = None
+        if t is not None:
+            pg = self.sg.passo(alvo_gpu(t, u))
+            try:
+                self.gpu.definir(pg)
+                self.ativo = True
+            except Exception as e:
+                print(f"[fanctl] GPU: {e}", flush=True)
+        tc, uc = self.leitura_cpu(), self.uso.ler()
         pc = None
-        if self.cpu:
-            tc = self.leitura_cpu()
-            if tc is not None:
-                pc = self.sc.passo(alvo_cpu(tc, self.leitura_carga()))
-                self.cpu.definir(pc)
+        if self.pwms:
+            alvo = alvo_cpu(tc, uc)
+            if t is not None:  # a caixa também ajuda a GPU: acompanha a curva dela, um pouco mais calma
+                alvo = max(alvo, int(alvo_gpu(t, u) * 0.85))
+            pc = self.sc.passo(alvo)
+            for p in self.pwms:
+                try:
+                    p.definir(pc)
+                    self.ativo = True
+                except OSError as e:
+                    print(f"[fanctl] {p.pwm}: {e}", flush=True)
+        self.estado = {
+            "hora": int(time.time()),
+            "gpu": {"temp": t, "uso": u, "pct": pg, "metodo": self.gpu.metodo, "erro": self.gpu.erro},
+            "cpu": {"temp": tc, "uso": None if uc is None else round(uc, 1)},
+            "placa_mae": [{"pwm": os.path.basename(p.pwm), "chip": os.path.basename(os.path.dirname(p.pwm)),
+                           "pct": p.pct, "rpm": p.rpm()} for p in self.pwms],
+        }
         return pg, pc
 
     def parar(self):
         self.gpu.restaurar()
-        if self.cpu:
-            self.cpu.restaurar()
+        for p in self.pwms:
+            p.restaurar()
         self.sg, self.sc = Suavizador(), Suavizador()
         self.ativo = False
 
 
+def grava_status(estado):
+    try:
+        tmp = STATUS + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(estado, f)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, STATUS)
+    except OSError:
+        pass
+
+
 def main():
-    gpu = GpuNvidia()
-    pwm = os.environ.get("FANCTL_CPU_PWM", "")
-    if pwm.lower() == "off":
-        pwm = ""
-    elif not pwm:
-        pwm = acha_pwm_cpu() or ""
-        if pwm:
-            print(f"[fanctl] PWM da CPU achado sozinho: {pwm}", flush=True)
-    cpu = CpuPwm(pwm) if pwm else None
-    ctl = Controlador(gpu, cpu)
+    amd = placa.acha_amd()
+    gpu = amd if amd else GpuNvidia()
+    print(f"[fanctl] placa de vídeo: {amd.nome() + ' (AMD, via amdgpu)' if amd else 'NVIDIA'}", flush=True)
+    pwms = descobre_pwms()
+    ctl = Controlador(gpu, pwms)
 
     def sair(*_):
         ctl.parar()
+        grava_status({"hora": int(time.time()), "parado": True})
         print("[fanctl] encerrado; ventoinhas devolvidas ao automático", flush=True)
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, sair)
     signal.signal(signal.SIGINT, sair)
-    print(f"[fanctl] iniciado (CPU PWM: {'sim' if cpu else 'não'})", flush=True)
+    print(f"[fanctl] iniciado (ventoinhas da placa-mãe controladas: {len(pwms)})", flush=True)
     erros = 0
     try:
         while True:
             try:
                 ctl.ciclo()
+                grava_status(ctl.estado)
                 erros = 0
             except Exception as e:
                 erros += 1
@@ -2331,8 +2686,10 @@ import os
 import shutil
 import subprocess
 import time
+from pathlib import Path
 
 import config
+import placa
 
 # Trabalhos pesados (compilar, gerar imagem, criar app/firmware): um de cada vez.
 pesado = asyncio.Lock()
@@ -2366,7 +2723,7 @@ def ram_livre_mb() -> int:
 
 
 def vram_livre_mb() -> int | None:
-    """VRAM livre da GPU NVIDIA em MiB, ou None se não houver GPU/nvidia-smi."""
+    """VRAM livre da GPU em MiB (NVIDIA pelo nvidia-smi, AMD pelo /sys), ou None se não houver placa."""
     try:
         r = subprocess.run(["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
                            capture_output=True, text=True, timeout=3)
@@ -2374,7 +2731,8 @@ def vram_livre_mb() -> int | None:
             return int(float(r.stdout.strip().splitlines()[0]))
     except (OSError, subprocess.TimeoutExpired, ValueError):
         pass
-    return None
+    amd = placa.acha_amd()
+    return amd.vram_livre_mb() if amd else None
 
 
 def baixa_prioridade(cmd: list[str]) -> list[str]:
@@ -2435,21 +2793,56 @@ def garante_ram(minimo_mb: int, o_que: str) -> None:
 
 
 # ------------------------------------------------------------ GPU, CPU ou os dois
-def modo_imagem() -> str:
-    """Onde rodar o gerador de imagens, conforme a VRAM livre agora.
+def modo_imagem(v: int | None = None) -> str:
+    """Onde rodar o gerador de imagens/vídeo, conforme a VRAM livre agora.
 
-    gpu     : tudo na placa (precisa de ~1,5 GB livres)
-    hibrido : o modelo de difusão na placa e o texto/decodificador na CPU (~0,8 GB livres)
-    cpu     : tudo na CPU (a placa está ocupada pelo modelo de linguagem)
+    gpu        : tudo na placa, de uma vez (precisa de ~2,4 GB livres; numa placa de 2 GB quase nunca)
+    segmentado : o modelo roda na placa EM PARTES, dentro de um limite de memória (max_vram do stable-diffusion.cpp);
+                 os pesos ficam na RAM e vão para a placa conforme o uso. Cabe nos ~0,7 GB ou mais que sobram.
+    cpu        : tudo na CPU
     """
-    v = vram_livre_mb()
+    v = vram_livre_mb() if v is None else v
     if v is None:
         return "cpu"
-    if v >= 1500:
+    if v >= 2400:
         return "gpu"
-    if v >= 800:
-        return "hibrido"
+    if v >= 600:
+        return "segmentado"
     return "cpu"
+
+
+def orcamento_vram_gib(v: int) -> float:
+    """Quanto da VRAM livre o gerador pode usar (em GiB), deixando folga para a tela e o modelo de texto."""
+    return round(max(0.35, min((v - 250) / 1024, 1.8)), 2)
+
+
+# ------------------------------------------------------------ a placa deu conta? (aprende com as tentativas)
+def _arq_gpu() -> Path:
+    return config.MODELO_ENV.parent / "gpu_imagem.json"
+
+
+def _le_gpu() -> dict:
+    try:
+        import json
+        return json.loads(_arq_gpu().read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def gpu_liberada(tarefa: str) -> bool:
+    """Falso se a placa falhou 2 vezes seguidas nas últimas 24 h nesta tarefa ('imagem' ou 'video')."""
+    e = _le_gpu().get(tarefa, {})
+    return not (e.get("falhas", 0) >= 2 and time.time() - e.get("quando", 0) < 24 * 3600)
+
+
+def anota_gpu(tarefa: str, ok: bool) -> None:
+    import json
+    d = _le_gpu()
+    d[tarefa] = {"falhas": 0 if ok else d.get(tarefa, {}).get("falhas", 0) + 1, "quando": time.time()}
+    try:
+        _arq_gpu().write_text(json.dumps(d))
+    except OSError:
+        pass
 EOF
   cat > uploads.py <<'EOF'
 """Anexos do usuário (imagens, .ino, .bin, .apk, código): guarda no disco e analisa."""
@@ -2730,6 +3123,7 @@ import httpx
 
 import androidgen
 import config
+import modelos
 import entregas
 import recursos
 import uploads
@@ -2739,8 +3133,19 @@ _download: dict[str, asyncio.Task] = {}
 
 
 # ------------------------------------------------------------------ modelo de imagem (download)
+def _todos() -> dict:
+    """Modelos de imagem: os dois que vêm prontos + os que você adicionou pela busca por nome."""
+    return {**config.IMG_MODELOS, **modelos.extras_imagem()}
+
+
 def _m(mid: str) -> dict:
-    return config.IMG_MODELOS.get(mid) or config.IMG_MODELOS["rapido"]
+    t = _todos()
+    return t.get(mid) or t["rapido"]
+
+
+def lista_modelos() -> list[dict]:
+    return [{"id": k, "nome": m["nome"], "passos": m["passos"], "max_passos": m.get("max_passos", 8),
+             "presente": presente(k)} for k, m in _todos().items()]
 
 
 def presente(mid: str = "rapido") -> bool:
@@ -2789,9 +3194,13 @@ def baixar(mid: str = "rapido") -> None:
     _download[mid] = asyncio.get_running_loop().create_task(_baixa(mid))
 
 
-async def melhora_prompt(texto: str, realista: bool = False) -> str:
+async def melhora_prompt(texto: str, realista: bool = False, video: bool = False) -> str:
     """Pede à IA de texto para traduzir e detalhar o pedido. Se ela não responder, usa o texto original."""
-    estilo = ("a realistic photograph: RAW photo, camera and lens (e.g. 85mm f/1.8), natural lighting, skin and "
+    if video:
+        estilo = ("a short video clip: describe the subject, the motion/action, camera movement (e.g. slow pan, "
+                  "dolly in), setting, lighting and visual style")
+    else:
+        estilo = ("a realistic photograph: RAW photo, camera and lens (e.g. 85mm f/1.8), natural lighting, skin and "
               "material texture, depth of field, film grain, 8k uhd" if realista else
               "style, lighting, camera/composition, quality keywords")
     msgs = [{"role": "system", "content": (
@@ -2850,9 +3259,9 @@ async def gera_imagem(descricao: str, init_id: str | None, tamanho: str, passos:
     if not motor_instalado():
         await emit({"type": "error", "msg": "O gerador de imagens não está instalado. Rode: bash atualizar.sh"})
         return
-    if modelo not in config.IMG_MODELOS:
+    if modelo not in _todos():
         modelo = "rapido"
-    cfgm = config.IMG_MODELOS[modelo]
+    cfgm = _m(modelo)
     if not presente(modelo):
         await emit({"type": "error", "msg": "Falta baixar o modelo de imagens (2 GB). Use o botão de baixar abaixo.",
                     "precisa_modelo": True})
@@ -2861,7 +3270,7 @@ async def gera_imagem(descricao: str, init_id: str | None, tamanho: str, passos:
         await emit({"type": "error", "msg": "Ainda estou criando outra coisa. Espere terminar ou clique em Parar."})
         return
     largura, altura = TAMANHOS.get(tamanho, (512, 512))
-    passos = max(1, min(int(passos), 8))
+    passos = max(1, min(int(passos), cfgm.get("max_passos", 8)))
     async with androidgen._trava:
         try:
             recursos.garante_ram(3500, "gerar a imagem")
@@ -2884,17 +3293,23 @@ async def gera_imagem(descricao: str, init_id: str | None, tamanho: str, passos:
         pasta.mkdir(parents=True, exist_ok=True)
         saida = pasta / "imagem.png"
         seed = random.randint(1, 2**31 - 1)
-        modo = recursos.modo_imagem()
+        vram = recursos.vram_livre_mb()
+        modo = recursos.modo_imagem(vram)
+        if modo != "cpu" and not recursos.gpu_liberada("imagem"):
+            modo = "cpu"   # a placa falhou nas últimas tentativas; não perde tempo de novo (tenta outra vez amanhã)
         # threads = todos os núcleos/threads do processador
         base = {"modelo": str(cfgm["arquivo"]), "threads": os.cpu_count() or recursos.nucleos_fisicos(), "prompt": prompt,
                 "largura": largura, "altura": altura, "passos": passos, "seed": seed, "saida": str(saida),
-                "cfg": cfgm["cfg"], "negativo": cfgm["negativo"], "init": str(init) if init else None, "forca": forca}
+                "orcamento": recursos.orcamento_vram_gib(vram or 0), "cfg": cfgm["cfg"], "negativo": cfgm["negativo"], "init": str(init) if init else None, "forca": forca}
         try:
-            rotulo = {"gpu": "na placa de vídeo", "hibrido": "na placa de vídeo e na CPU", "cpu": "na CPU"}[modo]
-            vram = recursos.vram_livre_mb()
-            motivo = (f" (a IA de texto está ocupando a placa: só {vram} MB livres)" if modo == "cpu" and vram is not None else "")
+            rotulo = {"gpu": "na placa de vídeo",
+                      "segmentado": f"na placa de vídeo (em partes, até {base['orcamento']} GiB) com todos os núcleos da CPU ajudando",
+                      "cpu": "na CPU"}[modo]
+            motivo = (f" (a placa está ocupada: só {vram} MB livres)" if modo == "cpu" and vram is not None and vram < 600 else "")
             await emit({"type": "status", "msg": f"Gerando a imagem {rotulo}{motivo}…{' (leva cerca de 1 minuto)' if modo == 'cpu' else ''}"})
             ok, erro = await _roda_worker({**base, "modo": modo}, emit)
+            if modo != "cpu":
+                recursos.anota_gpu("imagem", ok)
             if not ok and modo != "cpu":
                 await emit({"type": "status", "msg": "A placa de vídeo não deu conta; tentando só pela CPU…"})
                 ok, erro = await _roda_worker({**base, "modo": "cpu"}, emit)
@@ -2938,8 +3353,8 @@ def main():
     try:
         from stable_diffusion_cpp import StableDiffusion
         kw = dict(model_path=cfg["modelo"], n_threads=cfg["threads"], vae_decode_only=not cfg.get("init"))
-        if modo == "hibrido":                         # modelo de difusão na placa; texto e decodificador na CPU
-            kw.update(keep_clip_on_cpu=True, keep_vae_on_cpu=True)
+        if modo == "segmentado":                      # na placa EM PARTES, dentro do limite de memória que sobra
+            kw.update(offload_params_to_cpu=True, max_vram=cfg["orcamento"], keep_clip_on_cpu=False, keep_vae_on_cpu=False)
         elif modo == "gpu":
             kw.update(keep_clip_on_cpu=False, keep_vae_on_cpu=False)
         sd = StableDiffusion(**kw)
@@ -3712,6 +4127,1358 @@ def status() -> dict:
             pass
     return info
 EOF
+  cat > modelos.py <<'EOF'
+"""Gerenciador de IAs: procura pelo NOME no Hugging Face, baixa e passa a usar. Sem lista fechada.
+
+A busca é neutra: traz o que o Hugging Face tem com aquele nome (não escolhemos, não recomendamos e não
+bloqueamos nenhum modelo). Os avisos sobre o tamanho para o seu PC são só informação; dá para baixar e usar
+mesmo assim. O que cada modelo aceita ou recusa depende do próprio modelo.
+
+  texto  : modelos de conversa (.gguf) vão para ~/models; "usar" grava ~/localai/modelo.env e reinicia o llama-server
+  imagem : modelos Stable Diffusion completos (.gguf num arquivo só) vão para ~/models/imagens e aparecem na lista
+           de modelos de imagem
+Os modelos adicionados ficam registrados em ~/localai/modelos_extra.json.
+"""
+import asyncio
+import hashlib
+import json
+import re
+import shutil
+import struct
+import subprocess
+from pathlib import Path
+
+import httpx
+
+import config
+
+HF = "https://huggingface.co"
+REPO_RE = re.compile(r"^[\w.\-]+/[\w.\-]+$")
+ARQ_RE = re.compile(r"^[\w.\-+ ()\[\]]+(/[\w.\-+ ()\[\]]+)*\.gguf$")
+PARTE_RE = re.compile(r"^(.*)-(\d{5})-of-(\d{5})\.gguf$")
+QUANT_RE = re.compile(r"(?i)(IQ\d_\w+|Q\d(?:_K)?(?:_[SML01])?|BF16|F16|F32)")
+PREFERENCIA = ["Q4_K_M", "Q4_K_S", "Q4_0", "Q5_K_M", "Q5_K_S", "Q4_1", "Q3_K_M", "Q6_K", "IQ4_XS", "Q8_0", "Q3_K_S", "Q2_K"]
+SEM_TEXTO = {"text-to-image", "image-to-image", "text-to-video", "image-to-video", "text-to-speech",
+             "automatic-speech-recognition", "feature-extraction"}
+
+REGISTRO = config.MODELO_ENV.parent / "modelos_extra.json"
+_baixando: dict[str, dict] = {}   # id -> {"task", "partes", "tam", "erro"}
+
+
+# ------------------------------------------------------------------ registro dos modelos adicionados
+def lista() -> list[dict]:
+    try:
+        return json.loads(REGISTRO.read_text())
+    except (OSError, ValueError):
+        return []
+
+
+def _salva(itens: list[dict]) -> None:
+    REGISTRO.parent.mkdir(parents=True, exist_ok=True)
+    REGISTRO.write_text(json.dumps(itens, ensure_ascii=False, indent=1))
+
+
+def _pasta(tipo: str) -> Path:
+    if tipo == "visao":
+        return config.MODELS_DIR / "visao"
+    return config.MODELS_DIR / "imagens" if tipo == "imagem" else config.MODELS_DIR
+
+
+def _id(repo: str, arquivo: str) -> str:
+    return hashlib.sha1(f"{repo}/{arquivo}".encode()).hexdigest()[:10]
+
+
+def extras_imagem() -> dict:
+    """Modelos de imagem adicionados, no mesmo formato de config.IMG_MODELOS (usado pelo gerador de imagens)."""
+    out = {}
+    for m in lista():
+        if m.get("tipo") != "imagem":
+            continue
+        rapido = bool(re.search(r"(?i)turbo|lcm|lightning|hyper|distill", m["nome"] + m["arquivo"]))
+        out["x" + m["id"]] = {"nome": m["nome"], "arquivo": Path(m["caminho"]), "tam": m["tam"],
+                              "cfg": 1.5 if rapido else 7.0, "passos": 4 if rapido else 20,
+                              "max_passos": 8 if rapido else 30, "url": "",
+                              "negativo": "" if rapido else "(worst quality, low quality:1.4), blurry, deformed, watermark, text"}
+    return out
+
+
+# ------------------------------------------------------------------ hardware (só para avisos)
+def _ram_gb() -> float:
+    try:
+        for ln in open("/proc/meminfo"):
+            if ln.startswith("MemTotal:"):
+                return int(ln.split()[1]) / 1048576
+    except OSError:
+        pass
+    return 16.0
+
+
+def aviso_tamanho(tam: int, tipo: str = "texto") -> str:
+    gb = tam / 1e9
+    ram = _ram_gb()
+    if tipo == "imagem":
+        return "" if gb <= 3 else f"Grande ({gb:.1f} GB): vai demorar bastante e usar muita memória."
+    if gb <= ram * 0.40:
+        return ""
+    if gb <= ram * 0.62:
+        return f"Pesado ({gb:.1f} GB): cabe, mas fica lento."
+    return f"Muito grande ({gb:.1f} GB) para {ram:.0f} GB de RAM: pode travar o PC. Dá para baixar mesmo assim."
+
+
+# ------------------------------------------------------------------ busca e arquivos
+def _repo_de(q: str) -> str | None:
+    """Aceita 'dono/repositório', 'dono/repositório:Q4_K_M' e links do Hugging Face."""
+    q = q.strip()
+    m = re.match(r"https?://huggingface\.co/([\w.\-]+/[\w.\-]+)", q)
+    if m:
+        return m.group(1)
+    q = q.split(":")[0]
+    return q if REPO_RE.match(q) else None
+
+
+async def buscar(q: str, tipo: str = "texto", limite: int = 20) -> list[dict]:
+    q = q.strip()
+    if not q:
+        return []
+    repo = _repo_de(q)
+    async with httpx.AsyncClient(timeout=20, follow_redirects=True) as c:
+        if repo:  # nome exato do repositório: mostra direto
+            r = await c.get(f"{HF}/api/models/{repo}")
+            if r.status_code == 200:
+                d = r.json()
+                return [{"repo": d["id"], "downloads": d.get("downloads", 0), "likes": d.get("likes", 0),
+                         "tipo": d.get("pipeline_tag") or "", "tags": (d.get("tags") or [])[:6]}]
+        r = await c.get(f"{HF}/api/models", params={"search": q, "filter": "gguf", "sort": "downloads",
+                                                    "direction": "-1", "limit": limite * 2})
+        r.raise_for_status()
+        saida = []
+        for m in r.json():
+            pt = m.get("pipeline_tag") or ""
+            if tipo == "texto" and pt in SEM_TEXTO:
+                continue
+            if tipo == "imagem" and pt not in ("text-to-image", "image-to-image", ""):
+                continue
+            saida.append({"repo": m["id"], "downloads": m.get("downloads", 0), "likes": m.get("likes", 0),
+                          "tipo": pt, "tags": [t for t in (m.get("tags") or []) if ":" not in t][:6]})
+        return saida[:limite]
+
+
+def _quant(nome: str) -> str:
+    m = QUANT_RE.search(nome)
+    return m.group(1).upper() if m else ""
+
+
+async def arquivos(repo: str, tipo: str = "texto") -> list[dict]:
+    """Arquivos .gguf do repositório (partes de um modelo dividido viram um item só), com a escolha recomendada."""
+    if not REPO_RE.match(repo):
+        raise ValueError("Nome de repositório inválido.")
+    async with httpx.AsyncClient(timeout=20, follow_redirects=True) as c:
+        r = await c.get(f"{HF}/api/models/{repo}", params={"blobs": "true"})
+    if r.status_code != 200:
+        raise ValueError("Não achei esse modelo no Hugging Face.")
+    grupos: dict[str, dict] = {}
+    for f in r.json().get("siblings", []):
+        n = f["rfilename"]
+        if not n.lower().endswith(".gguf") or "mmproj" in n.lower() or not ARQ_RE.match(n):
+            continue
+        m = PARTE_RE.match(n)
+        base = (m.group(1) + ".gguf") if m else n
+        g = grupos.setdefault(base, {"nome": base, "inteiro": None, "partes": [], "quant": _quant(base)})
+        if m:
+            g["partes"].append((n, f.get("size") or 0))
+        else:
+            g["inteiro"] = (n, f.get("size") or 0)
+    # Alguns repositórios (ex.: Qwen) publicam a mesma quantização inteira E dividida em partes: baixar os dois
+    # dobraria o tamanho. Havendo o arquivo inteiro, ele vale; senão, vale o conjunto de partes.
+    for g in grupos.values():
+        usados = [g["inteiro"]] if g["inteiro"] else g["partes"]
+        g["arquivos"] = [n for n, _ in usados]
+        g["tam"] = sum(t for _, t in usados)
+    itens = sorted(grupos.values(), key=lambda g: g["tam"])
+    for g in itens:
+        g["arquivos"].sort()
+        g["aviso"] = aviso_tamanho(g["tam"], tipo)
+    # recomendado: a quantização preferida que cabe bem na RAM (texto) / o menor completo (imagem)
+    limite = min(_ram_gb() * 0.40, 8.0) * 1e9
+    rec = None
+    if tipo == "texto":
+        for q in PREFERENCIA:
+            rec = next((g for g in itens if g["quant"] == q and g["tam"] <= limite), None)
+            if rec:
+                break
+    elif itens:
+        rec = itens[0] if len(itens) == 1 else next((g for g in itens if g["quant"] in ("Q8_0", "F16")), itens[0])
+    if rec is None and itens:
+        rec = min(itens, key=lambda g: abs(g["tam"] - limite))
+    for g in itens:
+        g["recomendado"] = g is rec
+    return itens
+
+
+# ------------------------------------------------------------------ download
+def _camadas(arquivo: Path) -> int | None:
+    """Lê o número de camadas ('block_count') do cabeçalho do .gguf (usado para dividir CPU/placa com precisão)."""
+    try:
+        with open(arquivo, "rb") as f:
+            if f.read(4) != b"GGUF":
+                return None
+            _ver, _nt, nkv = struct.unpack("<IQQ", f.read(20))
+
+            def le_str():
+                (n,) = struct.unpack("<Q", f.read(8))
+                return f.read(n).decode("utf-8", "ignore")
+
+            tam = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
+
+            def le_valor(t):
+                if t == 8:
+                    return le_str()
+                if t == 9:
+                    (et,) = struct.unpack("<I", f.read(4))
+                    (n,) = struct.unpack("<Q", f.read(8))
+                    if et in tam and et != 8:
+                        f.seek(tam[et] * n, 1)
+                    else:
+                        for _ in range(n):
+                            le_valor(et)
+                    return None
+                n = tam[t]
+                b = f.read(n)
+                return int.from_bytes(b, "little") if t in (0, 1, 2, 3, 4, 5, 10, 11) else None
+
+            for _ in range(nkv):
+                k = le_str()
+                (t,) = struct.unpack("<I", f.read(4))
+                v = le_valor(t)
+                if k.endswith(".block_count") and isinstance(v, int):
+                    return v
+    except (OSError, struct.error, KeyError):
+        return None
+    return None
+
+
+async def _baixa(job: dict, repo: str, tipo: str, nome: str, arquivos_: list[str]) -> None:
+    pasta = _pasta(tipo)
+    pasta.mkdir(parents=True, exist_ok=True)
+    try:
+        for n in arquivos_:
+            destino = pasta / Path(n).name
+            if destino.exists() and destino.stat().st_size > 0:
+                continue
+            parte = destino.with_suffix(".gguf.part")
+            proc = await asyncio.create_subprocess_exec(
+                "curl", "-L", "--fail", "-C", "-", "-o", str(parte), f"{HF}/{repo}/resolve/main/{n}",
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL, start_new_session=True)
+            job["proc"] = proc
+            if await proc.wait() != 0:
+                job["erro"] = "O download falhou (sem internet, ou o arquivo exige login no Hugging Face). Tente de novo."
+                return
+            parte.rename(destino)
+        primeiro = pasta / Path(arquivos_[0]).name
+        total = sum((pasta / Path(n).name).stat().st_size for n in arquivos_)
+        itens = [m for m in lista() if m["id"] != job["id"]]
+        itens.append({"id": job["id"], "nome": nome, "repo": repo, "tipo": tipo, "arquivo": primeiro.name,
+                      "caminho": str(primeiro), "tam": total, "quant": _quant(primeiro.name),
+                      "camadas": _camadas(primeiro) if tipo == "texto" else None})
+        _salva(itens)
+        if job.get("usar_depois") and tipo == "texto":   # pediram "instala e já deixa selecionado"
+            try:
+                await asyncio.to_thread(usar, job["id"])
+                job["selecionado"] = True
+            except Exception as e:   # baixou, mas não deu para trocar sozinho: o modelo fica na lista
+                job["aviso"] = str(e)[:240]
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        job["erro"] = f"{type(e).__name__}: {e}"[:200]
+    finally:
+        job["fim"] = True
+
+
+def baixar(repo: str, arquivos_: list[str], tipo: str = "texto", total: int = 0, usar_depois: bool = False) -> str:
+    if not REPO_RE.match(repo) or not arquivos_ or any(not ARQ_RE.match(a) or ".." in a for a in arquivos_):
+        raise ValueError("Pedido inválido.")
+    id_ = _id(repo, arquivos_[0])
+    atual = _baixando.get(id_)
+    if atual and not atual.get("fim"):
+        return id_
+    pasta = _pasta(tipo)
+    pasta.mkdir(parents=True, exist_ok=True)
+    if total and shutil.disk_usage(pasta).free < total * 1.05:
+        raise ValueError(f"Falta espaço no disco: preciso de uns {total / 1e9:.1f} GB livres.")
+    nome = repo.split("/")[-1].replace("-GGUF", "").replace("_GGUF", "")
+    job = {"id": id_, "repo": repo, "tipo": tipo, "arquivos": [Path(a).name for a in arquivos_], "tam": total,
+           "pasta": pasta, "fim": False, "erro": "", "usar_depois": usar_depois,
+           "selecionado": False, "aviso": ""}
+    job["task"] = asyncio.get_running_loop().create_task(_baixa(job, repo, tipo, nome, arquivos_))
+    _baixando[id_] = job
+    return id_
+
+
+def estado() -> dict:
+    """Downloads em andamento (com progresso) e modelos já adicionados."""
+    andamento = []
+    for id_, j in list(_baixando.items()):
+        feito = 0
+        for n in j["arquivos"]:
+            f = j["pasta"] / n
+            p = f.with_suffix(".gguf.part")
+            feito += f.stat().st_size if f.exists() else (p.stat().st_size if p.exists() else 0)
+        andamento.append({"id": id_, "repo": j["repo"], "tipo": j["tipo"], "progresso": round(min(feito / j["tam"], 1.0), 3) if j["tam"] else 0,
+                          "feito": feito, "tam": j["tam"], "fim": j["fim"], "erro": j["erro"],
+                          "selecionado": j.get("selecionado", False), "aviso": j.get("aviso", "")})
+        if j["fim"] and not j["erro"] and any(m["id"] == id_ for m in lista()):
+            _baixando.pop(id_, None)
+    return {"baixando": andamento, "modelos": lista()}
+
+
+def cancelar(id_: str) -> bool:
+    j = _baixando.get(id_)
+    if not j or j.get("fim"):
+        return False
+    j["task"].cancel()
+    p = j.get("proc")
+    try:
+        if p:
+            p.kill()
+    except ProcessLookupError:
+        pass
+    j["fim"], j["erro"] = True, "Cancelado."
+    return True
+
+
+def apagar(id_: str) -> None:
+    itens = lista()
+    m = next((x for x in itens if x["id"] == id_), None)
+    if not m:
+        raise ValueError("Modelo não encontrado.")
+    pasta = _pasta(m["tipo"])
+    nome = m["arquivo"]
+    mp = PARTE_RE.match(nome)
+    alvos = [nome] if not mp else [p.name for p in pasta.glob(f"{mp.group(1)}-*-of-{mp.group(3)}.gguf")]
+    for a in alvos:
+        (pasta / Path(a).name).unlink(missing_ok=True)
+    _salva([x for x in itens if x["id"] != id_])
+    _baixando.pop(id_, None)
+
+
+def usar(id_: str) -> None:
+    """Texto: passa a usar este modelo (grava modelo.env e reinicia o llama-server). Imagem: já fica na lista."""
+    m = next((x for x in lista() if x["id"] == id_), None)
+    if not m:
+        raise ValueError("Modelo não encontrado.")
+    if not Path(m["caminho"]).exists():
+        raise ValueError("O arquivo do modelo não está mais na pasta.")
+    if m["tipo"] != "texto":
+        return
+    config.MODELO_ENV.parent.mkdir(parents=True, exist_ok=True)
+    extra = f"CAMADAS={m['camadas']}\n" if m.get("camadas") else ""
+    config.MODELO_ENV.write_text(f"MODEL={m['caminho']}\nNGL=auto\n{extra}")
+    try:
+        r = subprocess.run(["sudo", "-n", "systemctl", "restart", "localai-llm.service"],
+                           capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        r = None
+    if r is None or r.returncode != 0:
+        raise RuntimeError("Salvei a escolha, mas não consegui reiniciar o modelo sozinho. "
+                           "Rode no PC: bash atualizar.sh (ele libera essa permissão) ou sudo systemctl restart localai-llm")
+
+
+# ------------------------------------------------------------------ "ache, instale e já deixe selecionado"
+_RUIDO = {"gguf", "modelo", "modelos", "llm", "llms", "ia", "ias", "o", "a", "os", "as", "de", "da", "do", "um", "uma",
+          "pra", "para", "no", "na", "me", "meu", "minha", "the", "model", "hugging", "face", "huggingface"}
+_QUANT_PEDIDA = re.compile(r"(?i)(?<![\w.])(iq\d_\w+|q\d(?:_k)?(?:_[sml01])?|bf16|f16)(?![\w.])")
+
+
+def separa_pedido(q: str) -> tuple[str, str]:
+    """('qwen2.5 coder 14b q5_k_m') -> ('qwen2.5 coder 14b', 'Q5_K_M'). Links e 'dono/repo:Q4_K_M' ficam como estão."""
+    q = q.strip()
+    if _repo_de(q):
+        return q.split(":")[0] if not q.startswith("http") else q, (q.split(":")[1].upper() if ":" in q and not q.startswith("http") else "")
+    m = _QUANT_PEDIDA.search(q)
+    quant = m.group(1).upper() if m else ""
+    if m:
+        q = (q[:m.start()] + " " + q[m.end():]).strip()
+    return re.sub(r"\s+", " ", q), quant
+
+
+def _tokens(q: str) -> list[str]:
+    return [t for t in re.split(r"[^a-z0-9.]+", q.lower()) if t and t not in _RUIDO]
+
+
+def _pontua(repo: str, tokens: list[str]) -> float:
+    r = repo.lower()
+    return sum(t in r for t in tokens) / len(tokens) if tokens else 0.0
+
+
+def escolhe_repo(candidatos: list[dict], q: str) -> tuple[dict | None, bool]:
+    """Entre os resultados da busca, o que contém TODAS as palavras do pedido e tem mais downloads.
+    Se nenhum contém todas, devolve o que casa mais (aproximado=True)."""
+    tk = _tokens(q)
+    if not candidatos:
+        return None, False
+    pont = [(_pontua(c["repo"], tk), c.get("downloads", 0), c) for c in candidatos]
+    completos = [p for p in pont if p[0] >= 0.999]
+    if completos:
+        return max(completos, key=lambda p: p[1])[2], False
+    return max(pont, key=lambda p: (p[0], p[1]))[2], True
+
+
+def _escolhe_arquivo(itens: list[dict], quant: str) -> dict | None:
+    if quant:
+        q = next((g for g in itens if g["quant"] == quant), None) or \
+            next((g for g in itens if g["quant"].startswith(quant)), None)
+        if q:
+            return q
+    return next((g for g in itens if g.get("recomendado")), itens[0] if itens else None)
+
+
+async def instalar_e_usar(pedido: str, tipo: str = "texto") -> dict:
+    """Acha o modelo pelo nome, escolhe a versão que cabe no PC, baixa e, ao terminar, deixa selecionado.
+
+    Devolve {estado: 'baixando'|'pronto', repo, arquivo, tam, aviso, alternativas, aproximado, quant_pedida_ok}.
+    Se o modelo já estava baixado, só passa a usá-lo (estado 'pronto')."""
+    nome, quant = separa_pedido(pedido)
+    if not nome:
+        raise ValueError("Diga o nome do modelo que você quer (por exemplo: qwen2.5 coder 7b).")
+    resultados = await buscar(nome, tipo, limite=30)
+    if not resultados:
+        raise ValueError(f"Não achei nada no Hugging Face para \"{nome}\".")
+    repo, aproximado = escolhe_repo(resultados, nome)
+    alternativas = [r["repo"] for r in resultados if r["repo"] != repo["repo"]][:3]
+    itens = await arquivos(repo["repo"], tipo)
+    if not itens:
+        raise ValueError(f"{repo['repo']} não tem arquivo .gguf para baixar.")
+    g = _escolhe_arquivo(itens, quant)
+    primeiro = Path(g["arquivos"][0]).name
+    info = {"repo": repo["repo"], "arquivo": g["nome"], "quant": g["quant"], "tam": g["tam"], "aviso": g["aviso"],
+            "alternativas": alternativas, "aproximado": aproximado, "quant_pedida_ok": (not quant) or g["quant"].startswith(quant)}
+    ja = next((m for m in lista() if m["repo"] == repo["repo"] and m["arquivo"] == primeiro
+               and Path(m["caminho"]).exists() and m["tipo"] == tipo), None)
+    if ja:
+        await asyncio.to_thread(usar, ja["id"])
+        return {**info, "estado": "pronto", "id": ja["id"]}
+    id_ = baixar(repo["repo"], g["arquivos"], tipo, g["tam"], usar_depois=True)
+    return {**info, "estado": "baixando", "id": id_}
+
+
+def acha_instalado(pedido: str) -> dict | None:
+    """Procura, entre o que já está no PC (perfis e modelos adicionados), o que casa com o pedido."""
+    import perfis
+    tk = _tokens(separa_pedido(pedido)[0])
+    if not tk:
+        return None
+    melhor, pts = None, 0.0
+    for id_, p in perfis.PERFIS.items():
+        if perfis.presente(p):
+            v = _pontua(f"{p['nome']} {p['modelo']} {p['arquivo']}", tk)
+            if v > pts:
+                melhor, pts = {"id": id_, "nome": p["modelo"], "perfil": True}, v
+    for m in lista():
+        if m["tipo"] == "texto" and Path(m["caminho"]).exists():
+            v = _pontua(f"{m['nome']} {m['repo']} {m['arquivo']}", tk)
+            if v > pts:
+                melhor, pts = {"id": m["id"], "nome": m["nome"], "perfil": False}, v
+    return melhor if pts >= 0.999 else None
+EOF
+  cat > agente.py <<'EOF'
+"""Entende pedidos em linguagem livre e executa (sem frases fixas): trocar, achar e instalar modelos de IA.
+
+Fluxo: um filtro barato decide se a mensagem PODE ser um comando sobre modelos de IA; só então a própria IA local
+interpreta o pedido (JSON curto). Se ela estiver desligada ou reiniciando, regras simples fazem o mesmo.
+Mensagens que não são comandos seguem a conversa normal (devolve None).
+"""
+import json
+import re
+
+import httpx
+
+import config
+import modelos
+import perfis
+
+# a mensagem fala de modelos de IA (palavra genérica ou nome de família conhecida)...
+ASSUNTO = re.compile(r"(?i)\b(modelos?|llms?|gguf|hugging ?face|ias?|llama|qwen|mistral|mixtral|gemma|phi|deepseek|"
+                     r"granite|smollm|olmo|falcon|starcoder|codestral|nemotron|hermes|dolphin|tinyllama|yi|solar|"
+                     r"stable ?diffusion|sdxl|flux)\b")
+# ...e pede uma ação
+ACAO = re.compile(r"(?i)\b(instal\w*|baix\w*|coloc\w*|bot[ae]\w*|troc\w*|mud\w*|us(?:e|ar|a|ando)|ativ\w*|selecion\w*|"
+                  r"test\w*|carreg\w*|quero|queria|procur\w*|ach\w*|busc\w*|traz\w*|pega\w*|trabalh\w*|lista\w*|mostr\w*|"
+                  r"quais|qual)\b")
+FILLER = {"instala", "instale", "instalar", "baixa", "baixe", "baixar", "coloca", "coloque", "colocar", "bota", "bote",
+          "botar", "troca", "troque", "trocar", "muda", "mude", "mudar", "usa", "use", "usar", "ativa", "ative", "ativar",
+          "seleciona", "selecione", "selecionar", "testa", "teste", "testar", "carrega", "carregue", "carregar", "quero",
+          "queria", "procura", "procure", "procurar", "acha", "ache", "achar", "busca", "busque", "buscar", "traz", "traga",
+          "pega", "pegue", "pegar", "agora", "aí", "ai", "por", "favor", "pf", "pfv", "eu", "pra", "para", "que", "esse",
+          "este", "essa", "esta", "aquele", "aquela", "meu", "minha", "no", "na", "de", "da", "do", "um", "uma", "o", "a",
+          "os", "as", "e", "ou", "modelo", "modelos", "llm", "llms", "ia", "ias", "online", "internet", "hugging", "face",
+          "huggingface", "gguf", "já", "ja", "deixa", "deixe", "deixar", "selecionado", "selecionada", "testando", "teste"}
+
+SISTEMA = (
+    "Você decide se a mensagem do usuário é um PEDIDO para gerenciar modelos de IA neste computador. "
+    "Responda SOMENTE um JSON: {\"acao\": ..., \"consulta\": ..., \"tipo\": ...}.\n"
+    "acao: \"instalar_modelo\" (achar na internet/baixar/instalar/testar um modelo que talvez não esteja no PC), "
+    "\"usar_modelo\" (trocar para um modelo já instalado), \"listar_modelos\" (ver o que está instalado ou em uso), "
+    "\"nenhuma\" (qualquer outra coisa: perguntas sobre IA, conversa, explicações).\n"
+    "consulta: o nome do modelo como se digitaria numa busca (ex.: \"qwen2.5 coder 14b\"), sem verbos nem enfeites; "
+    "vazio se não houver.\n"
+    "tipo: \"texto\" (conversa/código) ou \"imagem\" (gera imagens, ex.: stable diffusion).\n"
+    "Exemplos:\n"
+    "\"bota o qwen coder de 14b pra eu testar\" -> {\"acao\":\"instalar_modelo\",\"consulta\":\"qwen2.5 coder 14b\",\"tipo\":\"texto\"}\n"
+    "\"quero testar o deepseek r1 pequeno\" -> {\"acao\":\"instalar_modelo\",\"consulta\":\"deepseek r1 distill 7b\",\"tipo\":\"texto\"}\n"
+    "\"volta pro modelo rápido\" -> {\"acao\":\"usar_modelo\",\"consulta\":\"rápido\",\"tipo\":\"texto\"}\n"
+    "\"que modelos eu tenho?\" -> {\"acao\":\"listar_modelos\",\"consulta\":\"\",\"tipo\":\"texto\"}\n"
+    "\"o que é um LLM?\" -> {\"acao\":\"nenhuma\",\"consulta\":\"\",\"tipo\":\"texto\"}"
+)
+ACOES = {"instalar_modelo", "usar_modelo", "listar_modelos", "nenhuma"}
+
+
+def parece_comando(msg: str) -> bool:
+    return 3 <= len(msg) <= 400 and bool(ASSUNTO.search(msg)) and bool(ACAO.search(msg))
+
+
+def heuristica(msg: str) -> dict:
+    """Plano B sem IA: tira os verbos e enfeites e fica com o nome do modelo."""
+    if re.search(r"(?i)\b(que|quais|qual)\b.*\bmodelos?\b.*\b(tenho|tem|instalad\w+|uso|usando)\b|"
+                 r"\b(lista\w*|mostr\w*)\b.*\bmodelos?\b", msg):
+        return {"acao": "listar_modelos", "consulta": "", "tipo": "texto"}
+    if msg.strip().endswith("?"):   # pergunta, não pedido
+        return {"acao": "nenhuma", "consulta": "", "tipo": "texto"}
+    palavras = [p for p in re.split(r"[^\w.\-/:+]+", msg) if p]
+    resto = [p for p in palavras if p.lower() not in FILLER]
+    tipo = "imagem" if re.search(r"(?i)stable ?diffusion|sdxl|flux|imagens?", msg) else "texto"
+    if not resto or not ACAO.search(msg):
+        return {"acao": "nenhuma", "consulta": "", "tipo": "texto"}
+    return {"acao": "instalar_modelo", "consulta": " ".join(resto), "tipo": tipo}
+
+
+async def interpreta(msg: str) -> dict:
+    payload = {"messages": [{"role": "system", "content": SISTEMA}, {"role": "user", "content": msg}],
+               "temperature": 0, "max_tokens": 120, "cache_prompt": True,
+               "response_format": {"type": "json_object"}}
+    try:
+        async with httpx.AsyncClient(timeout=25) as c:
+            r = await c.post(f"{config.LLAMA_URL}/v1/chat/completions", json=payload)
+        r.raise_for_status()
+        txt = r.json()["choices"][0]["message"]["content"]
+        j = json.loads(txt[txt.index("{"):txt.rindex("}") + 1])
+        if j.get("acao") in ACOES:
+            return {"acao": j["acao"], "consulta": str(j.get("consulta") or "")[:120].strip(),
+                    "tipo": "imagem" if j.get("tipo") == "imagem" else "texto"}
+    except Exception:
+        pass
+    return heuristica(msg)
+
+
+def _gb(n: int) -> str:
+    return f"{n / 1e9:.1f} GB".replace(".", ",")
+
+
+async def _instalar(consulta: str, tipo: str) -> str:
+    try:
+        r = await modelos.instalar_e_usar(consulta, tipo)
+    except ValueError as e:
+        return f"Não consegui: {e}"
+    except httpx.HTTPError:
+        return "Não consegui falar com o Hugging Face agora. O PC está sem internet?"
+    linhas = []
+    nome = f"**{r['repo']}**" + (f" ({r['quant']}, {_gb(r['tam'])})" if r["quant"] else f" ({_gb(r['tam'])})")
+    if r["aproximado"]:
+        linhas.append(f"Não achei um modelo com exatamente esse nome; o mais parecido foi {nome}.")
+    else:
+        linhas.append(f"Achei {nome}.")
+    if not r["quant_pedida_ok"]:
+        linhas.append("Essa versão (quantização) não existe nesse repositório; escolhi a que cabe melhor no seu PC.")
+    if r["aviso"]:
+        linhas.append(f"⚠ {r['aviso']}")
+    if r["estado"] == "pronto":
+        linhas.append("Já estava baixado: passei a usar agora. O modelo recarrega em alguns minutos; é só testar depois.")
+    elif tipo == "imagem":
+        linhas.append("Estou baixando; quando terminar ele aparece na lista de modelos de imagem. "
+                      "Acompanhe em ⚙ Configurações › Modelo de IA.")
+    else:
+        linhas.append("Estou baixando agora. Quando terminar, **deixo selecionado e reinicio o modelo** para você testar "
+                      "(a conversa fica indisponível por alguns minutos nessa troca). Acompanhe em ⚙ Configurações › Modelo de IA.")
+    if r["alternativas"]:
+        linhas.append("Se não era esse, diga o nome exato ou cole o link do Hugging Face. Outros que apareceram: "
+                      + ", ".join(r["alternativas"]) + ".")
+    return "\n\n".join(linhas)
+
+
+async def _usar(consulta: str, tipo: str) -> str:
+    import asyncio
+    achado = modelos.acha_instalado(consulta)
+    if not achado:
+        return "Esse eu não tenho instalado. " + await _instalar(consulta, tipo)
+    try:
+        if achado["perfil"]:
+            await asyncio.to_thread(perfis.seleciona, achado["id"])
+        else:
+            await asyncio.to_thread(modelos.usar, achado["id"])
+    except (ValueError, RuntimeError) as e:
+        return f"Não consegui trocar: {e}"
+    return f"Troquei para **{achado['nome']}**. O modelo recarrega em alguns minutos; é só testar depois."
+
+
+def _lista() -> str:
+    atual = perfis._le_env().get("MODEL", "")
+    from pathlib import Path
+    em_uso = Path(atual).name if atual else ""
+    linhas = []
+    for p in perfis.lista():
+        if p["presente"]:
+            linhas.append(f"- {p['modelo']} ({p['nome']})" + (" ← em uso" if p["id"] == perfis.atual() else ""))
+    for m in modelos.lista():
+        if m["tipo"] == "texto":
+            linhas.append(f"- {m['nome']} ({m.get('quant') or '?'}, {_gb(m['tam'])})" + (" ← em uso" if m["arquivo"] == em_uso else ""))
+    return "Modelos de texto instalados:\n" + ("\n".join(linhas) if linhas else "- nenhum") + \
+        "\n\nPara trazer outro, é só pedir: por exemplo, \"instala o gemma 3 4b\"."
+
+
+async def tenta(msg: str) -> str | None:
+    """Se a mensagem é um comando sobre modelos, executa e devolve a resposta; senão, None (conversa normal)."""
+    if not parece_comando(msg):
+        return None
+    it = await interpreta(msg)
+    if it["acao"] == "instalar_modelo" and it["consulta"]:
+        return await _instalar(it["consulta"], it["tipo"])
+    if it["acao"] == "usar_modelo" and it["consulta"]:
+        return await _usar(it["consulta"], it["tipo"])
+    if it["acao"] == "listar_modelos":
+        return _lista()
+    return None
+EOF
+  cat > visao.py <<'EOF'
+"""Visão: descreve uma imagem (a foto do usuário, imagens anexadas) com um modelo que enxerga.
+
+O modelo (Qwen2.5-VL 3B) é baixado na primeira vez. A análise sobe uma segunda cópia do llama-server só com ele,
+na CPU (a placa fica para o modelo de conversa), e a desliga em seguida: nada fica ocupando memória depois.
+"""
+import asyncio
+import base64
+import io
+import os
+import time
+
+import httpx
+
+import config
+import modelos
+import recursos
+
+PROMPT_FOTO = (
+    "Esta é uma foto do próprio usuário, que a enviou para a IA saber como ele é. Descreva em português do Brasil, "
+    "em 3 a 5 frases, apenas o que dá para ver: cabelo (cor, comprimento, estilo), barba ou bigode, óculos, faixa etária "
+    "aparente, expressão, roupa, acessórios e o fundo. Não adivinhe nome, etnia ou raça, saúde, religião, orientação ou "
+    "qualquer coisa que não esteja visível. Se não houver uma pessoa na foto, diga só isso."
+)
+
+
+def arquivos() -> tuple[str, str] | None:
+    pasta = config.MODELS_DIR / "visao"
+    m, p = (pasta / n for n in config.VISAO_ARQUIVOS)
+    return (str(m), str(p)) if m.exists() and p.exists() else None
+
+
+def pronto() -> bool:
+    return arquivos() is not None
+
+
+def baixar() -> str | None:
+    """Começa o download do modelo de visão (se ainda não existe). Devolve o id do download, ou None se já está pronto."""
+    if pronto():
+        return None
+    return modelos.baixar(config.VISAO_REPO, config.VISAO_ARQUIVOS, "visao", config.VISAO_TAM)
+
+
+def progresso() -> dict | None:
+    for j in modelos.estado()["baixando"]:
+        if j["tipo"] == "visao":
+            return j
+    return None
+
+
+def _jpeg_pequeno(caminho, maximo: int = 896) -> str:
+    """A imagem reduzida (lado maior 896 px) em base64: foto de celular em tamanho cheio deixaria a análise lentíssima."""
+    from PIL import Image, ImageOps
+    with Image.open(caminho) as im:
+        im = ImageOps.exif_transpose(im).convert("RGB")
+        im.thumbnail((maximo, maximo))
+        buf = io.BytesIO()
+        im.save(buf, "JPEG", quality=88)
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+async def descreve(caminho, prompt: str = PROMPT_FOTO, espera_max: int = 240) -> str:
+    """Descreve a imagem. Levanta RuntimeError com uma mensagem em português se algo falhar."""
+    arq = arquivos()
+    if not arq:
+        raise RuntimeError("O modelo de visão ainda não foi baixado.")
+    if not config.LLAMA_SERVER_BIN.exists():
+        raise RuntimeError("Não achei o llama-server. Rode no PC: bash atualizar.sh")
+    b64 = await asyncio.to_thread(_jpeg_pequeno, caminho)
+    async with recursos.pesado:
+        recursos.garante_ram(4500, "analisar a imagem")
+        porta = config.VISAO_PORTA
+        proc = await asyncio.create_subprocess_exec(
+            str(config.LLAMA_SERVER_BIN), "-m", arq[0], "--mmproj", arq[1], "--host", "127.0.0.1", "--port", str(porta),
+            "-ngl", "0", "-c", "4096", "-t", str(recursos.nucleos_fisicos()),
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL, start_new_session=True)
+        try:
+            url = f"http://127.0.0.1:{porta}"
+            limite = time.time() + 180
+            async with httpx.AsyncClient(timeout=10) as c:
+                while True:
+                    if proc.returncode is not None:
+                        raise RuntimeError("O modelo de visão não iniciou (versão do llama.cpp sem suporte a imagens?). "
+                                           "Rode no PC: bash atualizar.sh")
+                    try:
+                        if (await c.get(f"{url}/health")).status_code == 200:
+                            break
+                    except httpx.HTTPError:
+                        pass
+                    if time.time() > limite:
+                        raise RuntimeError("O modelo de visão demorou demais para carregar.")
+                    await asyncio.sleep(1.5)
+            corpo = {"messages": [{"role": "user", "content": [
+                         {"type": "text", "text": prompt},
+                         {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + b64}}]}],
+                     "temperature": 0.1, "max_tokens": 350}
+            async with httpx.AsyncClient(timeout=espera_max) as c:
+                r = await c.post(f"{url}/v1/chat/completions", json=corpo)
+            if r.status_code != 200:
+                raise RuntimeError(f"O modelo de visão respondeu com erro {r.status_code}.")
+            return r.json()["choices"][0]["message"]["content"].strip()
+        except httpx.TimeoutException:
+            raise RuntimeError("A análise da imagem demorou demais.")
+        finally:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            await proc.wait()
+EOF
+  cat > perfil.py <<'EOF'
+"""Perfil do usuário: nome e foto. A IA descreve a foto uma vez (modelo de visão) e usa essa descrição para saber
+quem ele é e como é. Tudo fica só neste PC, em ~/localai/perfil, e pode ser corrigido ou apagado pela tela."""
+import asyncio
+import json
+import time
+from pathlib import Path
+
+import config
+import visao
+
+ARQ = lambda: config.PERFIL_DIR / "perfil.json"   # noqa: E731
+EXT = {".jpg", ".jpeg", ".png", ".webp"}
+_tarefa: asyncio.Task | None = None
+PADRAO = {"nome": "", "descricao": "", "foto": "", "estado": "vazio", "erro": ""}
+
+
+def le() -> dict:
+    try:
+        return {**PADRAO, **json.loads(ARQ().read_text())}
+    except (OSError, ValueError):
+        return dict(PADRAO)
+
+
+def _grava(p: dict) -> None:
+    config.PERFIL_DIR.mkdir(parents=True, exist_ok=True)
+    ARQ().write_text(json.dumps(p, ensure_ascii=False, indent=1))
+
+
+def _muda(**kw) -> dict:
+    p = {**le(), **kw}
+    _grava(p)
+    return p
+
+
+def estado() -> dict:
+    p = le()
+    ocupado = _tarefa is not None and not _tarefa.done()
+    if p["estado"] in ("baixando_visao", "descrevendo") and not ocupado:   # o servidor reiniciou no meio
+        p["estado"], p["erro"] = "interrompido", "A análise foi interrompida. Toque em \"Analisar de novo\"."
+    out = {"nome": p["nome"], "descricao": p["descricao"], "tem_foto": bool(p["foto"]) and Path(p["foto"]).exists(),
+           "estado": p["estado"], "erro": p["erro"], "progresso": None}
+    if p["estado"] == "baixando_visao":
+        j = visao.progresso()
+        out["progresso"] = j["progresso"] if j else None
+    return out
+
+
+def define_nome(nome: str) -> None:
+    _muda(nome=nome.strip()[:60])
+
+
+def define_descricao(txt: str) -> None:
+    _muda(descricao=txt.strip()[:1200], estado="pronto" if txt.strip() else le()["estado"], erro="")
+
+
+def caminho_foto() -> Path | None:
+    f = le()["foto"]
+    return Path(f) if f and Path(f).exists() else None
+
+
+def salva_foto(dados: bytes, ext: str) -> None:
+    ext = ext.lower()
+    if ext not in EXT:
+        raise ValueError("Use uma foto .jpg, .png ou .webp.")
+    if len(dados) > 25 * 1024 * 1024:
+        raise ValueError("A foto é grande demais (máximo 25 MB).")
+    config.PERFIL_DIR.mkdir(parents=True, exist_ok=True)
+    antiga = caminho_foto()
+    destino = config.PERFIL_DIR / f"foto-{int(time.time())}{ext}"
+    destino.write_bytes(dados)
+    if antiga and antiga != destino:
+        antiga.unlink(missing_ok=True)
+    _muda(foto=str(destino), descricao="", estado="descrevendo", erro="")
+
+
+def apaga() -> None:
+    f = caminho_foto()
+    if f:
+        f.unlink(missing_ok=True)
+    _grava(dict(PADRAO))
+
+
+def contexto() -> str:
+    """Texto para o prompt do sistema; vazio se o usuário não preencheu nada."""
+    p = le()
+    partes = []
+    if p["nome"]:
+        partes.append(f"O nome do usuário é {p['nome']}.")
+    if p["descricao"]:
+        partes.append(f"Aparência do usuário (descrita a partir da foto que ele mesmo enviou): {p['descricao']}")
+    return ("Sobre o usuário: " + " ".join(partes) + " Use isso com naturalidade, sem repetir sem necessidade.") if partes else ""
+
+
+async def _analisa() -> None:
+    try:
+        foto = caminho_foto()
+        if not foto:
+            _muda(estado="vazio", erro="")
+            return
+        if not visao.pronto():
+            _muda(estado="baixando_visao", erro="")
+            try:
+                visao.baixar()
+            except ValueError as e:
+                _muda(estado="erro", erro=str(e))
+                return
+            while not visao.pronto():
+                j = visao.progresso()
+                if j is None or j.get("erro"):
+                    _muda(estado="erro", erro=(j or {}).get("erro") or "O download do modelo de visão não terminou. Tente de novo.")
+                    return
+                await asyncio.sleep(3)
+        _muda(estado="descrevendo", erro="")
+        texto = await visao.descreve(foto)
+        if caminho_foto() == foto:   # a foto não foi trocada enquanto analisava
+            _muda(descricao=texto, estado="pronto", erro="")
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        _muda(estado="erro", erro=str(e)[:240])
+
+
+def analisar() -> None:
+    """Começa (ou recomeça) a análise da foto em segundo plano."""
+    global _tarefa
+    if _tarefa is not None and not _tarefa.done():
+        return
+    if not caminho_foto():
+        raise ValueError("Envie uma foto primeiro.")
+    _muda(estado="descrevendo", erro="")
+    _tarefa = asyncio.get_running_loop().create_task(_analisa())
+EOF
+  cat > placa.py <<'EOF'
+"""Placa de vídeo AMD (driver amdgpu): leitura e controle da ventoinha pelo /sys, sem programas extras.
+
+Para NVIDIA o servidor usa nvidia-smi/NVML; aqui fica o equivalente para AMD (ex.: RX 580). Se houver mais de uma
+AMD (a gráfica integrada do Ryzen e a placa dedicada), vale a de maior VRAM, que é a placa dedicada.
+Controle da ventoinha: pwm1_enable = 1 (manual) / 2 (automático da placa) e pwm1 de 0 a 255; precisa de root.
+"""
+import glob
+import os
+from pathlib import Path
+
+RAIZ = "/sys/class/drm"
+AMD = "0x1002"
+
+
+def _ler(p: Path) -> str | None:
+    try:
+        return p.read_text().strip()
+    except OSError:
+        return None
+
+
+def _int(p: Path) -> int | None:
+    v = _ler(p)
+    try:
+        return int(v) if v is not None else None
+    except ValueError:
+        return None
+
+
+class PlacaAmd:
+    def __init__(self, dev: Path):
+        self.dev = Path(dev)
+        hw = sorted(glob.glob(str(self.dev / "hwmon" / "hwmon*")))
+        self.hw = Path(hw[0]) if hw else None
+        self.metodo = None
+        self.erro = ""
+        self._manual = False
+
+    # ---- leitura
+    def nome(self) -> str:
+        return _ler(self.dev / "product_name") or "AMD Radeon"
+
+    def temp(self) -> float:
+        if self.hw:
+            for f in ("temp1_input", "temp2_input"):
+                v = _int(self.hw / f)
+                if v is not None:
+                    return v / 1000
+        raise OSError("sem sensor de temperatura da placa AMD")
+
+    def uso(self) -> float | None:
+        v = _int(self.dev / "gpu_busy_percent")
+        return None if v is None else float(v)
+
+    def vram_mb(self) -> tuple[int, int] | None:
+        """(usada, total) em MiB."""
+        t, u = _int(self.dev / "mem_info_vram_total"), _int(self.dev / "mem_info_vram_used")
+        return None if t is None else ((u or 0) // 1048576, t // 1048576)
+
+    def vram_livre_mb(self) -> int | None:
+        v = self.vram_mb()
+        return None if v is None else max(0, v[1] - v[0])
+
+    def ventoinha_pct(self) -> float | None:
+        if not self.hw:
+            return None
+        pwm = _int(self.hw / "pwm1")
+        if pwm is not None:
+            return round(100 * pwm / 255, 1)
+        rpm, mx = _int(self.hw / "fan1_input"), _int(self.hw / "fan1_max")
+        return round(100 * rpm / mx, 1) if rpm is not None and mx else None
+
+    def watts(self) -> float | None:
+        if self.hw:
+            for f in ("power1_average", "power1_input"):
+                v = _int(self.hw / f)
+                if v is not None:
+                    return round(v / 1e6, 1)
+        return None
+
+    def resumo(self) -> dict:
+        v = self.vram_mb()
+        try:
+            t = round(self.temp(), 1)
+        except OSError:
+            t = None
+        return {"nome": self.nome(), "temp": t, "uso": self.uso(), "mem_usada": v[0] if v else None,
+                "mem_total": v[1] if v else None, "ventoinha": self.ventoinha_pct(), "watts": self.watts()}
+
+    # ---- ventoinha (mesma interface do GpuNvidia do fanctl)
+    def definir(self, pct) -> None:
+        if not self.hw or not (self.hw / "pwm1_enable").exists():
+            self.metodo, self.erro = None, "esta placa AMD não expõe controle de ventoinha (pwm1)"
+            raise RuntimeError(self.erro)
+        try:
+            if not self._manual:
+                (self.hw / "pwm1_enable").write_text("1")   # 1 = manual
+                self._manual = True
+            lo, hi = _int(self.hw / "pwm1_min"), _int(self.hw / "pwm1_max")
+            valor = round(255 * max(0, min(100, pct)) / 100)
+            valor = max(lo or 0, min(hi if hi else 255, valor))
+            (self.hw / "pwm1").write_text(str(valor))
+            if self.metodo != "amdgpu":
+                print("[fanctl] GPU: controle da ventoinha via amdgpu (sysfs)", flush=True)
+            self.metodo, self.erro = "amdgpu", ""
+        except OSError as e:
+            self.metodo, self.erro = None, str(e)[:160]
+            raise RuntimeError(f"Não consegui controlar a ventoinha da placa AMD: {e}")
+
+    def restaurar(self) -> None:
+        """Devolve a ventoinha ao controle automático da placa."""
+        if self.hw and self._manual:
+            try:
+                (self.hw / "pwm1_enable").write_text("2")   # 2 = automático
+            except OSError as e:
+                print(f"[fanctl] aviso ao restaurar a GPU: {e}", flush=True)
+        self._manual = False
+        self.metodo = None
+
+
+def acha_amd(raiz: str = RAIZ) -> PlacaAmd | None:
+    melhor, tam = None, -1
+    for c in sorted(glob.glob(f"{raiz}/card[0-9]*")):
+        dev = Path(c) / "device"
+        if _ler(dev / "vendor") != AMD:
+            continue
+        t = _int(dev / "mem_info_vram_total")
+        if t is not None and t > tam:
+            melhor, tam = dev, t
+    return PlacaAmd(melhor) if melhor else None
+
+
+def fabricante(raiz: str = RAIZ) -> str | None:
+    import shutil
+    if acha_amd(raiz):
+        return "amd"
+    return "nvidia" if shutil.which("nvidia-smi") else None
+EOF
+  cat > video.py <<'EOF'
+"""Vídeo curto a partir de texto, 100% local (Wan 2.1 pelo stable-diffusion.cpp).
+
+Na CPU de 4 núcleos, um clipe de ~1 s (320x192) leva de 15 a 25 minutos. Por isso o trabalho roda em segundo
+plano no servidor: se o celular desconectar, ele continua; o app volta a acompanhar em /video/seguir e o
+resultado também fica na lista de arquivos criados. Só um por vez (junto com apps, firmware e imagens).
+Não há filtro nosso; o modelo é o oficial, sem alterações.
+"""
+import asyncio
+import json
+import os
+import random
+import shutil
+import signal
+import sys
+import time
+import uuid
+from pathlib import Path
+
+import androidgen
+import config
+import entregas
+import imagens
+import recursos
+
+RESOLUCOES = {"320x192": (320, 192), "192x320": (192, 320), "480x272": (480, 272)}
+QUADROS = (9, 17, 33)          # o Wan exige 4n+1 quadros
+NEGATIVO = ("static, blurry, low quality, worst quality, jpeg artifacts, deformed, extra fingers, "
+            "watermark, text, subtitles, overexposed")
+_download: asyncio.Task | None = None
+_job: dict | None = None        # {"eventos": [...], "fim": bool, "task": Task, "descricao": str, "estado": {...}}
+_cond: asyncio.Condition | None = None
+
+
+# ------------------------------------------------------------------ modelos (download)
+def _faltam() -> list[dict]:
+    return [m for m in config.VIDEO_ARQUIVOS.values()
+            if not (m["arquivo"].exists() and m["arquivo"].stat().st_size >= m["tam"] * 0.999)]
+
+
+def presente() -> bool:
+    return not _faltam()
+
+
+def ffmpeg() -> str | None:
+    exe = shutil.which("ffmpeg")
+    if exe:
+        return exe
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+
+
+def estado() -> dict:
+    total = sum(m["tam"] for m in config.VIDEO_ARQUIVOS.values())
+    feito = 0
+    for m in config.VIDEO_ARQUIVOS.values():
+        f, parte = m["arquivo"], m["arquivo"].with_suffix(m["arquivo"].suffix + ".part")
+        if f.exists():
+            feito += min(f.stat().st_size, m["tam"])
+        elif parte.exists():
+            feito += parte.stat().st_size
+    baixando = _download is not None and not _download.done()
+    return {"presente": presente(), "baixando": baixando, "progresso": round(min(feito / total, 1.0), 3),
+            "tam": total, "motor": imagens.motor_instalado(), "ffmpeg": ffmpeg() is not None}
+
+
+async def _baixa() -> None:
+    for m in _faltam():
+        m["arquivo"].parent.mkdir(parents=True, exist_ok=True)
+        parte = m["arquivo"].with_suffix(m["arquivo"].suffix + ".part")
+        proc = await asyncio.create_subprocess_exec(
+            "curl", "-L", "--fail", "-C", "-", "-o", str(parte), m["url"],
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL, start_new_session=True)
+        if await proc.wait() == 0 and parte.exists() and parte.stat().st_size >= m["tam"] * 0.999:
+            parte.rename(m["arquivo"])
+        else:
+            return
+
+
+def baixar() -> None:
+    global _download
+    if presente() or (_download is not None and not _download.done()):
+        return
+    pasta = next(iter(config.VIDEO_ARQUIVOS.values()))["arquivo"].parent
+    pasta.mkdir(parents=True, exist_ok=True)
+    if shutil.disk_usage(pasta).free < 5.5e9:
+        raise ValueError("Falta espaço no disco: preciso de uns 6 GB livres para o modelo de vídeo.")
+    _download = asyncio.get_running_loop().create_task(_baixa())
+
+
+# ------------------------------------------------------------------ geração
+def _estimativa_min(largura: int, altura: int, quadros: int, passos: int) -> int:
+    """Estimativa grosseira para a CPU (medida num PC de 4 núcleos): difusão + decodificação + leitura do texto."""
+    f = (largura * altura * quadros) / (320 * 192 * 17)
+    seg = 53 * passos * f ** 1.1 + 270 * f + 90
+    return max(1, round(seg / 60))
+
+
+async def _roda_worker(cfg: dict, emit) -> tuple[bool, str]:
+    cmd = recursos.baixa_prioridade([sys.executable, str(Path(__file__).with_name("vidgen.py"))])
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        start_new_session=True)
+    proc.stdin.write(json.dumps(cfg).encode())
+    await proc.stdin.drain()
+    proc.stdin.close()
+    erro, fase, fixo_dec = "", 1, 270 * (cfg["largura"] * cfg["altura"] * cfg["quadros"]) / (320 * 192 * 17)
+    try:
+        async for linha in proc.stdout:
+            try:
+                ev = json.loads(linha)
+            except ValueError:
+                continue
+            if ev.get("tipo") == "passo":
+                i, n, seg = ev["passo"], ev["total"], ev.get("seg", 0)
+                if fase == 1 and i == n and n == cfg["passos"]:
+                    fase = 2                      # terminou a difusão; os próximos "passos" são a decodificação
+                    await emit({"type": "status", "msg": "Montando os quadros do vídeo (decodificação)…"})
+                    continue
+                if fase == 1:
+                    resta = (n - i) * seg + fixo_dec if seg else None
+                    txt = f"Gerando o vídeo… passo {i} de {n}"
+                    if resta:
+                        txt += f" · faltam uns {max(1, round(resta / 60))} min"
+                    await emit({"type": "passo", "passo": i, "total": n, "msg": txt})
+            elif ev.get("tipo") == "erro":
+                erro = ev.get("msg", "")
+        await proc.wait()
+    except asyncio.CancelledError:  # o usuário clicou em Parar
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        raise
+    return proc.returncode == 0, erro
+
+
+def _junta_mp4(pasta: Path, saida: Path) -> bool:
+    import subprocess
+    exe = ffmpeg()
+    if not exe:
+        return False
+    r = subprocess.run(recursos.baixa_prioridade([
+        exe, "-y", "-framerate", str(config.VIDEO_FPS), "-i", str(pasta / "q%04d.png"), "-c:v", "libx264",
+        "-pix_fmt", "yuv420p", "-crf", "20", "-movflags", "+faststart", str(saida)]), capture_output=True, timeout=300)
+    return r.returncode == 0 and saida.exists()
+
+
+async def gera_video(descricao: str, tamanho: str, quadros: int, passos: int, melhorar: bool, emit) -> None:
+    if not imagens.motor_instalado():
+        await emit({"type": "error", "msg": "O motor de imagens/vídeo não está instalado. Rode: bash atualizar.sh"})
+        return
+    if not presente():
+        await emit({"type": "error", "msg": "Falta baixar o modelo de vídeo (uns 5 GB). Use o botão de baixar abaixo.",
+                    "precisa_modelo_video": True})
+        return
+    if ffmpeg() is None:
+        await emit({"type": "error", "msg": "Falta o conversor de vídeo (ffmpeg). Rode: bash atualizar.sh"})
+        return
+    if androidgen._trava.locked():
+        await emit({"type": "error", "msg": "Ainda estou criando outra coisa. Espere terminar ou clique em Parar."})
+        return
+    largura, altura = RESOLUCOES.get(tamanho, RESOLUCOES["320x192"])
+    quadros = quadros if quadros in QUADROS else 17
+    passos = max(4, min(int(passos), 30))
+    async with androidgen._trava:
+        try:
+            recursos.garante_ram(9000, "gerar o vídeo")
+        except RuntimeError as e:
+            await emit({"type": "error", "msg": str(e)})
+            return
+        prompt = descricao
+        if melhorar:
+            await emit({"type": "status", "msg": "A IA está traduzindo e detalhando o seu pedido…"})
+            prompt = await imagens.melhora_prompt(descricao, video=True)
+        id_ = uuid.uuid4().hex[:10]
+        pasta = config.WORK_DIR / f"vid-{id_}"
+        pasta.mkdir(parents=True, exist_ok=True)
+        seed = random.randint(1, 2**31 - 1)
+        # com a placa o vídeo roda em partes (limite de memória); se ela falhar, repete só pela CPU
+        vram = recursos.vram_livre_mb()
+        modo = recursos.modo_imagem(vram)
+        if modo != "cpu" and not recursos.gpu_liberada("video"):
+            modo = "cpu"
+        d = config.VIDEO_ARQUIVOS
+        base = {"difusao": str(d["difusao"]["arquivo"]), "texto": str(d["texto"]["arquivo"]), "vae": str(d["vae"]["arquivo"]),
+                "threads": os.cpu_count() or recursos.nucleos_fisicos(), "prompt": prompt, "negativo": NEGATIVO,
+                "largura": largura, "altura": altura, "quadros": quadros, "passos": passos, "seed": seed,
+                "cfg": 6.0, "pasta": str(pasta / "quadros"), "orcamento": recursos.orcamento_vram_gib(vram or 0)}
+        try:
+            minutos = _estimativa_min(largura, altura, quadros, passos)
+            await emit({"type": "status", "msg": f"Gerando o vídeo ({quadros} quadros, {largura}×{altura}). Leva uns "
+                                                 f"{minutos} minutos; pode fechar o app, ele continua no PC."})
+            ok, erro = await _roda_worker({**base, "modo": modo}, emit)
+            if modo != "cpu":
+                recursos.anota_gpu("video", ok)
+            if not ok and modo != "cpu":
+                await emit({"type": "status", "msg": "A placa de vídeo não deu conta; tentando só pela CPU…"})
+                ok, erro = await _roda_worker({**base, "modo": "cpu"}, emit)
+            if not ok:
+                await emit({"type": "error", "msg": "Não consegui gerar o vídeo.", "log": erro})
+                return
+            await emit({"type": "status", "msg": "Juntando os quadros num arquivo .mp4…"})
+            mp4 = pasta / "video.mp4"
+            if not await asyncio.to_thread(_junta_mp4, pasta / "quadros", mp4):
+                await emit({"type": "error", "msg": "Gerei os quadros, mas não consegui montar o .mp4."})
+                return
+            slug = androidgen.slugify(descricao) or "video"
+            nome = (descricao[:40] or "Vídeo").strip()
+            meta = entregas.salva(id_, nome, descricao, "video", [(mp4, f"{slug}.mp4", "Vídeo (.mp4)")],
+                                  {"prompt": prompt, "seed": seed, "tamanho": f"{largura}x{altura}", "quadros": quadros})
+            await emit({"type": "done", "id": id_, "name": nome, "kind": "video", "files": meta["files"],
+                        "preview": meta["files"][0]["url"], "prompt": prompt, "note": f"Prompt usado: {prompt}"})
+        finally:
+            shutil.rmtree(pasta, ignore_errors=True)
+
+
+# ------------------------------------------------------------------ trabalho em segundo plano
+def _condicao() -> asyncio.Condition:
+    global _cond
+    if _cond is None:
+        _cond = asyncio.Condition()
+    return _cond
+
+
+def rodando() -> bool:
+    return _job is not None and not _job["fim"]
+
+
+def inicia(descricao: str, tamanho: str, quadros: int, passos: int, melhorar: bool) -> None:
+    """Começa a gerar em segundo plano (sobrevive à desconexão do celular)."""
+    global _job
+    if rodando():
+        raise ValueError("Já tem um vídeo sendo gerado. Espere terminar ou cancele.")
+    job = {"eventos": [], "fim": False, "descricao": descricao, "inicio": time.time(), "ultimo": None}
+    _job = job
+    cond = _condicao()
+
+    async def emit(ev: dict):
+        async with cond:
+            job["eventos"].append(ev)
+            if ev.get("type") in ("passo", "status"):
+                job["ultimo"] = ev
+            cond.notify_all()
+
+    async def roda():
+        try:
+            await gera_video(descricao, tamanho, quadros, passos, melhorar, emit)
+        except asyncio.CancelledError:
+            await asyncio.shield(emit({"type": "error", "msg": "Vídeo cancelado."}))
+        except Exception as e:
+            await emit({"type": "error", "msg": f"Erro inesperado: {type(e).__name__}: {e}"})
+        finally:
+            async with cond:
+                job["fim"] = True
+                cond.notify_all()
+
+    job["task"] = asyncio.get_running_loop().create_task(roda())
+
+
+def cancela() -> bool:
+    if rodando():
+        _job["task"].cancel()
+        return True
+    return False
+
+
+def situacao() -> dict:
+    if _job is None:
+        return {"rodando": False}
+    ult = _job.get("ultimo") or {}
+    return {"rodando": rodando(), "descricao": _job["descricao"], "inicio": _job["inicio"],
+            "msg": ult.get("msg", ""), "passo": ult.get("passo"), "total": ult.get("total")}
+
+
+async def segue():
+    """Entrega (como eventos SSE) tudo o que já aconteceu no trabalho atual/último e depois acompanha ao vivo."""
+    if _job is None:
+        return
+    job, cond, i = _job, _condicao(), 0
+    while True:
+        async with cond:
+            await cond.wait_for(lambda: i < len(job["eventos"]) or job["fim"])
+            novos = job["eventos"][i:]
+            i = len(job["eventos"])
+            fim = job["fim"]
+        for ev in novos:
+            yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n".encode()
+        if fim and i >= len(job["eventos"]):
+            return
+EOF
+  cat > vidgen.py <<'EOF'
+#!/usr/bin/env python3
+"""Processo isolado que gera UM vídeo curto com o stable-diffusion.cpp (modelo Wan 2.1, texto para vídeo).
+
+Lê um JSON na entrada padrão e escreve eventos JSON (um por linha) na saída, como o imggen.py.
+Roda separado do servidor para poder ser cancelado na hora (botão Parar) e devolver toda a memória.
+Grava os quadros como PNG numa pasta; o servidor junta tudo num .mp4.
+"""
+import json
+import os
+import sys
+
+
+def evento(**kw):
+    print(json.dumps(kw, ensure_ascii=False), flush=True)
+
+
+def main():
+    cfg = json.loads(sys.stdin.read())
+    modo = cfg.get("modo", "cpu")
+    if modo == "cpu":
+        os.environ["CUDA_VISIBLE_DEVICES"] = "-1"   # sem GPU: tudo na CPU
+    try:
+        from stable_diffusion_cpp import StableDiffusion
+        kw = dict(diffusion_model_path=cfg["difusao"], vae_path=cfg["vae"], t5xxl_path=cfg["texto"],
+                  n_threads=cfg["threads"], vae_decode_only=False, diffusion_flash_attn=True,   # (vídeo exige vae_decode_only=False)
+                  
+                  keep_clip_on_cpu=True,           # o codificador de texto (3,6 GB) nunca cabe na placa
+                  enable_mmap=True)
+        if modo == "segmentado":                   # a difusão (e o VAE) na placa, em partes, dentro do limite que sobra
+            kw.update(offload_params_to_cpu=True, max_vram=cfg["orcamento"], keep_vae_on_cpu=False)
+        elif modo == "gpu":
+            kw.update(keep_vae_on_cpu=False)
+        sd = StableDiffusion(**kw)
+        evento(tipo="carregado", modo=modo)
+
+        def passo(i, total, tempo):
+            evento(tipo="passo", passo=int(i), total=int(total), seg=round(float(tempo), 1))
+
+        quadros = sd.generate_video(
+            prompt=cfg["prompt"], negative_prompt=cfg.get("negativo", ""), width=cfg["largura"], height=cfg["altura"],
+            cfg_scale=cfg.get("cfg", 6.0), sample_method="euler", sample_steps=cfg["passos"], flow_shift=3.0,
+            video_frames=cfg["quadros"], seed=cfg["seed"], vae_tiling=True, progress_callback=passo)
+        os.makedirs(cfg["pasta"], exist_ok=True)
+        for n, q in enumerate(quadros):
+            q.save(os.path.join(cfg["pasta"], f"q{n:04d}.png"))
+        evento(tipo="pronto", quadros=len(quadros))
+    except Exception as e:  # o servidor decide o que fazer (por exemplo, repetir só pela CPU)
+        evento(tipo="erro", msg=f"{type(e).__name__}: {e}"[:300])
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
+EOF
   cat > "$BASE/diagnostico_fans.sh" <<'EOF'
 #!/usr/bin/env bash
 # Mostra o que dá para controlar nas ventoinhas pelo Linux (GPU e CPU).
@@ -3831,7 +5598,8 @@ EOF
 
   #log { flex:1; overflow-y:auto; scroll-behavior:smooth; }
   .coluna { max-width:760px; margin:0 auto; padding:8px 20px 24px; display:flex; flex-direction:column; gap:22px; min-height:100%; }
-  .vazio { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; text-align:center; padding:24px 0 60px; gap:22px; }
+  .vazio { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:flex-start; text-align:center; padding:24px 0 40px; gap:22px; }
+  .vazio > :first-child { margin-top:auto; } .vazio > :last-child { margin-bottom:auto; }   /* centraliza sem cortar o topo quando é alto */
   .vazio h1 { font:700 clamp(26px,5vw,36px)/1.2 var(--serif); margin:0; }
   .vazio h1 i { font-style:normal; color:var(--acc); margin-right:8px; }
   .sugestoes { display:flex; flex-wrap:wrap; gap:8px; justify-content:center; max-width:640px; }
@@ -3874,7 +5642,7 @@ EOF
   #status { min-height:20px; padding:0 20px 6px; text-align:center; font-size:13px; color:var(--mut); }
   .compor { padding:0 16px calc(14px + env(safe-area-inset-bottom)); }
   .caixa { max-width:760px; margin:0 auto; background:var(--card); border:1px solid var(--line); border-radius:24px; box-shadow:var(--sombra); padding:10px 12px 8px; position:relative; transition:border-color .15s, box-shadow .15s; }
-  .caixa:focus-within { border-color:var(--acc); box-shadow:0 2px 18px rgba(198,97,63,.18); }
+  .caixa:focus-within { border-color:var(--acc); box-shadow:0 2px 18px rgba(0,229,143,.18); }
   #modoChips { display:flex; gap:6px; flex-wrap:wrap; padding:0 4px 6px; } #modoChips:empty { display:none; }
   #modoChips span { font-size:12.5px; background:var(--acc-soft); color:var(--acc); padding:3px 10px; border-radius:999px; }
   #txt { width:100%; border:0; outline:0; resize:none; background:none; color:var(--txt); font:16px/1.5 var(--sans); padding:6px 6px 4px; max-height:200px; min-height:28px; }
@@ -3934,6 +5702,10 @@ EOF
   #imgOpts { padding:2px 10px 6px; } #imgOpts label { padding:5px 0; } #imgOpts .linha-opt { display:flex; align-items:center; gap:8px; font-size:13px; color:var(--mut); }
   #imgOpts input[type=range] { flex:1; }
   .barra-img { height:6px; background:var(--line); border-radius:99px; overflow:hidden; margin-top:8px; } .barra-img i { display:block; height:100%; background:var(--acc); width:0; transition:width .5s; }
+  .sub { font:700 13px var(--mono); color:var(--ciano); margin:16px 0 4px; letter-spacing:.3px; }
+  .linha-bm { display:flex; gap:8px; margin-top:8px; } .linha-bm input { flex:1; min-width:0; } .linha-bm select { max-width:44%; }
+  .arq-l { display:flex; align-items:center; gap:8px; padding:7px 0; border-top:1px solid var(--line); font-size:13px; } .arq-l .t { flex:1; word-break:break-all; }
+  .rec { color:var(--acc); font-weight:700; } .aviso { color:var(--warn); }
   .sec-btn { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:6px 10px; font-size:13px; color:var(--mut); }
   /* ---------- celular ---------- */
   @media (max-width: 860px) {
@@ -3947,6 +5719,43 @@ EOF
     .compor { padding:0 10px calc(10px + env(safe-area-inset-bottom)); }
     .rodape { display:none; }
   }
+  /* ---------- visual v1.3: brilho, bandeja de ferramentas e navegação do celular ---------- */
+  body { background:radial-gradient(1100px 480px at 50% -12%, rgba(0,229,143,.08), transparent 62%), radial-gradient(800px 380px at 100% 0%, rgba(34,211,238,.06), transparent 58%), var(--bg); background-attachment:fixed; }
+  :root[data-tema="claro"] body { background:var(--bg); }
+  .caixa:focus-within { border-color:var(--acc); box-shadow:0 0 0 1px var(--acc), 0 6px 28px rgba(0,229,143,.16); }
+  .vazio h1 { background:linear-gradient(90deg,var(--acc),var(--ciano)); -webkit-background-clip:text; background-clip:text; color:transparent; }
+  .vazio h1 i { -webkit-text-fill-color:var(--acc); }
+  .msg.user .corpo { border:1px solid var(--line); background:linear-gradient(180deg,var(--user),var(--card)); }
+  .cartao { border-left:3px solid var(--acc); }
+  ::-webkit-scrollbar { width:8px; height:8px; } ::-webkit-scrollbar-thumb { background:var(--line); border-radius:8px; }
+  .ferr-grid { display:grid; grid-template-columns:repeat(4,1fr); gap:10px; width:min(640px,100%); }
+  .ferr-grid button, .tiles button { display:flex; flex-direction:column; align-items:flex-start; gap:2px; text-align:left; padding:12px 12px 11px; border:1px solid var(--line); background:var(--card); border-radius:16px; box-shadow:var(--sombra); transition:border-color .15s, transform .1s; }
+  .ferr-grid button:hover, .tiles button:hover, .ferr-grid button:active, .tiles button:active { border-color:var(--acc); transform:translateY(-1px); }
+  .ferr-grid b, .tiles b { font:700 13.5px var(--sans); } .ferr-grid small, .tiles small { font-size:11.5px; color:var(--mut); line-height:1.3; }
+  .ferr-grid .e, .tiles .e { font-size:24px; line-height:1.2; }
+  #folha { position:fixed; inset:0; z-index:90; display:flex; align-items:flex-end; justify-content:center; }
+  #folhaFundo { position:absolute; inset:0; background:rgba(0,0,0,.55); }
+  .folha-cx { position:relative; width:min(560px,100%); max-height:82dvh; overflow-y:auto; background:var(--side); border:1px solid var(--line); border-bottom:0; border-radius:22px 22px 0 0; padding:10px 16px calc(18px + env(safe-area-inset-bottom)); box-shadow:0 -10px 40px rgba(0,0,0,.45); animation:sobe .2s ease-out; }
+  @keyframes sobe { from { transform:translateY(30px); opacity:.4; } }
+  .folha-barra { width:44px; height:4px; border-radius:4px; background:var(--line); margin:4px auto 12px; }
+  #folhaTit { font:700 15px var(--mono); color:var(--acc); margin:0 2px 12px; } #folhaTit::before { content:"// "; color:var(--ciano); }
+  .tiles { display:grid; grid-template-columns:repeat(2,1fr); gap:10px; }
+  .linhas { display:flex; flex-direction:column; gap:4px; }
+  .linhas button { display:flex; align-items:center; gap:14px; padding:13px 12px; border:0; background:none; border-radius:14px; text-align:left; font-size:15px; }
+  .linhas button:hover, .linhas button:active { background:var(--user); } .linhas .e { font-size:22px; width:30px; text-align:center; }
+  #nav { display:none; }
+  @media (max-width: 860px) {
+    .ferr-grid { grid-template-columns:repeat(4,1fr); gap:8px; } .ferr-grid small { display:none; } .ferr-grid button { align-items:center; text-align:center; padding:10px 3px 9px; border-radius:14px; } .ferr-grid b { font-size:11.5px; line-height:1.2; } .ferr-grid .e { font-size:22px; }
+    .vazio { gap:16px; padding:12px 0 24px; } .vazio h1 { font-size:26px; }
+    .sugestoes { flex-wrap:nowrap; overflow-x:auto; justify-content:flex-start; width:100%; padding:0 2px 6px; } .sugestoes button { white-space:nowrap; flex:none; }
+    #side { z-index:60; } body.lateral #fundo { z-index:55; }   /* a gaveta fica por cima da navegação inferior */
+    #nav { display:flex; position:relative; z-index:40; background:var(--side); border-top:1px solid var(--line); padding:5px 6px calc(5px + env(safe-area-inset-bottom)); gap:2px; }
+    #nav button { flex:1; display:flex; flex-direction:column; align-items:center; gap:2px; border:0; background:none; color:var(--mut); font:600 10.5px var(--sans); padding:6px 2px 5px; border-radius:12px; }
+    #nav button svg { width:22px; height:22px; stroke:currentColor; fill:none; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }
+    #nav button.ativo { color:var(--acc); background:var(--acc-soft); }
+    .compor { padding-bottom:8px; }
+    dialog { width:100vw; max-width:100vw; max-height:92dvh; margin:auto 0 0; border-radius:22px 22px 0 0; border-bottom:0; }
+  }
 </style>
 </head>
 <body>
@@ -3959,6 +5768,7 @@ EOF
       <div id="estadoLlm"><span class="bolinha" id="bolinha"></span><span id="estadoTxt">Verificando o modelo…</span></div>
       <div class="menu acima" id="gearMenu" hidden style="left:0;right:0">
         <button class="item" id="voiceBtn">🔊 Voz</button>
+        <button class="item" id="perfilBtn">👤 Meu perfil e foto</button>
         <button class="item" id="llmBtn">🤖 Modelo de IA</button>
         <button class="item" id="memBtn">🧠 Memória</button>
         <button class="item" id="filesBtn">📁 Arquivos criados</button>
@@ -3994,6 +5804,7 @@ EOF
             <option value="web">🌐 Página web</option>
             <option value="python">🐍 Programa Python</option>
             <option value="img">🎨 Criar ou modificar imagem</option>
+            <option value="video">🎬 Criar vídeo curto (lento)</option>
           </select>
           <select id="placa" hidden></select>
           <div id="imgOpts" hidden>
@@ -4004,6 +5815,15 @@ EOF
             <label title="A IA traduz o pedido para inglês e o detalha; os modelos de imagem entendem muito melhor"><input type="checkbox" id="imgMelhorar" checked> ✨ Melhorar o pedido com a IA</label>
             <div class="sec-btn"><span id="imgModeloTxt">Modelo de imagens: verificando…</span><button class="bt-mini" id="imgBaixar" hidden>Baixar (2 GB)</button></div>
             <div class="barra-img" id="imgBaixarBarra" hidden><i></i></div>
+          </div>
+          <div id="vidOpts" hidden>
+            <select id="vidTam" title="Tamanho do vídeo. Quanto maior, mais demora."><option value="320x192">Horizontal pequeno 320×192 (recomendado)</option><option value="192x320">Vertical pequeno 192×320</option><option value="480x272">Horizontal maior 480×272 (bem mais lento)</option></select>
+            <select id="vidQuadros" title="Duração do clipe (16 quadros por segundo)."><option value="9">Curtinho ≈ 0,5 s</option><option value="17" selected>Curto ≈ 1 s</option><option value="33">Mais longo ≈ 2 s (demora o dobro)</option></select>
+            <div class="linha-opt">Qualidade (passos) <input type="range" id="vidPassos" min="6" max="25" value="12"> <span id="vidPassosV">12</span></div>
+            <label title="A IA traduz o pedido para inglês e descreve movimento e câmera; o modelo de vídeo entende muito melhor"><input type="checkbox" id="vidMelhorar" checked> ✨ Melhorar o pedido com a IA</label>
+            <div class="dica">Roda na CPU: um clipe de ~1 s leva de 15 a 25 minutos. Pode fechar o app; ele continua no PC e o vídeo aparece em 📁 Arquivos criados.</div>
+            <div class="sec-btn"><span id="vidModeloTxt">Modelo de vídeo: verificando…</span><button class="bt-mini" id="vidBaixar" hidden>Baixar (5 GB)</button></div>
+            <div class="barra-img" id="vidBaixarBarra" hidden><i></i></div>
           </div>
           <div class="sec">Opções</div>
           <label><input type="checkbox" id="web"> 🌐 Pesquisar na web</label>
@@ -4023,7 +5843,14 @@ EOF
           <button id="send" title="Enviar (Enter)" aria-label="Enviar" disabled>↑</button>
         </div>
       </div>
-      <div class="rodape">A IA roda no seu PC. Confira informações importantes.</div>
+      <nav id="nav" aria-label="Navegação">
+      <button data-aba="chat" class="ativo"><svg viewBox="0 0 24 24"><path d="M21 12a8 8 0 0 1-11.5 7.2L4 20l1-4.4A8 8 0 1 1 21 12z"/></svg>Conversa</button>
+      <button data-aba="criar"><svg viewBox="0 0 24 24"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z"/><path d="M19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8z"/></svg>Criar</button>
+      <button data-aba="arquivos"><svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>Arquivos</button>
+      <button data-aba="biblioteca"><svg viewBox="0 0 24 24"><path d="M4 5a2 2 0 0 1 2-2h12v16H6a2 2 0 0 0-2 2z"/><path d="M4 19V5M8 7h6"/></svg>Biblioteca</button>
+      <button data-aba="mais"><svg viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg>Mais</button>
+    </nav>
+    <div class="rodape">A IA roda no seu PC. Confira informações importantes.</div>
     </div>
   </main>
 </div>
@@ -4037,11 +5864,34 @@ EOF
   <div style="display:flex;gap:8px;margin-top:16px"><button class="bt pri" id="vozTest">▶ Testar</button><button class="bt" id="vozClose">Fechar</button></div>
 </dialog>
 
+<dialog id="perfilDlg">
+  <h2>Meu perfil e foto</h2>
+  <div class="dica">Mande uma foto sua e a IA aprende como você é: ela descreve a foto uma vez e usa isso nas conversas. A foto e a descrição ficam só neste PC; apague quando quiser.</div>
+  <div style="display:flex;gap:14px;align-items:flex-start;margin:12px 0;flex-wrap:wrap">
+    <img id="perfilImg" alt="" hidden style="width:120px;height:120px;object-fit:cover;border-radius:16px;border:1px solid var(--line)">
+    <div style="flex:1;min-width:200px">
+      <input type="text" class="campo" id="perfilNome" placeholder="Como devo te chamar?" style="width:100%;margin-bottom:8px">
+      <input type="file" id="perfilArq" accept="image/jpeg,image/png,image/webp" hidden>
+      <button class="bt pri" id="perfilEscolhe">📷 Escolher minha foto</button>
+    </div>
+  </div>
+  <div class="dica" id="perfilEstado"></div>
+  <div style="margin:10px 0 4px">Como a IA te vê (você pode corrigir)</div>
+  <textarea class="campo" id="perfilDesc" rows="4" style="width:100%" placeholder="Aparece aqui depois que a IA analisar a foto."></textarea>
+  <div style="display:flex;gap:8px;margin-top:14px;flex-wrap:wrap"><button class="bt pri" id="perfilSalva">Salvar</button><button class="bt" id="perfilRefaz">Analisar de novo</button><button class="bt" id="perfilApaga">Apagar tudo</button><button class="bt" id="perfilClose">Fechar</button></div>
+</dialog>
+
 <dialog id="llmDlg">
   <h2>Modelo de IA</h2>
   <div class="dica">Troque conforme a tarefa. Mais preciso = mais lento. Ao trocar, o modelo recarrega (alguns minutos).</div>
   <div class="lista" id="llmLista"></div>
   <div class="dica" id="llmMsg"></div>
+  <h3 class="sub">➕ Adicionar outra IA</h3>
+  <div class="dica">Digite só o <b>nome</b> (ex.: “llama 3.2 3b”, “mistral 7b”, “gemma”, “stable diffusion”) ou o endereço do Hugging Face. A busca é online e <b>nada é filtrado</b>: aparece o que o Hugging Face tiver com esse nome. Os avisos de tamanho são só informação.</div>
+  <div class="linha-bm"><select id="mdTipo"><option value="texto">💬 Conversa</option><option value="imagem">🎨 Imagem</option></select><input type="text" class="campo" id="mdQ" placeholder="Nome da IA…" autocomplete="off"><button class="bt pri" id="mdBusca">Buscar</button></div>
+  <div class="lista" id="mdRes"></div>
+  <h3 class="sub">Suas IAs adicionadas</h3>
+  <div class="lista" id="mdMeus"></div>
   <button class="bt" id="llmClose">Fechar</button>
 </dialog>
 
@@ -4059,12 +5909,17 @@ EOF
   <button class="bt" id="filesClose">Fechar</button>
 </dialog>
 
+<div id="folha" hidden>
+  <div id="folhaFundo"></div>
+  <div class="folha-cx"><div class="folha-barra"></div><div id="folhaTit"></div><div id="folhaCorpo"></div></div>
+</div>
+
 <dialog id="libDlg">
   <h2>Biblioteca</h2>
   <div class="dica">Documentação e exemplos guardados no disco grande. A IA consulta isto sozinha ao responder e ao criar apps e firmware. Coloque seus próprios arquivos na pasta <b>meus</b>.</div>
   <table class="sis" id="libTab"></table>
   <div class="dica" id="libNota"></div>
-  <div style="display:flex;gap:8px;margin-top:10px"><input id="libQ" placeholder="Buscar na biblioteca…" style="flex:1"><button class="bt" id="libBusca">Buscar</button></div>
+  <div style="display:flex;gap:8px;margin-top:10px"><input type="text" class="campo" id="libQ" placeholder="Buscar na biblioteca…" style="flex:1" autocomplete="off"><button class="bt" id="libBusca">Buscar</button></div>
   <div class="lista" id="libRes" style="max-height:34vh;overflow:auto"></div>
   <div style="margin-top:14px;display:flex;gap:8px"><button class="bt" id="libIdx">Atualizar índice</button><button class="bt" id="libClose">Fechar</button></div>
 </dialog>
@@ -4189,6 +6044,26 @@ function apaga(id) {
 $('new').onclick = nova;
 
 /* ======================= Desenho das mensagens ======================= */
+const FERRAMENTAS = [
+  ['chat', '💬', 'Conversa', 'pergunte, pesquise na web'], ['app', '📱', 'App rápido', '1 arquivo, gera o .apk'],
+  ['appx', '📲', 'App avançado', 'várias telas e arquivos'], ['esp32', '🔌', 'Firmware ESP32', 'gera o .ino e o .bin'],
+  ['web', '🌐', 'Página web', 'site ou sistema'], ['python', '🐍', 'Programa Python', 'scripts e ferramentas'],
+  ['img', '🎨', 'Imagem', 'arte, fotos e edição'], ['video', '🎬', 'Vídeo curto', 'lento: roda na CPU'],
+];
+function escolheFerramenta(id) {
+  $('modo').value = id; $('modo').onchange(); fechaFolha();
+  if (['img', 'video', 'esp32'].includes(id)) { $('gearMenu').hidden = true; $('plusMenu').hidden = false; }
+  txt.focus();
+}
+function tilesFerramentas(classe) {
+  const g = document.createElement('div'); g.className = classe;
+  for (const [id, e, nome, sub] of FERRAMENTAS) {
+    const b = document.createElement('button'); b.innerHTML = '<span class="e"></span><b></b><small></small>';
+    b.querySelector('.e').textContent = e; b.querySelector('b').textContent = nome; b.querySelector('small').textContent = sub;
+    b.onclick = e2 => { e2.stopPropagation(); escolheFerramenta(id); }; g.appendChild(b);
+  }
+  return g;
+}
 const SUGESTOES = [
   ['📱 Criar um app Android de lista de compras', 'app', 'um app de lista de compras com campo para adicionar itens e marcar como comprado'],
   ['🔌 Firmware ESP32 que pisca um LED', 'esp32', 'piscar o LED da placa a cada meio segundo e escrever na serial'],
@@ -4200,6 +6075,7 @@ const SUGESTOES = [
 function boasVindas() {
   const d = document.createElement('div'); d.className = 'vazio'; d.id = 'vazio';
   d.innerHTML = '<h1><i>✦</i>Olá! Como posso ajudar hoje?</h1>';
+  d.appendChild(tilesFerramentas('ferr-grid'));
   const s = document.createElement('div'); s.className = 'sugestoes';
   for (const [rot, modo, texto, web] of SUGESTOES) {
     const b = document.createElement('button'); b.textContent = rot;
@@ -4269,7 +6145,7 @@ const TEACH = /^\s*(lembre-se|lembre|guarde|aprenda|anote)(\s+disso|\s+que)?[:,]
 /* ======================= Anexos e modificação ======================= */
 let anexos = [];      // arquivos enviados e ainda não usados: {id, name, tipo, size, url, analise, entrega}
 let baseMod = null;   // item que a IA já criou e que será modificado: {id, nome, kind}
-const ICONES = {apk: '📱', bin: '🔌', ino: '🔌', imagem: '🖼️', texto: '📄', img: '🎨', web: '🌐', python: '🐍'};
+const ICONES = {apk: '📱', bin: '🔌', ino: '🔌', imagem: '🖼️', texto: '📄', img: '🎨', video: '🎬', web: '🌐', python: '🐍'};
 function renderAnexos() {
   const box = $('anexos'); box.textContent = '';
   if (baseMod) {
@@ -4469,7 +6345,9 @@ $('mic').onclick = async () => {
 };
 
 /* ======================= Parar (resposta, voz, gravação, criação) ======================= */
+let criandoVideo = false;
 function parar() {
+  if (criandoVideo) fetch('/video/cancelar', {method: 'POST'}).catch(() => {});   // vídeo continua no PC se só a conexão cair; Parar cancela de verdade
   if (ctrl) ctrl.abort();
   pararVoz();
   if (rec) { descartar = true; rec.stop(); }
@@ -4494,6 +6372,30 @@ txt.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey && !
 $('send').onclick = () => send(txt.value);
 
 /* ======================= Menus ======================= */
+// --- bandeja (folha) e navegação inferior
+function abreFolha(titulo, corpo) { $('folhaTit').textContent = titulo; const c = $('folhaCorpo'); c.textContent = ''; c.appendChild(corpo); $('folha').hidden = false; }
+function fechaFolha() { $('folha').hidden = true; }
+$('folhaFundo').onclick = fechaFolha;
+function folhaMais() {
+  const l = document.createElement('div'); l.className = 'linhas';
+  for (const [e, nome, id] of [['👤', 'Meu perfil e foto', 'perfilBtn'], ['🤖', 'Modelos de IA e adicionar outras', 'llmBtn'], ['🔊', 'Voz', 'voiceBtn'], ['🧠', 'Memória', 'memBtn'], ['🖥', 'Sistema e ventoinhas', 'sisBtn'], ['📲', 'Conectar celular', 'pairBtn'], ['⚙', 'Servidor do app', 'cfgBtn'], ['🌓', 'Tema', 'temaBtn'], ['＋', 'Nova conversa', 'new']]) {
+    if ($(id).hidden) continue;
+    const b = document.createElement('button'); b.innerHTML = '<span class="e"></span><span></span>'; b.querySelector('.e').textContent = e; b.lastChild.textContent = nome;
+    b.onclick = () => { fechaFolha(); $(id).click(); }; l.appendChild(b);
+  }
+  abreFolha('Mais', l);
+}
+function marcaAba(aba) { for (const b of document.querySelectorAll('#nav button')) b.classList.toggle('ativo', b.dataset.aba === aba); }
+for (const b of document.querySelectorAll('#nav button')) b.onclick = () => {
+  const a = b.dataset.aba; fechaMenus(); fechaFolha();
+  if (a === 'chat') { $('modo').value = 'chat'; $('modo').onchange(); txt.focus(); }
+  else if (a === 'criar') { const t = tilesFerramentas('tiles'); abreFolha('Criar', t); }
+  else if (a === 'arquivos') $('filesBtn').click();
+  else if (a === 'biblioteca') $('libBtn').click();
+  else if (a === 'mais') folhaMais();
+  marcaAba(a);
+};
+document.addEventListener('keydown', e => { if (e.key === 'Escape') fechaFolha(); });
 function fechaMenus() { $('plusMenu').hidden = true; $('gearMenu').hidden = true; }
 $('plus').onclick = e => { e.stopPropagation(); const v = $('plusMenu').hidden; fechaMenus(); $('plusMenu').hidden = !v; };
 $('gearBtn').onclick = e => { e.stopPropagation(); const v = $('gearMenu').hidden; fechaMenus(); $('gearMenu').hidden = !v; };
@@ -4502,11 +6404,12 @@ $('menuBtn').onclick = () => document.body.classList.add('lateral');
 $('fundo').onclick = () => document.body.classList.remove('lateral');
 
 const PLACEHOLDERS = {
+  video: 'Descreva o vídeo curto (ex.: um balão vermelho flutuando sobre um campo, câmera lenta)…',
   chat: 'Escreva sua mensagem…', app: 'Descreva o app (ex.: lista de compras)… ou anexe um app para modificar',
   appx: 'Descreva o app com várias telas (ex.: agenda com lista e detalhes)…', esp32: 'Descreva o firmware… ou anexe um .ino para modificar/compilar',
   web: 'Descreva a página ou o sistema web (ex.: calculadora de gorjeta)…', python: 'Descreva o programa Python (ex.: renomear arquivos em lote)…',
   img: 'Descreva a imagem… ou anexe uma imagem para modificar'};
-const ROTULOS_MODO = {app: '📱 App Android rápido', appx: '📱 App Android avançado', esp32: '🔌 Firmware ESP32', web: '🌐 Página web', python: '🐍 Python', img: '🎨 Imagem'};
+const ROTULOS_MODO = {app: '📱 App Android rápido', appx: '📱 App Android avançado', esp32: '🔌 Firmware ESP32', web: '🌐 Página web', python: '🐍 Python', img: '🎨 Imagem', video: '🎬 Vídeo'};
 function atualizaChips() {
   const box = $('modoChips'); box.textContent = '';
   const m = $('modo').value;
@@ -4530,10 +6433,36 @@ async function checaModeloImagem() {
   } catch (e) {}
 }
 $('imgBaixar').onclick = async () => { await fetch('/imagem/modelo?m=' + $('imgModelo').value, {method: 'POST'}); checaModeloImagem(); };
-$('imgModelo').onchange = () => { const p = $('imgModelo').value === 'realista' ? 6 : 4; $('imgPassos').value = p; $('imgPassosV').textContent = p; checaModeloImagem(); };
+let imgModelos = [];
+async function carregaModelosImagem() {
+  try {
+    imgModelos = await (await fetch('/imagem/modelos')).json(); const sel = $('imgModelo'), atual = sel.value;
+    sel.textContent = '';
+    for (const m of imgModelos) { const o = document.createElement('option'); o.value = m.id; o.textContent = (m.id === 'rapido' ? '⚡ ' : m.id === 'realista' ? '📷 ' : '🎨 ') + m.nome + (m.id === 'rapido' ? ' (arte e ilustração)' : m.id === 'realista' ? ' (fotos)' : ''); sel.appendChild(o); }
+    if (imgModelos.some(m => m.id === atual)) sel.value = atual;
+  } catch (e) {}
+}
+$('imgModelo').onchange = () => {
+  const m = imgModelos.find(x => x.id === $('imgModelo').value) || {passos: 4, max_passos: 8};
+  $('imgPassos').max = m.max_passos || 8; $('imgPassos').value = m.passos; $('imgPassosV').textContent = m.passos; checaModeloImagem();
+};
+let vidTimer = null;
+async function checaModeloVideo() {
+  try {
+    const e = await (await fetch('/video/modelo')).json();
+    $('vidModeloTxt').textContent = !e.motor ? 'Motor de imagens/vídeo não instalado (rode: bash atualizar.sh)' : !e.ffmpeg ? 'Falta o conversor de vídeo (rode: bash atualizar.sh)' : e.presente ? 'Modelo de vídeo pronto ✓' : e.baixando ? 'Baixando o modelo de vídeo… ' + Math.round(e.progresso * 100) + '%' : 'Falta o modelo de vídeo (5 GB)';
+    $('vidBaixar').hidden = !(e.motor && !e.presente && !e.baixando); $('vidBaixarBarra').hidden = !e.baixando;
+    if (e.baixando) $('vidBaixarBarra').firstChild.style.width = Math.round(e.progresso * 100) + '%';
+    if (e.baixando && !vidTimer) vidTimer = setInterval(checaModeloVideo, 3000); if (!e.baixando && vidTimer) { clearInterval(vidTimer); vidTimer = null; }
+  } catch (e) {}
+}
+$('vidBaixar').onclick = async () => { const r = await fetch('/video/modelo', {method: 'POST'}); if (!r.ok) $('vidModeloTxt').textContent = (await r.json()).detail; else checaModeloVideo(); };
+$('vidPassos').oninput = () => $('vidPassosV').textContent = $('vidPassos').value;
 $('modo').onchange = async () => {
-  const m = $('modo').value; $('placa').hidden = m !== 'esp32'; $('imgOpts').hidden = m !== 'img'; atualizaChips(); atualizaForca();
-  if (m === 'img') checaModeloImagem();
+  const m = $('modo').value; $('placa').hidden = m !== 'esp32'; $('imgOpts').hidden = m !== 'img'; $('vidOpts').hidden = m !== 'video'; atualizaChips(); atualizaForca();
+  if (m === 'img') { await carregaModelosImagem(); checaModeloImagem(); }
+  if (m === 'video') checaModeloVideo();
+  marcaAba(m === 'chat' ? 'chat' : 'criar');
   if (m === 'esp32' && !$('placa').options.length) {
     try { for (const b of await (await fetch('/boards')).json()) { const o = document.createElement('option'); o.value = b.id; o.textContent = b.label; $('placa').appendChild(o); } } catch (e) {}
   }
@@ -4555,10 +6484,11 @@ function cartaoCriacao(m) {
   const k = m.criacao, d = document.createElement('div'); d.className = 'cartao' + (k.erro ? ' erro' : '');
   const st = document.createElement('div'); st.className = 'st'; st.textContent = k.status; d.appendChild(st);
   if (k.codigo) { const det = document.createElement('details'), sm = document.createElement('summary'), pre = document.createElement('pre'); sm.textContent = 'Ver o código que a IA escreveu'; pre.textContent = k.codigo; det.append(sm, pre); d.appendChild(det); }
-  if (k.preview) { const im = document.createElement('img'); im.className = 'miniatura'; im.src = k.preview; im.alt = 'Imagem criada'; d.appendChild(im); }
+  if (k.preview && k.kind === 'video') { const v = document.createElement('video'); v.className = 'miniatura'; v.src = k.preview; v.controls = true; v.loop = true; v.muted = true; v.playsInline = true; v.preload = 'metadata'; d.appendChild(v); }
+  else if (k.preview) { const im = document.createElement('img'); im.className = 'miniatura'; im.src = k.preview; im.alt = 'Imagem criada'; d.appendChild(im); }
   for (const f of k.files || []) d.appendChild(linkArquivo(f));
   if (k.passo) { const b = document.createElement('div'); b.className = 'barra-img'; b.innerHTML = '<i></i>'; b.firstChild.style.width = Math.round(100 * k.passo[0] / k.passo[1]) + '%'; d.appendChild(b); }
-  if (k.id && !k.erro && (k.files || []).length) {
+  if (k.id && !k.erro && (k.files || []).length && k.kind !== 'video') {
     const ac = document.createElement('div'); ac.className = 'acoes-cartao';
     const mb = document.createElement('button'); mb.textContent = '✏ Modificar'; mb.onclick = () => modificar({id: k.id, name: k.nome, kind: k.kind, modo: k.modo}); ac.appendChild(mb);
     if (k.kind === 'img' && k.descricao) { const ob = document.createElement('button'); ob.textContent = '↻ Outra versão'; ob.onclick = () => { $('modo').value = 'img'; $('modo').onchange(); txt.value = k.descricao; autoAltura(); send(txt.value); }; ac.appendChild(ob); }
@@ -4568,8 +6498,8 @@ function cartaoCriacao(m) {
   if (k.log) { const det = document.createElement('details'), sm = document.createElement('summary'), pre = document.createElement('pre'); sm.textContent = 'Ver os erros'; pre.textContent = k.log; det.append(sm, pre); d.appendChild(det); }
   return d;
 }
-async function criarArquivo(tipo, desc, c, usados, base) {
-  usados = usados || []; const rotulo = {app: 'app', appx: 'app', esp32: 'firmware', web: 'página web', python: 'programa', img: 'imagem'}[tipo];
+async function criarArquivo(tipo, desc, c, usados, base, retomar) {
+  usados = usados || []; const rotulo = {app: 'app', appx: 'app', esp32: 'firmware', web: 'página web', python: 'programa', img: 'imagem', video: 'vídeo'}[tipo];
   const m = {role: 'assistant', kind: 'criacao', ignorar: true, criacao: {status: '⏳ Enviando o pedido…', descricao: desc}}; c.msgs.push(m);
   let atual = criaMsg(m); coluna.appendChild(atual); desceFim(true);
   const k = m.criacao, att = () => { const n = criaMsg(m); atual.replaceWith(n); atual = n; desceFim(false); };
@@ -4585,12 +6515,12 @@ async function criarArquivo(tipo, desc, c, usados, base) {
   else if (tipo === 'esp32') rota = '/esp32/generate';
   else if (tipo === 'web' || tipo === 'python') { rota = '/codigo/generate'; body.alvo = tipo; }
   else if (tipo === 'img') { rota = '/imagem/generate'; body.tamanho = $('imgTam').value; body.passos = parseInt($('imgPassos').value, 10); body.forca = parseFloat($('imgForca').value); body.melhorar = $('imgMelhorar').checked; body.modelo = $('imgModelo').value; }
+  else if (tipo === 'video') { rota = '/video/generate'; body.tamanho = $('vidTam').value; body.quadros = parseInt($('vidQuadros').value, 10); body.passos = parseInt($('vidPassos').value, 10); body.melhorar = $('vidMelhorar').checked; }
   setStatus(`Criando: ${rotulo}… (■ cancela)`); let terminou = false;
-  try {
-    ctrl = new AbortController();
-    const r = await fetch(rota, {method: 'POST', headers: {'Content-Type': 'application/json'}, signal: ctrl.signal, body: JSON.stringify(body)});
-    if (!r.ok) throw new Error(r.status === 400 || r.status === 404 ? (await r.json()).detail : 'Servidor respondeu ' + r.status);
-    const reader = r.body.getReader(), dec = new TextDecoder(); let buf = '';
+  const ehVideo = tipo === 'video'; if (ehVideo) criandoVideo = true;
+  // lê o fluxo de eventos do servidor (SSE) e atualiza o cartão
+  const consome = async resp => {
+    const reader = resp.body.getReader(), dec = new TextDecoder(); let buf = '';
     for (;;) {
       const {value, done} = await reader.read(); if (done) break;
       buf += dec.decode(value, {stream: true});
@@ -4599,22 +6529,44 @@ async function criarArquivo(tipo, desc, c, usados, base) {
         if (!ln.startsWith('data:')) continue;
         const ev = JSON.parse(ln.slice(5).trim());
         if (ev.type === 'status') { k.status = '⏳ ' + ev.msg; att(); }
-        else if (ev.type === 'passo') { k.passo = [ev.passo, ev.total]; k.status = `⏳ Gerando a imagem… passo ${ev.passo} de ${ev.total}`; att(); }
+        else if (ev.type === 'passo') { k.passo = [ev.passo, ev.total]; k.status = ev.msg ? '⏳ ' + ev.msg : `⏳ Gerando a imagem… passo ${ev.passo} de ${ev.total}`; att(); }
         else if (ev.type === 'progress') setStatus(`A IA já escreveu ${ev.tokens} pedaços de código… (■ cancela)`);
         else if (ev.type === 'code') { k.codigo = ev.text; att(); }
         else if (ev.type === 'done') { terminou = true; k.passo = null; k.status = `✅ "${ev.name}" pronto!`; k.files = ev.files; k.nota = ev.note; k.preview = ev.preview; k.id = ev.id; k.nome = ev.name; k.kind = ev.kind; k.modo = tipo === 'appx' ? 'avancado' : undefined; att(); }
         else if (ev.type === 'error') {
           terminou = true; k.passo = null; k.erro = true; k.status = '⚠ ' + ev.msg; k.log = ev.log; att();
           if (ev.precisa_modelo) { $('plusMenu').hidden = false; checaModeloImagem(); }
+          if (ev.precisa_modelo_video) { $('plusMenu').hidden = false; checaModeloVideo(); }
         }
       }
+    }
+  };
+  try {
+    ctrl = new AbortController();
+    const r = await fetch(retomar ? '/video/seguir' : rota, retomar ? {signal: ctrl.signal} : {method: 'POST', headers: {'Content-Type': 'application/json'}, signal: ctrl.signal, body: JSON.stringify(body)});
+    if (!r.ok) throw new Error(r.status === 400 || r.status === 404 ? (await r.json()).detail : 'Servidor respondeu ' + r.status);
+    await consome(r);
+    // vídeo demora vários minutos: se a conexão cair (tela apagada, sinal), o PC continua e o app volta a acompanhar
+    for (let t = 0; ehVideo && !terminou && t < 400; t++) {
+      k.status = '⏳ Conexão interrompida; o vídeo continua sendo gerado no PC. Reconectando…'; att();
+      await new Promise(ok => setTimeout(ok, 5000));
+      try { const r2 = await fetch('/video/seguir', {signal: ctrl.signal}); if (r2.ok) await consome(r2); } catch (e) { if (e.name === 'AbortError') throw e; }
     }
     if (!terminou) { k.erro = true; k.status = `⚠ A conexão terminou antes de ficar pronto.`; att(); }
   } catch (e) {
     if (e.name === 'AbortError') k.status = `⏹ Criação cancelada por você.`;
     else { k.erro = true; k.status = '⚠ ' + mensagemAmigavel(e); }
     att();
-  } finally { setStatus(''); }
+  } finally { criandoVideo = false; setStatus(''); }
+}
+// ao abrir o app: se um vídeo ainda está sendo gerado no PC, volta a acompanhar
+async function retomaVideo() {
+  try {
+    const e = await (await fetch('/video/estado')).json(); if (!e.rodando || busy) return;
+    let c = conv(); if (!c) { c = novaConv(); convs.push(c); atualId = c.id; }
+    busy = true; atualizaBotoes();
+    try { await criarArquivo('video', e.descricao || 'vídeo', c, [], null, true); } finally { busy = false; atualizaBotoes(); }
+  } catch (e) {}
 }
 
 /* ======================= Janelas ======================= */
@@ -4709,7 +6661,87 @@ async function trocaModelo(id) {
   const r = await fetch('/llm/select', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({id})});
   if (!r.ok) $('llmMsg').textContent = '⚠ ' + (await r.json()).detail; carregaLlm();
 }
-$('llmBtn').onclick = () => { abreDlg('llmDlg'); carregaLlm(); clearInterval(llmTimer); llmTimer = setInterval(() => { if ($('llmDlg').open) carregaLlm(); else clearInterval(llmTimer); }, 2500); };
+$('llmBtn').onclick = () => { abreDlg('llmDlg'); carregaLlm(); lerMeus(); clearInterval(llmTimer); llmTimer = setInterval(() => { if ($('llmDlg').open) carregaLlm(); else clearInterval(llmTimer); }, 2500); };
+// --- adicionar outras IAs (busca pelo nome, online)
+let mdTimer = null, modeloAtual = '';
+const fmtN = n => n >= 1e6 ? (n / 1e6).toFixed(1) + ' mi' : n >= 1e3 ? Math.round(n / 1e3) + ' mil' : String(n || 0);
+const fmtGB = n => n >= 1e9 ? (n / 1e9).toFixed(2) + ' GB' : Math.round(n / 1e6) + ' MB';
+async function buscaModelos() {
+  const q = $('mdQ').value.trim(); if (!q) return; const tipo = $('mdTipo').value, box = $('mdRes');
+  box.textContent = 'Buscando no Hugging Face…';
+  try {
+    const r = await fetch('/modelos/buscar?q=' + encodeURIComponent(q) + '&tipo=' + tipo);
+    if (!r.ok) throw new Error((await r.json()).detail);
+    const itens = await r.json(); box.textContent = itens.length ? '' : 'Nada encontrado com esse nome.';
+    for (const it of itens) {
+      const row = document.createElement('div'); row.className = 'item-l'; row.style.flexDirection = 'column';
+      const topo = document.createElement('div'); topo.style.cssText = 'display:flex;gap:10px;align-items:center;width:100%';
+      const t = document.createElement('div'); t.className = 't'; t.innerHTML = '<b></b><small></small>';
+      t.querySelector('b').textContent = it.repo; t.querySelector('small').textContent = '↓ ' + fmtN(it.downloads) + ' · ♥ ' + fmtN(it.likes) + (it.tags && it.tags.length ? ' · ' + it.tags.join(', ') : '');
+      const b = document.createElement('button'); b.className = 'bt'; b.textContent = 'Ver arquivos';
+      b.onclick = () => mostraArquivos(it.repo, tipo, row, b);
+      topo.append(t, b); row.appendChild(topo); box.appendChild(row);
+    }
+  } catch (e) { box.textContent = '⚠ ' + e.message; }
+}
+async function mostraArquivos(repo, tipo, row, btn) {
+  btn.disabled = true; btn.textContent = '…';
+  try {
+    const r = await fetch('/modelos/arquivos?repo=' + encodeURIComponent(repo) + '&tipo=' + tipo);
+    if (!r.ok) throw new Error((await r.json()).detail);
+    const gs = await r.json(); btn.remove();
+    if (!gs.length) { const d = document.createElement('div'); d.className = 'dica'; d.textContent = 'Esse repositório não tem arquivo .gguf utilizável.'; row.appendChild(d); }
+    for (const g of gs) {
+      const l = document.createElement('div'); l.className = 'arq-l'; l.style.width = '100%';
+      const t = document.createElement('div'); t.className = 't';
+      t.innerHTML = '<span></span> <small></small><div class="aviso"></div>';
+      t.querySelector('span').textContent = g.nome; t.querySelector('small').textContent = (g.quant ? g.quant + ' · ' : '') + fmtGB(g.tam) + (g.arquivos.length > 1 ? ' · ' + g.arquivos.length + ' partes' : '');
+      if (g.recomendado) { const rc = document.createElement('span'); rc.className = 'rec'; rc.textContent = ' ★ recomendado para o seu PC'; t.querySelector('small').after(rc); }
+      t.querySelector('.aviso').textContent = g.aviso || '';
+      const bb = document.createElement('button'); bb.className = 'bt' + (g.recomendado ? ' pri' : ''); bb.textContent = 'Baixar';
+      bb.onclick = async () => {
+        bb.disabled = true; const rr = await fetch('/modelos/baixar', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({repo, arquivos: g.arquivos, tipo, tam: g.tam})});
+        if (!rr.ok) { $('llmMsg').textContent = '⚠ ' + (await rr.json()).detail; bb.disabled = false; } else { bb.textContent = 'Baixando…'; lerMeus(); }
+      };
+      l.append(t, bb); row.appendChild(l);
+    }
+  } catch (e) { btn.disabled = false; btn.textContent = 'Ver arquivos'; $('llmMsg').textContent = '⚠ ' + e.message; }
+}
+async function lerMeus() {
+  try {
+    const [e, j] = await Promise.all([fetch('/modelos/estado').then(r => r.json()), fetch('/llm').then(r => r.json())]);
+    modeloAtual = j.modelo_atual || ''; const box = $('mdMeus'); box.textContent = '';
+    for (const d of e.baixando) {
+      const row = document.createElement('div'); row.className = 'item-l'; row.style.flexDirection = 'column';
+      const topo = document.createElement('div'); topo.style.cssText = 'display:flex;gap:10px;align-items:center;width:100%';
+      const t = document.createElement('div'); t.className = 't'; t.innerHTML = '<b></b><small></small>';
+      t.querySelector('b').textContent = d.repo; t.querySelector('small').textContent = d.erro ? '⚠ ' + d.erro : 'Baixando… ' + Math.round(d.progresso * 100) + '% (' + fmtGB(d.feito) + ' de ' + fmtGB(d.tam) + ')';
+      const b = document.createElement('button'); b.className = 'bt'; b.textContent = d.fim ? 'Ok' : 'Cancelar';
+      b.onclick = async () => { await fetch('/modelos/cancelar', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({id: d.id})}); lerMeus(); };
+      topo.append(t, b); row.appendChild(topo);
+      if (!d.fim) { const bar = document.createElement('div'); bar.className = 'barra'; bar.innerHTML = '<i></i>'; bar.firstChild.style.width = Math.round(d.progresso * 100) + '%'; row.appendChild(bar); }
+      box.appendChild(row);
+    }
+    for (const m of e.modelos) {
+      const emUso = m.tipo === 'texto' && modeloAtual === m.arquivo;
+      const row = document.createElement('div'); row.className = 'item-l';
+      const t = document.createElement('div'); t.className = 't'; t.innerHTML = '<b></b><small></small>';
+      t.querySelector('b').textContent = (m.tipo === 'imagem' ? '🎨 ' : '💬 ') + m.nome + (emUso ? ' · em uso' : '');
+      t.querySelector('small').textContent = (m.quant ? m.quant + ' · ' : '') + fmtGB(m.tam) + ' · ' + m.repo;
+      const b = document.createElement('button'); b.className = 'bt' + (emUso ? '' : ' pri');
+      if (emUso) { b.textContent = 'Em uso'; b.disabled = true; }
+      else if (m.tipo === 'texto') { b.textContent = 'Usar'; b.onclick = async () => { $('llmMsg').textContent = 'Trocando o modelo… ele recarrega em alguns minutos.'; const r = await fetch('/modelos/usar', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({id: m.id})}); if (!r.ok) $('llmMsg').textContent = '⚠ ' + (await r.json()).detail; carregaLlm(); lerMeus(); }; }
+      else { b.textContent = 'Usar nas imagens'; b.onclick = () => { $('llmDlg').close(); $('modo').value = 'img'; $('modo').onchange(); setTimeout(() => { $('imgModelo').value = 'x' + m.id; $('imgModelo').onchange(); }, 400); }; }
+      const ap = document.createElement('button'); ap.className = 'bt'; ap.textContent = 'Apagar';
+      ap.onclick = async () => { if (!confirm('Apagar ' + m.nome + ' do disco?')) return; await fetch('/modelos/apagar', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({id: m.id})}); lerMeus(); };
+      row.append(t, b, ap); box.appendChild(row);
+    }
+    if (!e.baixando.length && !e.modelos.length) box.textContent = 'Nenhuma ainda. Busque pelo nome acima.';
+    if (e.baixando.some(d => !d.fim) && !mdTimer) mdTimer = setInterval(() => { if ($('llmDlg').open) lerMeus(); else { clearInterval(mdTimer); mdTimer = null; } }, 3000);
+    if (!e.baixando.some(d => !d.fim) && mdTimer) { clearInterval(mdTimer); mdTimer = null; }
+  } catch (e) {}
+}
+$('mdBusca').onclick = buscaModelos; $('mdQ').onkeydown = e => { if (e.key === 'Enter') buscaModelos(); };
 function atualizaEstadoLlm(estado) {
   $('bolinha').className = 'bolinha ' + estado;
   $('estadoTxt').textContent = {ok: 'Modelo pronto', carregando: 'Modelo carregando…', desligado: 'Modelo desligado'}[estado] || '';
@@ -4729,6 +6761,12 @@ async function lerTele() {
     h += linhaSis('Temperatura da CPU', t.cpu.temp != null ? t.cpu.temp.toFixed(0) + ' °C' : 'indisponível', t.cpu.temp >= 85 ? 'err' : t.cpu.temp >= 75 ? 'warn' : '') + linhaSis('Uso da CPU', t.cpu.uso != null ? t.cpu.uso + ' %' : 'indisponível', t.cpu.uso >= 90 ? 'warn' : '') + linhaSis('Carga da CPU (1 min)', t.cpu.carga + ' (de ' + t.cpu.nucleos + ' threads)');
     for (const [k, v] of Object.entries(t.ventoinhas)) h += linhaSis('Ventoinha ' + k, v + ' RPM');
     h += linhaSis('Memória RAM', t.ram.usada + ' / ' + t.ram.total + ' MB');
+    const vc = t.ventoinha_ctl || {};
+    if (vc.ativo) {
+      h += linhaSis('Controle da ventoinha da GPU', vc.gpu && vc.gpu.metodo ? 'ligado (' + vc.gpu.metodo + ') · ' + (vc.gpu.pct != null ? vc.gpu.pct + ' %' : '—') : 'sem controle: ' + ((vc.gpu && vc.gpu.erro) || 'a placa não aceitou'), vc.gpu && vc.gpu.metodo ? '' : 'warn');
+      const pm = vc.placa_mae || [];
+      h += linhaSis('Ventoinhas da placa-mãe (CPU/caixa)', pm.length ? pm.length + ' controlada(s) · ' + (pm[0].pct != null ? pm[0].pct + ' %' : '—') : 'a placa-mãe não expõe controle ao Linux (rode: bash atualizar.sh)', pm.length ? '' : 'warn');
+    }
     $('sisTab').innerHTML = h;
     $('sisNota').textContent = t.controle_ventoinha === 'active' ? '✔ Controle automático da ventoinha da GPU ligado.' : 'O controle automático da ventoinha da GPU não está ligado (rode: bash atualizar.sh).';
     montaChips(t);
@@ -4800,8 +6838,44 @@ aplicaTema(le('iaTema', 'automático'));
 /* ======================= Início ======================= */
 atualId = le('iaAtual', '');
 if (!conv()) { const n = novaConv(); convs.push(n); atualId = n.id; }
-desenha(); atualizaChips(); autoAltura(); checaLlm(); setInterval(checaLlm, 5000); chipsLoop(); setInterval(chipsLoop, 3000);
+desenha(); atualizaChips(); autoAltura(); checaLlm(); setInterval(checaLlm, 5000); chipsLoop(); setInterval(chipsLoop, 3000); setTimeout(retomaVideo, 1500);
 txt.focus();
+
+// --- perfil: nome e foto do usuário
+let perfilTimer = null;
+const PERFIL_MSG = {vazio: 'Ainda sem foto.', baixando_visao: '⬇ Baixando o modelo que enxerga (~2,8 GB, só na primeira vez)…',
+  descrevendo: '👀 A IA está olhando a foto… (alguns minutos no primeiro uso)', pronto: '✅ Pronto: a IA já sabe como você é.',
+  erro: '⚠ ', interrompido: '⚠ '};
+async function carregaPerfil(manter) {
+  let p; try { p = await (await fetch('/perfil')).json(); } catch (e) { $('perfilEstado').textContent = '⚠ Sem conexão com o servidor.'; return; }
+  if (!manter) { $('perfilNome').value = p.nome || ''; $('perfilDesc').value = p.descricao || ''; }
+  else if (p.estado === 'pronto' && !$('perfilDesc').value) $('perfilDesc').value = p.descricao || '';
+  const img = $('perfilImg'); img.hidden = !p.tem_foto; if (p.tem_foto) img.src = '/perfil/foto?t=' + Date.now();
+  let t = PERFIL_MSG[p.estado] || ''; if (p.estado === 'baixando_visao' && p.progresso != null) t += ' ' + Math.round(p.progresso * 100) + '%';
+  if (p.erro) t += p.erro; $('perfilEstado').textContent = t;
+  $('perfilRefaz').hidden = !p.tem_foto;
+  clearTimeout(perfilTimer);
+  if ($('perfilDlg').open && (p.estado === 'baixando_visao' || p.estado === 'descrevendo')) perfilTimer = setTimeout(() => carregaPerfil(true), 3000);
+}
+$('perfilBtn').onclick = () => { abreDlg('perfilDlg'); carregaPerfil(false); };
+$('perfilClose').onclick = () => { clearTimeout(perfilTimer); $('perfilDlg').close(); };
+$('perfilEscolhe').onclick = () => $('perfilArq').click();
+$('perfilArq').onchange = async () => {
+  const f = $('perfilArq').files[0]; if (!f) return;
+  $('perfilEstado').textContent = 'Enviando a foto…'; const fd = new FormData(); fd.append('foto', f, f.name);
+  const r = await fetch('/perfil/foto', {method: 'POST', body: fd}); $('perfilArq').value = '';
+  if (!r.ok) { $('perfilEstado').textContent = '⚠ ' + ((await r.json()).detail || 'Não consegui enviar.'); return; }
+  $('perfilDesc').value = ''; carregaPerfil(true);
+};
+async function salvaPerfil() {
+  await fetch('/perfil', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({nome: $('perfilNome').value})});
+  if ($('perfilDesc').value.trim()) await fetch('/perfil/descricao', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({descricao: $('perfilDesc').value})});
+  carregaPerfil(false);
+}
+$('perfilSalva').onclick = async () => { await salvaPerfil(); $('perfilEstado').textContent = '✅ Salvo.'; };
+$('perfilNome').onchange = salvaPerfil;
+$('perfilRefaz').onclick = async () => { $('perfilDesc').value = ''; const r = await fetch('/perfil/analisar', {method: 'POST'}); if (!r.ok) $('perfilEstado').textContent = '⚠ ' + (await r.json()).detail; carregaPerfil(true); };
+$('perfilApaga').onclick = async () => { if (!confirm('Apagar a foto, o nome e a descrição?')) return; await fetch('/perfil', {method: 'DELETE'}); $('perfilNome').value = ''; $('perfilDesc').value = ''; carregaPerfil(false); };
 </script>
 </body>
 </html>
@@ -4823,17 +6897,32 @@ NGL="${NGL:-auto}"
 MODEL="${MODEL:-$HOME/models/__MODEL__}"
 [ -f "$HOME/localai/modelo.env" ] && . "$HOME/localai/modelo.env"
 
+# No boot, o driver da placa e os discos podem demorar alguns segundos. Espera (até ~2 min) em vez de decidir cedo
+# demais e deixar a IA rodando só na CPU a sessão inteira.
+for _ in $(seq 1 60); do [ -s "$MODEL" ] && break; sleep 2; done
+for _ in $(seq 1 60); do nvidia-smi >/dev/null 2>&1 && break; sleep 2; done
+
 # NGL=auto: calcula quantas camadas cabem na placa pela VRAM LIVRE agora, deixando folga para as contas
 # do modelo e para a tela (RESERVA_VRAM, em MiB). Assim a placa é aproveitada ao máximo sem estourar.
 if [ "$NGL" = "auto" ]; then
   LIVRE=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -dc '0-9')
+  if [ -z "$LIVRE" ]; then   # placa AMD (driver amdgpu): lê a VRAM pelo /sys; vale a de maior VRAM (a RX, não a gráfica do Ryzen)
+    for d in "${DRM_RAIZ:-/sys/class/drm}"/card[0-9]*/device; do
+      [ "$(cat "$d/vendor" 2>/dev/null)" = "0x1002" ] && [ -r "$d/mem_info_vram_total" ] || continue
+      L=$(( ( $(cat "$d/mem_info_vram_total") - $(cat "$d/mem_info_vram_used" 2>/dev/null || echo 0) ) / 1048576 ))
+      [ "$L" -gt "${LIVRE:-0}" ] && LIVRE=$L
+    done
+  fi
   TAM=$(( $(stat -c %s "$MODEL" 2>/dev/null || echo 0) / 1048576 ))
-  case "$MODEL" in *14B*|*14b*) CAMADAS=48 ;; *3B*|*3b*) CAMADAS=36 ;; *7B*|*7b*|*1.5B*) CAMADAS=28 ;; *) CAMADAS=32 ;; esac
+  # CAMADAS vem do modelo.env quando o modelo foi adicionado pela tela (lido do próprio arquivo); senão, pelo nome
+  if [ -z "${CAMADAS:-}" ]; then
+    case "$MODEL" in *14B*|*14b*) CAMADAS=48 ;; *3B*|*3b*) CAMADAS=36 ;; *7B*|*7b*|*1.5B*) CAMADAS=28 ;; *) CAMADAS=32 ;; esac
+  fi
   if [ -n "$LIVRE" ] && [ "$LIVRE" -gt 0 ] && [ "$TAM" -gt 0 ]; then
     POR_CAMADA=$(( TAM / CAMADAS + 1 ))
     # Deixa parte da placa livre para o gerador de imagens (junto com o texto, sem pausar nada): o modelo de
-    # imagens, se existir, pede ~1,4 GB; sem ele, só a folga normal. Mude com RESERVA_VRAM=NNNN (MiB).
-    if [ -s "$HOME/models/imagens/sd_turbo-f16-q8_0.gguf" ]; then RESERVA_PADRAO=1400; else RESERVA_PADRAO=1000; fi
+    # imagens, se existir, roda na placa EM PARTES (precisa de ~0,7 GB livres); sem ele, só a folga normal. Mude com RESERVA_VRAM=NNNN (MiB).
+    if [ -s "$HOME/models/imagens/sd_turbo-f16-q8_0.gguf" ]; then RESERVA_PADRAO=1100; else RESERVA_PADRAO=1000; fi
     NGL=$(( (LIVRE - ${RESERVA_VRAM:-$RESERVA_PADRAO}) / POR_CAMADA ))
     [ "$NGL" -lt 0 ] && NGL=0
     [ "$NGL" -gt "$CAMADAS" ] && NGL=$CAMADAS
@@ -4962,17 +7051,28 @@ ssd_rapido() {
 }
 
 baixar_modelo_imagem() {
-  local d="$HOME/models/imagens" atual par f tam url
+  local d="$HOME/models/imagens" atual par f tam url itens=()
   mkdir -p "$d"
+  # imagens (rápido e realista) e vídeo (Wan 2.1: modelo + texto + VAE). Tudo baixa em fila, em segundo plano.
   for par in "sd_turbo-f16-q8_0.gguf|2023745376|https://huggingface.co/Green-Sky/SD-Turbo-GGUF/resolve/main/sd_turbo-f16-q8_0.gguf" \
-             "realisticVisionV60B1_v51HyperVAE-Q8_0.gguf|1765950304|https://huggingface.co/second-state/Realistic_Vision_V6.0_B1-GGUF/resolve/main/realisticVisionV60B1_v51HyperVAE-Q8_0.gguf"; do
+             "realisticVisionV60B1_v51HyperVAE-Q8_0.gguf|1765950304|https://huggingface.co/second-state/Realistic_Vision_V6.0_B1-GGUF/resolve/main/realisticVisionV60B1_v51HyperVAE-Q8_0.gguf" \
+             "wan_2.1_vae.safetensors|253815318|https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/vae/wan_2.1_vae.safetensors" \
+             "Wan2.1-T2V-1.3B-Q4_K_M.gguf|982716640|https://huggingface.co/samuelchristlie/Wan2.1-T2V-1.3B-GGUF/resolve/main/Wan2.1-T2V-1.3B-Q4_K_M.gguf" \
+             "umt5-xxl-encoder-Q4_K_M.gguf|3655145312|https://huggingface.co/city96/umt5-xxl-encoder-gguf/resolve/main/umt5-xxl-encoder-Q4_K_M.gguf"; do
     IFS='|' read -r f tam url <<< "$par"
     atual=0; [ -f "$d/$f" ] && atual=$(stat -c %s "$d/$f")
     [ "$atual" -ge $((tam * 999 / 1000)) ] && continue
-    pgrep -f "$f.part" >/dev/null 2>&1 && continue   # já está baixando
-    echo "==> Modelo de imagens $f (~$((tam / 1000000)) MB) baixando em segundo plano (continua de onde parou se interromper)."
-    nohup nice -n 10 bash -c "curl -L --fail -C - -o '$d/$f.part' '$url' && mv '$d/$f.part' '$d/$f'" >> "$BASE/imagens-modelo.log" 2>&1 &
+    itens+=("$f|$url")
   done
+  [ "${#itens[@]}" -gt 0 ] || return 0
+  echo "==> Baixando em segundo plano ${#itens[@]} modelo(s) de imagem/vídeo (vários GB; continua de onde parou se interromper)."
+  # flock: se já houver um download em andamento, este não duplica
+  nohup flock -n "$BASE/.baixa_imagens.lock" nice -n 10 bash -c '
+    d="$1"; shift
+    for item in "$@"; do
+      f="${item%%|*}"; url="${item#*|}"
+      curl -L --fail -C - -o "$d/$f.part" "$url" && mv "$d/$f.part" "$d/$f"
+    done' _ "$d" "${itens[@]}" >> "$BASE/imagens-modelo.log" 2>&1 &
 }
 
 instalar_imagens() {
@@ -5009,6 +7109,55 @@ instalar_tailscale() {
   sudo tailscale set --operator="$USER" >/dev/null 2>&1 || true    # permite usar o tailscale sem sudo
   sudo tailscale set --hostname=betina >/dev/null 2>&1 || true     # nome fixo: o app acha o PC em http://betina:8080
   echo "Tailscale conectado. Depois deste login ele reconecta sozinho em todo boot."
+}
+
+instalar_servicos() {
+  # A IA (modelo + servidor) sobe sozinha em TODO boot do Linux, mesmo sem ninguém logado.
+  local MONTAGENS ALTERADO=0
+  MONTAGENS="$(readlink -f "$BASE") $(readlink -f "$HOME/models")"   # (se estiverem no SSD, espera o disco montar)
+  unit() {  # unit NOME  (conteúdo no stdin): só troca o arquivo se mudou
+    local f="/etc/systemd/system/$1" tmp; tmp=$(mktemp); cat > "$tmp"
+    if ! cmp -s "$tmp" "$f" 2>/dev/null; then sudo install -m 644 "$tmp" "$f"; ALTERADO=1; [ "$1" = localai-llm.service ] && LLM_UNIT_MUDOU=1; fi
+    rm -f "$tmp"
+  }
+  unit localai-llm.service <<UNIT
+[Unit]
+Description=Betina & IA - modelo de linguagem (llama-server)
+After=network-online.target local-fs.target nvidia-persistenced.service
+Wants=network-online.target
+RequiresMountsFor=$MONTAGENS
+
+[Service]
+User=$USER
+Environment=NGL=$NGL_PADRAO
+ExecStart=/usr/bin/env bash $BASE/start_llm.sh
+LimitMEMLOCK=infinity
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  unit localai-server.service <<UNIT
+[Unit]
+Description=Betina & IA - servidor (chat, busca, criação)
+After=network-online.target local-fs.target localai-llm.service
+Wants=network-online.target
+RequiresMountsFor=$MONTAGENS
+
+[Service]
+User=$USER
+ExecStart=/usr/bin/env bash $SRV/run.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  [ "$ALTERADO" = 1 ] && sudo systemctl daemon-reload
+  sudo systemctl enable localai-llm.service localai-server.service >/dev/null 2>&1   # sobem em todo boot
+  sudo systemctl enable --now nvidia-persistenced.service >/dev/null 2>&1 || true   # mantém o driver da placa pronto (CUDA liga mais rápido)
+  echo "Serviços: a IA inicia sozinha com o Linux ($(systemctl is-enabled localai-llm.service 2>/dev/null) / $(systemctl is-enabled localai-server.service 2>/dev/null))."
 }
 
 disco_biblioteca() {
@@ -5165,21 +7314,33 @@ instalar_desempenho() {
   fi
 
   # (c) controle automático das ventoinhas (aumentam sob demanda; devolvem ao automático ao parar)
+  # Placa de vídeo: automático. Processador/caixa: o serviço testa sozinho quais saídas PWM da placa-mãe mexem numa
+  # ventoinha. Para isso o Linux precisa enxergar o chip da placa-mãe (lm-sensors carrega o módulo certo).
+  if ! ls /sys/class/hwmon/hwmon*/pwm[0-9] >/dev/null 2>&1; then
+    sudo apt-get install -y lm-sensors >/dev/null 2>&1 || true
+    echo "==> Procurando o chip de ventoinhas da placa-mãe (sensors-detect, automático)…"
+    yes "" | sudo sensors-detect --auto >/dev/null 2>&1 || true
+    sudo systemctl restart kmod >/dev/null 2>&1 || true
+  fi
   [ -f "$SRV/fan.env" ] || cat > "$SRV/fan.env" <<'FANENV'
 # Controle automático das ventoinhas (reinicie com: sudo systemctl restart localai-fan)
-# Ventoinha da CPU pela placa-mãe: descubra o PWM com  bash ~/localai/diagnostico_fans.sh
-# e tire o # da linha abaixo, ajustando o caminho:
+# Normalmente não precisa mexer: o serviço descobre sozinho as ventoinhas da placa-mãe que respondem.
+# Para forçar UMA saída PWM (descubra com  bash ~/localai/diagnostico_fans.sh ), tire o # e ajuste:
 #FANCTL_CPU_PWM=/sys/class/hwmon/hwmon3/pwm2
+# Para desligar só a parte da placa-mãe (fica só a GPU):
+#FANCTL_AUTO_PWM=0
 FANENV
   sudo tee /etc/systemd/system/localai-fan.service >/dev/null <<UNIT
 [Unit]
-Description=Local AI - controle automatico das ventoinhas
-After=multi-user.target
+Description=Betina & IA - controle automatico das ventoinhas
+After=multi-user.target nvidia-persistenced.service
 
 [Service]
 EnvironmentFile=-$SRV/fan.env
+Environment=FANCTL_ESTADO=/var/lib/localai-fan/mapa.json
+StateDirectory=localai-fan
 ExecStart=$SRV/.venv/bin/python $SRV/fanctl.py
-Restart=on-failure
+Restart=always
 RestartSec=5
 TimeoutStopSec=15
 
@@ -5187,12 +7348,14 @@ TimeoutStopSec=15
 WantedBy=multi-user.target
 UNIT
   sudo systemctl daemon-reload
-  sudo systemctl enable --now localai-fan.service
+  sudo systemctl enable localai-fan.service >/dev/null 2>&1
+  sudo systemctl restart localai-fan.service   # recarrega a versão nova do controle (o teste das ventoinhas roda 1 vez)
 }
 
 
 # Gradle (compila apps), ESP32 (compila firmware) e Tailscale (acesso de qualquer lugar)
 [ -n "${SEM_SSD:-}" ] || ssd_rapido || echo "AVISO: não consegui configurar o SSD (rode de novo: bash atualizar.sh)."
+instalar_servicos || echo "AVISO: não consegui configurar a inicialização automática dos serviços."
 instalar_gradle || echo "AVISO: não consegui instalar o Gradle."
 [ -n "${SEM_ESP32:-}" ] || instalar_esp32 || echo "AVISO: o núcleo ESP32 não instalou; rode de novo mais tarde. (SEM_ESP32=1 pula esta etapa)"
 [ -n "${SEM_IMAGENS:-}" ] || instalar_imagens || echo "AVISO: o motor de imagens não instalou; rode de novo mais tarde (SEM_IMAGENS=1 pula esta etapa)."
@@ -5211,7 +7374,42 @@ fi
 echo "==> Reiniciando"
 sudo sed -i "s/^Environment=NGL=.*/Environment=NGL=$NGL_PADRAO/" "$SERVICO_LLM"
 sudo systemctl daemon-reload
+# llama.cpp: precisa (1) entender imagens (--mmproj, para a foto do perfil) e (2) usar a placa de vídeo certa:
+# AMD (ex.: RX 580) -> Vulkan; NVIDIA -> CUDA. Se faltar algum dos dois, atualiza e recompila (15 a 40 min, só desta vez).
+# Se falhar, o resto continua funcionando (a IA de texto fica como estava).
+LLAMA_BIN="$HOME/llama.cpp/build/bin/llama-server"
 PRECISA_LLM=0
+GPU_AMD=0
+for d in "${DRM_RAIZ:-/sys/class/drm}"/card[0-9]*/device; do
+  [ "$(cat "$d/vendor" 2>/dev/null)" = "0x1002" ] && [ -r "$d/mem_info_vram_total" ] && GPU_AMD=1
+done
+if [ -d "$HOME/llama.cpp" ]; then
+  RECOMPILAR=0
+  AJUDA_LLAMA="$("$LLAMA_BIN" --help 2>&1 || true)"
+  grep -q -- '--mmproj' <<<"$AJUDA_LLAMA" || RECOMPILAR=1
+  if [ "$GPU_AMD" = 1 ]; then
+    "$LLAMA_BIN" --list-devices 2>&1 | grep -qi vulkan || RECOMPILAR=1
+    CMAKE_GPU="-DGGML_VULKAN=ON -DGGML_CUDA=OFF"
+  elif [ -x "$CUDA_DIR/bin/nvcc" ]; then
+    CMAKE_GPU="-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=52 -DCMAKE_CUDA_COMPILER=$CUDA_DIR/bin/nvcc"
+  else
+    CMAKE_GPU=""
+  fi
+  if [ "$RECOMPILAR" = 1 ]; then
+    echo "==> Atualizando o llama.cpp (${CMAKE_GPU:-só CPU}); 15 a 40 minutos, só desta vez"
+    if [ "$GPU_AMD" = 1 ]; then
+      sudo apt install -y libvulkan-dev glslc mesa-vulkan-drivers vulkan-tools cmake build-essential git ||
+      sudo apt install -y libvulkan-dev libshaderc-dev glslang-tools mesa-vulkan-drivers vulkan-tools cmake build-essential git ||
+      echo "AVISO: não consegui instalar os pacotes do Vulkan (precisa do glslc)."
+    fi
+    if ( export PATH="$CUDA_DIR/bin:$PATH"; cd "$HOME/llama.cpp" && git pull --ff-only &&
+         cmake -B build $CMAKE_GPU && cmake --build build --config Release -j 4 --target llama-server ); then
+      PRECISA_LLM=1
+    else
+      echo "AVISO: não consegui atualizar o llama.cpp. A IA de texto segue como estava; fotos (e a placa AMD, se for o caso) não funcionarão até isso."
+    fi
+  fi
+fi
 [ "$NGL_PADRAO" != "$NGL_ATUAL" ] && PRECISA_LLM=1
 cmp -s "$BASE/start_llm.sh" /tmp/start_llm.antes || PRECISA_LLM=1
 [ "$LLM_UNIT_MUDOU" = 1 ] && PRECISA_LLM=1
